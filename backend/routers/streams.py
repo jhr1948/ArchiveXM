@@ -187,6 +187,399 @@ async def get_stream_url(channel_id: str, db: DBSession = Depends(get_db)):
 # Store active stream sessions for proxy
 _stream_sessions = {}
 
+# Store XTRA stitched EVENT playlists by channel.
+# This is intentionally small/simple: keep the active item, append one or more
+# future items, and never emit EXT-X-ENDLIST while the player is active.
+_xtra_sessions = {}
+
+
+def _is_xtra_media_playlist_path(path: str) -> bool:
+    return path.endswith(".m3u8") and "_full_v3.m3u8" in path
+
+
+def _is_audio_segment_path(path: str) -> bool:
+    clean = path.split("?", 1)[0].lower()
+    return clean.endswith(".aac")
+
+
+def _extract_xtra_segment_key(path: str) -> str:
+    return path.split("?", 1)[0].rsplit("/", 1)[-1]
+
+
+def _playlist_duration_seconds(playlist_text: str) -> float:
+    total = 0.0
+    for line in playlist_text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXTINF:"):
+            try:
+                total += float(line.split(":", 1)[1].split(",", 1)[0])
+            except Exception:
+                pass
+    return total
+
+
+def _extract_target_duration(playlist_text: str) -> str:
+    for line in playlist_text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXT-X-TARGETDURATION"):
+            return line
+    return "#EXT-X-TARGETDURATION:10"
+
+
+def _extract_version(playlist_text: str) -> str:
+    for line in playlist_text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXT-X-VERSION"):
+            return line
+    return "#EXT-X-VERSION:3"
+
+
+def _extract_key_line(playlist_text: str) -> str | None:
+    for line in playlist_text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXT-X-KEY:"):
+            return line
+    return None
+
+
+def _rewrite_key_line_for_proxy(channel_id: str, line: str) -> str:
+    if not line or 'URI="' not in line:
+        return line
+
+    import re
+    import urllib.parse
+
+    match = re.search(r'URI="([^"]+)"', line)
+    if not match:
+        return line
+
+    key_url = match.group(1)
+    encoded_key = urllib.parse.quote(key_url, safe='')
+    proxy_key_url = f"/api/streams/{channel_id}/hls-key/{encoded_key}"
+    return line.replace(f'URI="{key_url}"', f'URI="{proxy_key_url}"')
+
+
+def _extract_segments_with_durations(playlist_text: str) -> list[tuple[str, str]]:
+    pairs = []
+    pending_duration = None
+
+    for raw_line in playlist_text.splitlines():
+        line = raw_line.strip()
+
+        if line.startswith("#EXTINF:"):
+            pending_duration = line
+        elif line and not line.startswith("#"):
+            # Media playlist segment line. Skip anything that is not audio-ish.
+            if ".aac" in line or ".ts" in line or ".m4s" in line:
+                pairs.append((pending_duration or "#EXTINF:10.0,", line))
+            pending_duration = None
+
+    return pairs
+
+
+def _absolute_resource_url(base_url: str, path_dir: str, resource_line: str) -> str:
+    """Resolve a media-playlist resource line to an absolute SiriusXM URL."""
+    if resource_line.startswith("http://") or resource_line.startswith("https://"):
+        return resource_line
+
+    return base_url + path_dir + resource_line
+
+
+def _proxied_segment_line(channel_id: str, base_url: str, path_dir: str, segment_line: str) -> str:
+    import urllib.parse
+
+    absolute_url = _absolute_resource_url(base_url, path_dir, segment_line)
+    encoded_url = urllib.parse.quote(absolute_url, safe='')
+    return f"/api/streams/{channel_id}/hls-xtra-resource/{encoded_url}"
+
+
+def _track_from_playlist(path: str, playlist_text: str, base_url: str) -> dict:
+    path_dir = path.rsplit("/", 1)[0] + "/" if "/" in path else ""
+    segments = _extract_segments_with_durations(playlist_text)
+
+    return {
+        "path": path,
+        "base_url": base_url,
+        "path_dir": path_dir,
+        "playlist_text": playlist_text,
+        "segments": segments,
+        "segment_names": [_extract_xtra_segment_key(seg) for _, seg in segments],
+        "duration": _playlist_duration_seconds(playlist_text),
+    }
+
+
+def _build_xtra_event_playlist(channel_id: str, session: dict) -> str:
+    tracks = session.get("tracks") or []
+
+    if not tracks:
+        return "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n"
+
+    first_text = tracks[0]["playlist_text"]
+    lines = [
+        "#EXTM3U",
+        _extract_version(first_text),
+        _extract_target_duration(first_text),
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "#EXT-X-START:TIME-OFFSET=0,PRECISE=YES",
+        "#EXT-X-PLAYLIST-TYPE:EVENT",
+        "#EXT-X-DISCONTINUITY-SEQUENCE:0",
+    ]
+
+    for index, track in enumerate(tracks):
+        if index > 0:
+            lines.append("#EXT-X-DISCONTINUITY")
+
+        key_line = _extract_key_line(track["playlist_text"])
+        if key_line:
+            lines.append(_rewrite_key_line_for_proxy(channel_id, key_line))
+
+        for duration_line, segment_line in track["segments"]:
+            lines.append(duration_line)
+            lines.append(_proxied_segment_line(channel_id, track["base_url"], track["path_dir"], segment_line))
+
+    # Do not emit EXT-X-ENDLIST. VLC/IPTV clients should keep refreshing the
+    # playlist, letting us append more XTRA items when the queue is nearly used.
+    return "\n".join(lines) + "\n"
+
+
+def _first_present(data: dict, keys: list[str]):
+    for key in keys:
+        value = data.get(key) if isinstance(data, dict) else None
+        if value:
+            return value
+    return None
+
+
+async def _xtra_tune_or_peek(
+    channel_id: str,
+    bearer: str,
+    source_context_id: str | None = None,
+    sequence_token: str | None = None,
+    use_peek: bool = False,
+) -> dict | None:
+    import httpx
+
+    url_name = "peek" if use_peek and source_context_id else "tuneSource"
+    url = f"https://api.edge-gateway.siriusxm.com/playback/play/v1/{url_name}"
+    payload = {
+        "id": channel_id,
+        "type": "channel-xtra",
+        "hlsVersion": "V3",
+        "mtcVersion": "V2",
+        "trackResumeSupported": False,
+    }
+
+    if url_name == "peek":
+        payload["sourceContextId"] = source_context_id
+        if sequence_token:
+            payload["sequenceToken"] = sequence_token
+    else:
+        payload["manifestVariant"] = "FULL"
+
+    headers = {
+        "Authorization": f"Bearer {bearer}",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, headers=headers, json=payload, timeout=15)
+
+    if response.status_code != 200:
+        print(f"⚠️ XTRA {url_name} failed channel={channel_id} status={response.status_code} body={response.text[:200]}")
+        return None
+
+    data = response.json()
+    streams = data.get("streams", [])
+    stream_url = None
+    if streams:
+        stream_url = streams[0].get("urls", [{}])[0].get("url")
+    stream_url = stream_url or data.get("hlsUrl") or data.get("primaryStreamUrl")
+
+    if not stream_url:
+        print(f"⚠️ XTRA {url_name} returned no stream URL for {channel_id}")
+        return None
+
+    return {
+        "stream_url": stream_url,
+        "raw_data": data,
+        "source_context_id": _first_present(data, ["sourceContextId"]) or source_context_id,
+        "sequence_token": _first_present(data, ["sequenceToken"]) or sequence_token,
+        "method": url_name,
+    }
+
+
+async def _fetch_xtra_256k_track(
+    channel_id: str,
+    bearer: str,
+    source_context_id: str | None = None,
+    sequence_token: str | None = None,
+    use_peek: bool = True,
+) -> dict | None:
+    """
+    Fetch a 256k XTRA FULL media playlist.
+
+    When possible this uses SiriusXM peek with sourceContextId/sequenceToken
+    so the stitched queue advances to a fresh next XTRA item instead of
+    restarting/resuming the current item near its end.
+    """
+    import httpx
+
+    result = await _xtra_tune_or_peek(
+        channel_id=channel_id,
+        bearer=bearer,
+        source_context_id=source_context_id,
+        sequence_token=sequence_token,
+        use_peek=use_peek,
+    )
+
+    if not result or not result.get("stream_url"):
+        print(f"⚠️ XTRA continuation failed to get stream URL for {channel_id}")
+        return None
+
+    master_url = result["stream_url"]
+    master_base = master_url.rsplit("/", 1)[0] + "/"
+
+    async with httpx.AsyncClient() as client:
+        master_response = await client.get(master_url, timeout=15)
+
+        if master_response.status_code != 200:
+            print(f"⚠️ XTRA continuation master fetch failed: {master_response.status_code}")
+            return None
+
+        master_lines = [line.strip() for line in master_response.text.splitlines()]
+        variant_path = None
+
+        i = 0
+        while i < len(master_lines):
+            line = master_lines[i]
+
+            if line.startswith("#EXT-X-STREAM-INF"):
+                variant_info = line
+                variant_uri = master_lines[i + 1].strip() if i + 1 < len(master_lines) else ""
+
+                if "_256k_" in variant_uri or "BANDWIDTH=281600" in variant_info:
+                    variant_path = variant_uri
+                    break
+
+                i += 2
+                continue
+
+            i += 1
+
+        if not variant_path:
+            print(f"⚠️ XTRA continuation could not find 256k variant for {channel_id}")
+            return None
+
+        if variant_path.startswith("http"):
+            variant_url = variant_path
+            # Best effort for proxy path building with absolute URLs.
+            proxy_path = variant_path.split(master_base, 1)[-1] if variant_path.startswith(master_base) else variant_path.rsplit("/", 2)[-2] + "/" + variant_path.rsplit("/", 1)[-1]
+        else:
+            variant_url = master_base + variant_path
+            proxy_path = variant_path
+
+        variant_response = await client.get(variant_url, timeout=20)
+
+        if variant_response.status_code != 200:
+            print(f"⚠️ XTRA continuation variant fetch failed: {variant_response.status_code}")
+            return None
+
+        track = _track_from_playlist(proxy_path, variant_response.text, master_base)
+        track["source_context_id"] = result.get("source_context_id")
+        track["sequence_token"] = result.get("sequence_token")
+        track["method"] = result.get("method")
+        return track
+
+
+async def _ensure_xtra_queue(channel_id: str, session_info: dict, requested_path: str, initial_playlist_text: str | None = None):
+    import time
+
+    now = time.time()
+    cached = _xtra_sessions.get(channel_id)
+
+    # Reset the queue when a new XTRA tune creates a different media playlist path.
+    if not cached or cached.get("active_path") != requested_path:
+        if initial_playlist_text is None:
+            return None
+
+        # Initial tuneSource can represent the current/resumed XTRA item and
+        # may be near its end. Use its continuity context to start the local
+        # stitched queue from a fresh peek item when possible.
+        first_track = await _fetch_xtra_256k_track(
+            channel_id=channel_id,
+            bearer=session_info.get("bearer"),
+            source_context_id=session_info.get("source_context_id"),
+            sequence_token=session_info.get("sequence_token"),
+            use_peek=True,
+        )
+
+        if not first_track:
+            first_track = _track_from_playlist(requested_path, initial_playlist_text, session_info.get("base_url", ""))
+
+        if first_track.get("source_context_id"):
+            session_info["source_context_id"] = first_track.get("source_context_id")
+        if first_track.get("sequence_token"):
+            session_info["sequence_token"] = first_track.get("sequence_token")
+
+        cached = {
+            "active_path": requested_path,
+            "tracks": [first_track],
+            "served": set(),
+            "created": now,
+            "last_access": now,
+            "append_in_progress": False,
+        }
+        _xtra_sessions[channel_id] = cached
+        print(
+            f"🎧 XTRA queue started channel={channel_id} "
+            f"method={first_track.get('method', 'initial')} "
+            f"segments={len(first_track['segments'])}"
+        )
+
+    cached["last_access"] = now
+
+    # Keep at least two tracks queued, and append another when the queue is
+    # mostly consumed. This avoids ENDLIST stops without aggressively prefetching.
+    total_segments = sum(len(track.get("segments") or []) for track in cached.get("tracks", []))
+    served_count = len(cached.get("served", set()))
+    remaining = total_segments - served_count
+
+    should_append = len(cached.get("tracks", [])) < 2 or remaining <= 8
+
+    if should_append and not cached.get("append_in_progress"):
+        cached["append_in_progress"] = True
+        try:
+            next_track = await _fetch_xtra_256k_track(
+                channel_id=channel_id,
+                bearer=session_info.get("bearer"),
+                source_context_id=session_info.get("source_context_id"),
+                sequence_token=session_info.get("sequence_token"),
+                use_peek=True,
+            )
+            if next_track and next_track.get("segments"):
+                if next_track.get("source_context_id"):
+                    session_info["source_context_id"] = next_track.get("source_context_id")
+                if next_track.get("sequence_token"):
+                    session_info["sequence_token"] = next_track.get("sequence_token")
+                # Avoid appending an identical playlist path twice in a row.
+                existing_paths = {track.get("path") for track in cached.get("tracks", [])}
+                if next_track.get("path") not in existing_paths:
+                    cached["tracks"].append(next_track)
+                    print(
+                        f"🎧 XTRA queue appended channel={channel_id} "
+                        f"tracks={len(cached['tracks'])} total_segments="
+                        f"{sum(len(track.get('segments') or []) for track in cached['tracks'])}"
+                    )
+                else:
+                    print(f"⚠️ XTRA continuation returned duplicate path for {channel_id}; not appending")
+        finally:
+            cached["append_in_progress"] = False
+
+    return cached
+
+
 @router.get("/{channel_id}/proxy-stream")
 async def proxy_stream(channel_id: str, db: DBSession = Depends(get_db)):
     """
@@ -209,10 +602,14 @@ async def proxy_stream(channel_id: str, db: DBSession = Depends(get_db)):
         master_url = result['stream_url']
         base_url = master_url.rsplit('/', 1)[0] + '/'
         
-        # Store base URL for this channel's proxy requests
+        raw_data = result.get('raw_data') or {}
+
+        # Store base URL and XTRA continuity context for this channel's proxy requests
         _stream_sessions[channel_id] = {
             'base_url': base_url,
-            'bearer': session.bearer_token
+            'bearer': session.bearer_token,
+            'source_context_id': raw_data.get('sourceContextId'),
+            'sequence_token': raw_data.get('sequenceToken'),
         }
         
         # Fetch the master playlist
@@ -285,11 +682,14 @@ async def proxy_stream(channel_id: str, db: DBSession = Depends(get_db)):
 @router.get("/{channel_id}/hls-proxy/{path:path}")
 async def hls_proxy(channel_id: str, path: str, db: DBSession = Depends(get_db)):
     """
-    Proxy any HLS resource (variant playlists, segments, keys)
+    Proxy any HLS resource (variant playlists, segments, keys).
+
+    For XTRA media playlists, this returns a small stitched EVENT playlist that
+    appends the next XTRA item before the current queue runs out.
     """
     import httpx
     from fastapi.responses import Response
-    
+
     # Get stored session info
     stream_info = _stream_sessions.get(channel_id)
     if not stream_info:
@@ -297,52 +697,88 @@ async def hls_proxy(channel_id: str, path: str, db: DBSession = Depends(get_db))
         session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
         if not session:
             raise HTTPException(status_code=401, detail="Not authenticated")
-        
+
         api = SiriusXMAPI(session.bearer_token)
         result = await api.get_stream_url(channel_id, get_channel_type(channel_id, db))
-        
+
         if result and result.get('stream_url'):
             base_url = result['stream_url'].rsplit('/', 1)[0] + '/'
+            raw_data = result.get('raw_data') or {}
             stream_info = {
                 'base_url': base_url,
-                'bearer': session.bearer_token
+                'bearer': session.bearer_token,
+                'source_context_id': raw_data.get('sourceContextId'),
+                'sequence_token': raw_data.get('sequenceToken'),
             }
             _stream_sessions[channel_id] = stream_info
         else:
             raise HTTPException(status_code=500, detail="No stream session")
-    
+
     base_url = stream_info['base_url']
     bearer = stream_info['bearer']
-    
+    channel_type = get_channel_type(channel_id, db)
+
     # Build full URL
     full_url = base_url + path
-    
+
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        
+
         # Add auth for key requests
         if '/key/' in path or 'key' in path.lower():
             headers['Authorization'] = f'Bearer {bearer}'
-        
+
         async with httpx.AsyncClient() as client:
             response = await client.get(full_url, headers=headers, timeout=30)
-            
+
             if response.status_code != 200:
                 raise HTTPException(status_code=response.status_code, detail="Proxy fetch failed")
-            
+
             content = response.content
             content_type = response.headers.get('content-type', 'application/octet-stream')
-            
-            # If it's a playlist, rewrite the URLs
+
+            # Track XTRA segment consumption so playlist refreshes know when to append.
+            if channel_type == "channel-xtra" and _is_audio_segment_path(path):
+                cached = _xtra_sessions.get(channel_id)
+                if cached:
+                    served = cached.setdefault("served", set())
+                    served.add(_extract_xtra_segment_key(path))
+
+            # If this is an XTRA FULL media playlist, serve an ongoing EVENT
+            # playlist instead of the finite playlist ending in EXT-X-ENDLIST.
+            if channel_type == "channel-xtra" and _is_xtra_media_playlist_path(path):
+                playlist_text = content.decode('utf-8')
+                cached = await _ensure_xtra_queue(
+                    channel_id=channel_id,
+                    session_info=stream_info,
+                    requested_path=path,
+                    initial_playlist_text=playlist_text,
+                )
+
+                if cached:
+                    content = _build_xtra_event_playlist(channel_id, cached).encode('utf-8')
+                    content_type = 'application/vnd.apple.mpegurl'
+
+                    return Response(
+                        content=content,
+                        media_type=content_type,
+                        headers={
+                            "Access-Control-Allow-Origin": "*",
+                            "Cache-Control": "no-cache"
+                        }
+                    )
+
+            # If it's a non-XTRA playlist, or an XTRA playlist we did not handle
+            # above, rewrite URLs through the normal proxy path.
             if '.m3u8' in path or 'mpegurl' in content_type.lower():
                 text_content = content.decode('utf-8')
                 rewritten_lines = []
-                
+
                 for line in text_content.split('\n'):
                     line = line.strip()
-                    
+
                     # Handle key URLs in EXT-X-KEY tag
                     if line.startswith('#EXT-X-KEY:') and 'URI="' in line:
                         import re
@@ -361,7 +797,7 @@ async def hls_proxy(channel_id: str, path: str, db: DBSession = Depends(get_db))
                             path_dir = path.rsplit('/', 1)[0] + '/'
                         else:
                             path_dir = ''
-                        
+
                         if line.startswith('http'):
                             # Absolute URL - extract path and proxy it
                             line = f"/api/streams/{channel_id}/hls-proxy/{path_dir}{line.split('/')[-1]}"
@@ -371,10 +807,10 @@ async def hls_proxy(channel_id: str, path: str, db: DBSession = Depends(get_db))
                         rewritten_lines.append(line)
                     else:
                         rewritten_lines.append(line)
-                
+
                 content = '\n'.join(rewritten_lines).encode('utf-8')
                 content_type = 'application/vnd.apple.mpegurl'
-            
+
             return Response(
                 content=content,
                 media_type=content_type,
@@ -383,11 +819,66 @@ async def hls_proxy(channel_id: str, path: str, db: DBSession = Depends(get_db))
                     "Cache-Control": "no-cache" if '.m3u8' in path else "max-age=3600"
                 }
             )
-            
+
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
+
+
+@router.get("/{channel_id}/hls-xtra-resource/{encoded_url:path}")
+async def hls_xtra_resource_proxy(channel_id: str, encoded_url: str, db: DBSession = Depends(get_db)):
+    """
+    Proxy an absolute SiriusXM XTRA media segment URL.
+
+    XTRA continuation can stitch together tracks whose media segments live under
+    different SiriusXM base URLs. The normal hls-proxy endpoint is relative to
+    one active base URL, so stitched XTRA segments use this absolute-resource
+    proxy instead.
+    """
+    import httpx
+    import urllib.parse
+    from fastapi.responses import Response
+
+    absolute_url = urllib.parse.unquote(encoded_url)
+
+    if not absolute_url.startswith(("https://", "http://")):
+        raise HTTPException(status_code=400, detail="Invalid XTRA resource URL")
+
+    # Mark stitched XTRA segment consumption. These segments bypass the normal
+    # hls-proxy route, so the queue needs to count them here.
+    cached = _xtra_sessions.get(channel_id)
+    if cached and _is_audio_segment_path(absolute_url):
+        served = cached.setdefault("served", set())
+        served.add(_extract_xtra_segment_key(absolute_url))
+
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(absolute_url, headers=headers, timeout=30)
+
+            if response.status_code != 200:
+                print(f"⚠️ XTRA resource fetch failed status={response.status_code} url={absolute_url}")
+                raise HTTPException(status_code=response.status_code, detail="XTRA resource fetch failed")
+
+            content_type = response.headers.get('content-type', 'application/octet-stream')
+
+            return Response(
+                content=response.content,
+                media_type=content_type,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Cache-Control": "max-age=3600"
+                }
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"XTRA resource proxy error: {str(e)}")
 
 
 @router.get("/{channel_id}/hls-key/{encoded_key:path}")

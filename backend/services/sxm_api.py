@@ -101,6 +101,9 @@ class SiriusXMAPI:
             'manifestVariant': 'WEB' if channel_type == 'channel-linear' else 'FULL',
             'mtcVersion': 'V2'
         }
+
+        if channel_type == "channel-xtra":
+            payload["trackResumeSupported"] = False
         
         for attempt in range(self.MAX_RETRIES + 1):
             try:

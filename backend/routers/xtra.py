@@ -52,24 +52,119 @@ async def legacy_listen(channel_id: str, db: DBSession = Depends(get_db)):
     return await streams.proxy_stream(resolved_channel_id, db)
 
 
+def _duration_ms_for_track(track: dict) -> int:
+    metadata = track.get("metadata") or {}
+    duration_ms = metadata.get("durationMs") or 0
+    try:
+        duration_ms = int(duration_ms)
+    except (TypeError, ValueError):
+        duration_ms = 0
+
+    if duration_ms <= 0:
+        try:
+            duration_ms = int(float(track.get("duration") or 0) * 1000)
+        except (TypeError, ValueError):
+            duration_ms = 0
+
+    return max(0, duration_ms)
+
+
+def _xtra_metadata_from_queue(channel_id: str, requested_channel_id: str, position_ms: int | None = None) -> dict | None:
+    cached = getattr(streams, "_xtra_sessions", {}).get(channel_id)
+    if not cached:
+        manual_start = getattr(streams, "_xtra_manual_start", {}).get(channel_id)
+        if manual_start and manual_start.get("track"):
+            track = manual_start.get("track")
+            metadata = dict(track.get("metadata") or {})
+            if metadata:
+                metadata["channelId"] = requested_channel_id
+                metadata["isXtra"] = True
+                return metadata
+        return None
+
+    tracks = cached.get("tracks") or []
+    if not tracks:
+        return None
+
+    selected = tracks[0]
+    start_offset_ms = 0
+    end_offset_ms = _duration_ms_for_track(selected)
+
+    if position_ms is not None:
+        offset = 0
+        for track in tracks:
+            duration_ms = _duration_ms_for_track(track)
+            next_offset = offset + duration_ms
+            if offset <= position_ms < next_offset:
+                selected = track
+                start_offset_ms = offset
+                end_offset_ms = next_offset
+                break
+            if position_ms >= next_offset:
+                selected = track
+                start_offset_ms = offset
+                end_offset_ms = next_offset
+            offset = next_offset
+
+    metadata = dict(selected.get("metadata") or {})
+    if not metadata:
+        return None
+
+    if not metadata.get("durationMs"):
+        metadata["durationMs"] = _duration_ms_for_track(selected)
+
+    try:
+        created_ms = int(float(cached.get("created") or 0) * 1000)
+    except (TypeError, ValueError):
+        created_ms = 0
+    if created_ms and position_ms is not None:
+        metadata["startedAtMs"] = created_ms + start_offset_ms
+    elif not metadata.get("startedAtMs") and created_ms:
+        metadata["startedAtMs"] = created_ms + start_offset_ms
+
+    metadata["channelId"] = requested_channel_id
+    metadata["isXtra"] = True
+    metadata["startOffsetMs"] = start_offset_ms
+    metadata["endOffsetMs"] = end_offset_ms
+    if position_ms is not None:
+        metadata["positionMs"] = position_ms
+        metadata["resolvedBy"] = "position"
+    return metadata
+
+
 @router.get("/metadata/{channel_id}")
-async def legacy_metadata(channel_id: str, db: DBSession = Depends(get_db)):
-    """Small compatibility metadata endpoint for clients that probe m3u8XM metadata."""
+async def legacy_metadata(channel_id: str, positionMs: int | None = None, db: DBSession = Depends(get_db)):
+    """M3You/m3u8XM-compatible metadata endpoint.
+
+    XTRA metadata comes from ArchiveXM's active XTRA queue, because M3You
+    polls /metadata/<uuid> for XTRA tracks instead of using normal SXM live metadata.
+    """
     resolved_channel_id = _resolve_channel_id(channel_id, db)
     channel = db.query(Channel).filter(Channel.channel_id == resolved_channel_id).first()
     if not channel:
         return JSONResponse(status_code=404, content={"ok": False}, headers={"Access-Control-Allow-Origin": "*"})
+
+    is_xtra = getattr(channel, "channel_type", None) == "channel-xtra"
+
+    if is_xtra:
+        queue_metadata = _xtra_metadata_from_queue(resolved_channel_id, channel_id, positionMs)
+        if queue_metadata and (queue_metadata.get("title") or queue_metadata.get("artist")):
+            queue_metadata["ok"] = True
+            if not queue_metadata.get("imageUrl"):
+                queue_metadata["imageUrl"] = channel.large_image_url or channel.image_url or ""
+            return JSONResponse(content=queue_metadata, headers={"Access-Control-Allow-Origin": "*"})
+
     return JSONResponse(
         content={
             "ok": True,
-            "channelId": resolved_channel_id,
+            "channelId": channel_id,
             "title": channel.name or "",
             "artist": "",
             "album": "",
             "imageUrl": channel.large_image_url or channel.image_url or "",
             "durationMs": 0,
             "startedAtMs": 0,
-            "isXtra": (getattr(channel, "channel_type", None) == "channel-xtra"),
+            "isXtra": is_xtra,
         },
         headers={"Access-Control-Allow-Origin": "*"},
     )

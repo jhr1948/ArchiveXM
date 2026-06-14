@@ -374,6 +374,196 @@ def _first_present(data: dict, keys: list[str]):
     return None
 
 
+def _deep_first_present(data, keys):
+    """Find the first non-empty value for any key in nested SiriusXM JSON."""
+    if isinstance(data, dict):
+        for key in keys:
+            value = data.get(key)
+            if value not in (None, ""):
+                return value
+        for value in data.values():
+            found = _deep_first_present(value, keys)
+            if found not in (None, ""):
+                return found
+    elif isinstance(data, list):
+        for value in data:
+            found = _deep_first_present(value, keys)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def _format_sxm_image_url(image_key, width=800, height=800):
+    """Convert SiriusXM artwork keys to imgsrv URLs, or pass through good HTTPS URLs."""
+    import base64
+    import json
+
+    if not image_key:
+        return ""
+    image_key = str(image_key)
+    if image_key.startswith("http://") or image_key.startswith("https://"):
+        if ".m3u8" in image_key or "/audio/" in image_key:
+            return ""
+        return image_key
+    if "/audio/" in image_key or image_key.endswith(".m3u8"):
+        return ""
+
+    logo_json = json.dumps({
+        "key": image_key,
+        "edits": [
+            {"format": {"type": "jpeg"}},
+            {"resize": {"width": int(width or 800), "height": int(height or 800)}},
+        ],
+    }, separators=(",", ":"))
+    encoded = base64.b64encode(logo_json.encode("ascii")).decode("utf-8")
+    return f"https://imgsrv-sxm-prod-device.streaming.siriusxm.com/{encoded}"
+
+
+def _xtra_track_item_from_tune(tune_data):
+    """SiriusXM XTRA tune/peek responses store song info under streams[].metadata.xtra.items."""
+    if not isinstance(tune_data, dict):
+        return None
+    for stream in tune_data.get("streams", []) or []:
+        if not isinstance(stream, dict):
+            continue
+        items = (((stream.get("metadata") or {}).get("xtra") or {}).get("items") or [])
+        for item in items:
+            if isinstance(item, dict) and item.get("type") == "xtra-channel-track":
+                return item
+        for item in items:
+            if isinstance(item, dict) and (item.get("name") or item.get("artistName") or item.get("title")):
+                return item
+    return None
+
+
+def _xtra_art_from_item(item):
+    if not isinstance(item, dict):
+        return ""
+    images = item.get("images") or {}
+    candidates = [
+        (((images.get("tile") or {}).get("aspect_1x1") or {}).get("preferredImage") or {}),
+        (((images.get("tile") or {}).get("aspect_1x1") or {}).get("defaultImage") or {}),
+        (((images.get("cover") or {}).get("aspect_1x1") or {}).get("preferredImage") or {}),
+        (((images.get("cover") or {}).get("aspect_1x1") or {}).get("defaultImage") or {}),
+    ]
+    for image in candidates:
+        if isinstance(image, dict):
+            url = image.get("url")
+            if url:
+                return _format_sxm_image_url(url, image.get("width", 800), image.get("height", 800))
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            url = obj.get("url")
+            if url and "/artwork/" in str(url):
+                return _format_sxm_image_url(url, obj.get("width", 800), obj.get("height", 800))
+            for value in obj.values():
+                found = walk(value)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for value in obj:
+                found = walk(value)
+                if found:
+                    return found
+        return ""
+
+    return walk(item)
+
+
+def _extract_xtra_skip_limits(tune_data):
+    def find_skip_limits(obj):
+        if isinstance(obj, dict):
+            if isinstance(obj.get("skipLimits"), dict):
+                return obj.get("skipLimits")
+            for value in obj.values():
+                found = find_skip_limits(value)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for value in obj:
+                found = find_skip_limits(value)
+                if found:
+                    return found
+        return None
+
+    skip_limits = find_skip_limits(tune_data) or {}
+    limited = skip_limits.get("limited") if isinstance(skip_limits, dict) else {}
+    if not isinstance(limited, dict):
+        limited = {}
+
+    def to_int(value, default=0):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    available_forward = to_int(
+        limited.get("availableForwardSkips", skip_limits.get("availableForwardSkips") if isinstance(skip_limits, dict) else 0),
+        0,
+    )
+    available_backward = to_int(
+        limited.get("availableBackwardSkips", skip_limits.get("availableBackwardSkips") if isinstance(skip_limits, dict) else 0),
+        0,
+    )
+    more_time = limited.get("moreSkipsAvailableTime") if isinstance(limited, dict) else None
+    if more_time is None and isinstance(skip_limits, dict):
+        more_time = skip_limits.get("moreSkipsAvailableTime")
+
+    return {
+        "availableForwardSkips": available_forward,
+        "availableBackwardSkips": available_backward,
+        "moreSkipsAvailableTime": more_time,
+    }
+
+
+def _extract_xtra_track_metadata(channel_id, tune_data):
+    import time
+
+    item = _xtra_track_item_from_tune(tune_data)
+    sequence_token = _deep_first_present(tune_data, ["sequenceToken"])
+    source_context_id = _deep_first_present(tune_data, ["sourceContextId"])
+
+    if item:
+        title = item.get("name") or item.get("title") or ""
+        artist = item.get("artistName") or item.get("artist") or ""
+        album = item.get("albumName") or item.get("albumTitle") or item.get("album") or ""
+        duration_ms = item.get("duration") or item.get("durationMs") or item.get("trackDurationMs") or 0
+        image_url = _xtra_art_from_item(item)
+        track_id = item.get("id")
+    else:
+        title = _deep_first_present(tune_data, ["trackTitle", "songTitle", "cutTitle", "name", "title"]) or ""
+        artist = _deep_first_present(tune_data, ["artistName", "artist", "artists", "subtitle", "secondaryTitle"]) or ""
+        album = _deep_first_present(tune_data, ["albumName", "albumTitle", "album"]) or ""
+        duration_ms = _deep_first_present(tune_data, ["durationMs", "duration", "trackDurationMs"]) or 0
+        image_url = ""
+        track_id = None
+
+    try:
+        duration_ms = int(duration_ms) if duration_ms is not None else 0
+    except (TypeError, ValueError):
+        duration_ms = 0
+
+    metadata = {
+        "channelId": channel_id,
+        "title": title or "",
+        "artist": artist or "",
+        "album": album or "",
+        "imageUrl": image_url or "",
+        "durationMs": duration_ms,
+        "startedAtMs": int(time.time() * 1000),
+        "isXtra": True,
+    }
+    if sequence_token:
+        metadata["sequenceToken"] = sequence_token
+    if source_context_id:
+        metadata["sourceContextId"] = source_context_id
+    if track_id:
+        metadata["trackId"] = track_id
+    metadata.update(_extract_xtra_skip_limits(tune_data))
+    return metadata
+
+
 async def _xtra_tune_or_peek(
     channel_id: str,
     bearer: str,
@@ -514,6 +704,7 @@ async def _fetch_xtra_256k_track(
         track["source_context_id"] = result.get("source_context_id")
         track["sequence_token"] = result.get("sequence_token")
         track["method"] = result.get("method")
+        track["metadata"] = _extract_xtra_track_metadata(channel_id, result.get("raw_data") or {})
         return track
 
 

@@ -373,13 +373,100 @@ class SiriusXMAPI:
 
         return None
 
+    def _walk_public_json(self, value):
+        """Yield nested dicts from public siriusxm.com JSON payloads."""
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from self._walk_public_json(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from self._walk_public_json(child)
+
+    def _first_public_value(self, item: Dict, keys: List[str]):
+        """Return the first non-empty value from a public channel object."""
+        for key in keys:
+            value = item.get(key)
+            if value not in (None, ""):
+                return value
+        return ""
+
+    def _add_public_channel_result(self, results: Dict[str, Dict], item: Dict) -> bool:
+        """Add one siriusxm.com/channels channel object to results."""
+        if not isinstance(item, dict):
+            return False
+
+        channel_number = self._first_public_value(
+            item,
+            ["streamingChannelNumber", "xmChannelNumber", "channelNumber"]
+        )
+        channel_uuid = self._first_public_value(
+            item,
+            ["uuid", "id", "channelGuid", "channelId"]
+        )
+
+        if not channel_number or not channel_uuid:
+            return False
+
+        try:
+            number_key = str(int(str(channel_number).strip()))
+        except Exception:
+            number_key = str(channel_number).strip()
+
+        title = self._normalize_public_text(
+            self._first_public_value(
+                item,
+                ["displayName", "channelDisplayName", "name", "title", "channelName"]
+            )
+        )
+        genre = self._normalize_public_text(
+            self._first_public_value(
+                item,
+                ["genreTitle", "genre", "categoryTitle", "category", "superCategoryName"]
+            )
+        )
+
+        is_xtra = bool(
+            item.get("xtra_channel")
+            or item.get("isXtra")
+            or item.get("isXtraChannel")
+            or str(item.get("channelType", "")).lower() in ("xtra", "channel-xtra")
+        )
+
+        logo_path = ""
+        web_image = item.get("web_2_0_image")
+        if isinstance(web_image, dict):
+            logo_path = web_image.get("url") or ""
+        logo_path = self._normalize_public_text(
+            logo_path
+            or item.get("colorLogo")
+            or item.get("greyscaleLogo")
+            or item.get("logo")
+            or item.get("image")
+            or ""
+        )
+
+        existing = results.get(number_key, {})
+        # Prefer entries with a friendly public displayName/title, but preserve
+        # already-found fields when a later partial object is less complete.
+        results[number_key] = {
+            "title": title or existing.get("title", ""),
+            "genre": genre or existing.get("genre", ""),
+            "channel_type": "channel-xtra" if is_xtra else existing.get("channel_type", "channel-linear"),
+            "id": str(channel_uuid) or existing.get("id", ""),
+            "logo_path": logo_path or existing.get("logo_path", ""),
+        }
+        return True
+
     async def fetch_public_channels(self) -> Dict[str, Dict]:
         """
         Fetch public SiriusXM channel metadata from siriusxm.com/channels.
 
-        This mirrors the old m3u8XM strategy: authenticated browse data remains
-        the playback source of truth, while the public page provides friendlier
-        names and genres for the UI and M3U.
+        This intentionally mirrors the old m3u8XM strategy: use the public
+        /channels page for friendly names/groups/UUID aliases, while keeping
+        authenticated browse artwork as the logo source of truth. The page
+        shape changes, so this parser handles both Next.js JSON blobs and
+        escaped embedded channel objects.
         """
         results = {}
         url = "https://www.siriusxm.com/channels"
@@ -406,9 +493,34 @@ class SiriusXMAPI:
                 except Exception:
                     pass
 
+            # Preferred path: parse JSON script blobs and recursively find any
+            # dict that looks like a public channel object.
+            for source in decoded_variants:
+                for script_match in re.finditer(
+                    r'<script[^>]*>(.*?)</script>',
+                    source,
+                    flags=re.IGNORECASE | re.DOTALL,
+                ):
+                    script_text = html_lib.unescape(script_match.group(1)).strip()
+                    if not script_text or "streamingChannelNumber" not in script_text:
+                        continue
+                    try:
+                        parsed = json.loads(script_text)
+                    except Exception:
+                        continue
+                    for obj in self._walk_public_json(parsed):
+                        if (
+                            "streamingChannelNumber" in obj
+                            or "xmChannelNumber" in obj
+                            or "channelNumber" in obj
+                        ) and ("uuid" in obj or "id" in obj or "channelGuid" in obj):
+                            self._add_public_channel_result(results, obj)
+
+            # Fallback path: scrape escaped JSON channel objects exactly like
+            # m3u8XM did, but allow quoted channel numbers too.
             seen_objects = set()
             for source in decoded_variants:
-                for match in re.finditer(r'"streamingChannelNumber"\s*:\s*\d+', source):
+                for match in re.finditer(r'"streamingChannelNumber"\s*:\s*"?\d+"?', source):
                     obj_text = self._json_object_around(source, match.start())
                     if not obj_text or obj_text in seen_objects:
                         continue
@@ -419,31 +531,10 @@ class SiriusXMAPI:
                     except Exception:
                         continue
 
-                    channel_number = item.get("streamingChannelNumber") or item.get("xmChannelNumber")
-                    channel_uuid = item.get("uuid")
-                    if not channel_number or not channel_uuid:
-                        continue
+                    self._add_public_channel_result(results, item)
 
-                    title = self._normalize_public_text(item.get("displayName") or item.get("name"))
-                    genre = self._normalize_public_text(item.get("genreTitle") or item.get("genre"))
-                    is_xtra = bool(item.get("xtra_channel"))
-
-                    logo_path = ""
-                    web_image = item.get("web_2_0_image")
-                    if isinstance(web_image, dict):
-                        logo_path = web_image.get("url") or ""
-                    logo_path = self._normalize_public_text(
-                        logo_path or item.get("colorLogo") or item.get("greyscaleLogo") or ""
-                    )
-
-                    results[str(channel_number)] = {
-                        "title": title,
-                        "genre": genre,
-                        "channel_type": "channel-xtra" if is_xtra else "channel-linear",
-                        "id": str(channel_uuid),
-                        "logo_path": logo_path,
-                    }
-
+            if results.get("349"):
+                print(f"🌐 Public 349 title: {results['349'].get('title')}")
             print(f"🌐 Loaded {len(results)} public channel metadata overrides")
             return results
 
@@ -488,6 +579,10 @@ class SiriusXMAPI:
             if override.get("title"):
                 channel["name"] = override["title"]
 
+            # Use the public channel page for nicer display names and base groups,
+            # but keep authenticated browse artwork as the source of truth. The
+            # public page sometimes exposes web image URLs with player-specific
+            # query strings that do not work well as IPTV/frontend logos.
             if override.get("genre"):
                 channel["category"] = override["genre"]
                 channel["genre"] = override["genre"]
@@ -499,12 +594,20 @@ class SiriusXMAPI:
 
             channel["channel_type"] = self._resolve_channel_type(channel, override)
 
-            public_logo = self._format_public_logo_url(override.get("logo_path", "")) if override else ""
-            if public_logo:
-                channel["images"] = {
-                    "thumbnail": public_logo,
-                    "large": public_logo,
-                }
+            # Store the final UI/M3U group in the database. This lets the
+            # ArchiveXM frontend category dropdown match the generated M3U,
+            # including the " XTRA" suffix for XTRA-only groups. The playlist
+            # generator already avoids double-appending XTRA.
+            if channel.get("channel_type") == "channel-xtra":
+                base_group = channel.get("category") or channel.get("genre") or "SiriusXM"
+                if str(base_group).strip().lower() == "all xtra":
+                    display_group = "All XTRA"
+                elif str(base_group).upper().endswith("XTRA"):
+                    display_group = str(base_group)
+                else:
+                    display_group = f"{base_group} XTRA"
+                channel["category"] = display_group
+                channel["genre"] = display_group
 
         return channels
 

@@ -121,7 +121,12 @@ def generate_m3u(db: DBSession) -> str:
         channel_number = f' tvg-chno="{tvg_chno}"'
 
         stream_path_channel_id = quote(str(channel.channel_id), safe="")
-        stream_url = f"{base_url}/api/streams/{stream_path_channel_id}/proxy-stream"
+        url_style = os.getenv("PLAYLIST_URL_STYLE", "listen").strip().lower()
+        if url_style in ("api", "archivexm"):
+            stream_url = f"{base_url}/api/streams/{stream_path_channel_id}/proxy-stream"
+        else:
+            # m3u8XM/M3You-compatible shape: the app extracts the XTRA UUID from /listen/<uuid>
+            stream_url = f"{base_url}/listen/{stream_path_channel_id}"
 
         lines.append(
             f'#EXTINF:-1 tvg-id="{tvg_id}" '

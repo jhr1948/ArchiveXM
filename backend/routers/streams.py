@@ -15,9 +15,28 @@ from services.hls_service import HLSService
 router = APIRouter()
 
 
+def resolve_channel_id(channel_id: str, db: DBSession) -> str:
+    """Resolve either a playable UUID or a SiriusXM channel number to the playable UUID."""
+    channel = db.query(Channel).filter(Channel.channel_id == channel_id).first()
+    if channel:
+        return channel.channel_id
+
+    try:
+        channel_number = int(str(channel_id).strip())
+    except (TypeError, ValueError):
+        return channel_id
+
+    channel = db.query(Channel).filter(Channel.number == channel_number).first()
+    if channel and channel.channel_id:
+        return channel.channel_id
+
+    return channel_id
+
+
 def get_channel_type(channel_id: str, db: DBSession) -> str:
     """Return stored SiriusXM channel type for playback tuning."""
-    channel = db.query(Channel).filter(Channel.channel_id == channel_id).first()
+    resolved_channel_id = resolve_channel_id(channel_id, db)
+    channel = db.query(Channel).filter(Channel.channel_id == resolved_channel_id).first()
 
     if channel and getattr(channel, "channel_type", None):
         return channel.channel_type
@@ -191,6 +210,11 @@ _stream_sessions = {}
 # This is intentionally small/simple: keep the active item, append one or more
 # future items, and never emit EXT-X-ENDLIST while the player is active.
 _xtra_sessions = {}
+
+# One-shot XTRA manual skip requests. When an app calls the Next endpoint,
+# we prefetch the next XTRA item here, then the next playlist reload starts
+# from that prefetched item instead of the normal tuneSource result.
+_xtra_manual_start = {}
 
 
 def _is_xtra_media_playlist_path(path: str) -> bool:
@@ -504,16 +528,29 @@ async def _ensure_xtra_queue(channel_id: str, session_info: dict, requested_path
         if initial_playlist_text is None:
             return None
 
+        # Manual Next requests prefetch a fresh XTRA item and place it here.
+        # The next player reload consumes it exactly once so playback starts
+        # with the skipped-to item instead of the normal tuneSource result.
+        manual_start = _xtra_manual_start.pop(channel_id, None)
+        first_track = manual_start.get("track") if manual_start else None
+
+        if manual_start:
+            if manual_start.get("source_context_id"):
+                session_info["source_context_id"] = manual_start.get("source_context_id")
+            if manual_start.get("sequence_token"):
+                session_info["sequence_token"] = manual_start.get("sequence_token")
+
         # Initial tuneSource can represent the current/resumed XTRA item and
         # may be near its end. Use its continuity context to start the local
         # stitched queue from a fresh peek item when possible.
-        first_track = await _fetch_xtra_256k_track(
-            channel_id=channel_id,
-            bearer=session_info.get("bearer"),
-            source_context_id=session_info.get("source_context_id"),
-            sequence_token=session_info.get("sequence_token"),
-            use_peek=True,
-        )
+        if not first_track:
+            first_track = await _fetch_xtra_256k_track(
+                channel_id=channel_id,
+                bearer=session_info.get("bearer"),
+                source_context_id=session_info.get("source_context_id"),
+                sequence_token=session_info.get("sequence_token"),
+                use_peek=True,
+            )
 
         if not first_track:
             first_track = _track_from_playlist(requested_path, initial_playlist_text, session_info.get("base_url", ""))
@@ -578,6 +615,96 @@ async def _ensure_xtra_queue(channel_id: str, session_info: dict, requested_path
             cached["append_in_progress"] = False
 
     return cached
+
+
+@router.get("/{channel_id}/xtra/next")
+@router.post("/{channel_id}/xtra/next")
+async def xtra_next(channel_id: str, db: DBSession = Depends(get_db)):
+    """
+    Skip an XTRA channel to the next item.
+
+    Client behavior:
+      1. POST this endpoint.
+      2. Stop/flush the current player buffer.
+      3. Reload the returned streamUrl.
+
+    M3U/HLS players cannot skip inside a static M3U entry by themselves, so the
+    endpoint prepares the next XTRA item server-side and tells the client to
+    reload the normal proxy-stream URL.
+    """
+    from fastapi.responses import JSONResponse
+
+    requested_channel_id = channel_id
+    channel_id = resolve_channel_id(channel_id, db)
+
+    if get_channel_type(channel_id, db) != "channel-xtra":
+        raise HTTPException(status_code=400, detail="Next is only supported for XTRA channels")
+
+    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+    if not session:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    stream_info = _stream_sessions.get(channel_id)
+
+    if not stream_info:
+        api = SiriusXMAPI(session.bearer_token)
+        result = await api.get_stream_url(channel_id, "channel-xtra")
+        if not result or not result.get("stream_url"):
+            raise HTTPException(status_code=500, detail="Failed to get XTRA stream URL")
+
+        raw_data = result.get("raw_data") or {}
+        stream_info = {
+            "base_url": result["stream_url"].rsplit("/", 1)[0] + "/",
+            "bearer": session.bearer_token,
+            "source_context_id": raw_data.get("sourceContextId"),
+            "sequence_token": raw_data.get("sequenceToken"),
+        }
+        _stream_sessions[channel_id] = stream_info
+    else:
+        # Keep bearer current in case the session was created before a token refresh.
+        stream_info["bearer"] = session.bearer_token
+
+    next_track = await _fetch_xtra_256k_track(
+        channel_id=channel_id,
+        bearer=stream_info.get("bearer"),
+        source_context_id=stream_info.get("source_context_id"),
+        sequence_token=stream_info.get("sequence_token"),
+        use_peek=True,
+    )
+
+    if not next_track or not next_track.get("segments"):
+        raise HTTPException(status_code=500, detail="Failed to prepare next XTRA item")
+
+    if next_track.get("source_context_id"):
+        stream_info["source_context_id"] = next_track.get("source_context_id")
+    if next_track.get("sequence_token"):
+        stream_info["sequence_token"] = next_track.get("sequence_token")
+
+    _xtra_sessions.pop(channel_id, None)
+    _xtra_manual_start[channel_id] = {
+        "track": next_track,
+        "source_context_id": next_track.get("source_context_id"),
+        "sequence_token": next_track.get("sequence_token"),
+    }
+
+    print(
+        f"⏭️ XTRA manual next prepared channel={channel_id} "
+        f"segments={len(next_track.get('segments') or [])}"
+    )
+
+    stream_url = f"/api/streams/{channel_id}/proxy-stream"
+    return JSONResponse(
+        content={
+            "ok": True,
+            "action": "reload",
+            "direction": "next",
+            "channelId": channel_id,
+            "requestedChannelId": requested_channel_id,
+            "streamUrl": stream_url,
+            "message": "Stop/flush the current player buffer, then reload streamUrl.",
+        },
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
 
 
 @router.get("/{channel_id}/proxy-stream")

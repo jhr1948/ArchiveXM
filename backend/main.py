@@ -9,7 +9,7 @@ import os
 import asyncio
 
 from database import create_tables
-from routers import auth, channels, streams, downloads, config, recording, library, settings, playlist
+from routers import auth, channels, streams, downloads, config, recording, library, settings, playlist, xtra
 
 # Background task reference
 _background_refresh_task = None
@@ -75,6 +75,7 @@ app.include_router(recording.router, prefix="/api/recording", tags=["Recording"]
 app.include_router(library.router, prefix="/api/library", tags=["Library"])
 app.include_router(settings.router, prefix="/api/settings", tags=["Settings"])
 app.include_router(playlist.router)
+app.include_router(xtra.router)
 
 @app.get("/api/health")
 async def health_check():

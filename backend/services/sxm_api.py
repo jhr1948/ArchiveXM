@@ -4,6 +4,8 @@ SiriusXM API Service - Handle all API interactions
 import httpx
 import base64
 import json
+import html as html_lib
+import re
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional
 import asyncio
@@ -17,6 +19,21 @@ class SiriusXMAPI:
     CDN_BASE = "https://imgsrv-sxm-prod-device.streaming.siriusxm.com/"
     
     MAX_RETRIES = 2
+
+    # Optional channel-number based group/category overrides. These match the
+    # old m3u8XM script and are applied during channel refresh so both the
+    # ArchiveXM UI and generated M3U use the preferred groups.
+    CHANNEL_GROUP_OVERRIDES = {
+        "1308": "Workout",          # Alt Workout
+        "1302": "Party",            # Oldies Party
+        "1085": "The 70s Decade",   # 70s on 7 Dance/R&B
+        "1177": "The 70s Decade",   # 70s on 7 Just Music
+        "739": "Country",           # Savior Sunday Daily by Carrie's Country
+    }
+
+    # Optional UUID-based type overrides for rare cases where both public and
+    # authenticated metadata disagree with reality.
+    CHANNEL_TYPE_OVERRIDES = {}
     
     def __init__(self, bearer_token: str = None):
         self._token_manager = None
@@ -292,6 +309,205 @@ class SiriusXMAPI:
         
         return []
     
+    def _normalize_public_text(self, value) -> str:
+        """Clean text scraped from siriusxm.com/channels."""
+        if value is None:
+            return ""
+
+        value = str(value)
+        try:
+            value = html_lib.unescape(value)
+            # Repair common mojibake from UTF-8 decoded as Latin-1.
+            if any(bad in value for bad in ("\u00c3", "\u00c2", "\u00e2")):
+                try:
+                    repaired = value.encode("latin-1").decode("utf-8")
+                    if repaired:
+                        value = repaired
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        return value.strip()
+
+    def _json_object_around(self, text: str, pos: int) -> Optional[str]:
+        """Return the JSON object surrounding pos, if it looks like a channel."""
+        start = text.rfind('{', 0, pos)
+
+        while start != -1:
+            depth = 0
+            in_string = False
+            escape = False
+
+            for i in range(start, len(text)):
+                ch = text[i]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif ch == '\\':
+                        escape = True
+                    elif ch == '"':
+                        in_string = False
+                else:
+                    if ch == '"':
+                        in_string = True
+                    elif ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            candidate = text[start:i + 1]
+                            try:
+                                obj = json.loads(candidate)
+                                if (
+                                    isinstance(obj, dict)
+                                    and "streamingChannelNumber" in obj
+                                    and "uuid" in obj
+                                ):
+                                    return candidate
+                            except Exception:
+                                break
+                            break
+
+            start = text.rfind('{', 0, start)
+
+        return None
+
+    async def fetch_public_channels(self) -> Dict[str, Dict]:
+        """
+        Fetch public SiriusXM channel metadata from siriusxm.com/channels.
+
+        This mirrors the old m3u8XM strategy: authenticated browse data remains
+        the playback source of truth, while the public page provides friendlier
+        names and genres for the UI and M3U.
+        """
+        results = {}
+        url = "https://www.siriusxm.com/channels"
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, headers=headers, timeout=20)
+
+            if response.status_code != 200:
+                print(f"Public channel page returned status {response.status_code}")
+                return results
+
+            raw_text = response.content.decode("utf-8", errors="replace")
+            decoded_variants = [raw_text, html_lib.unescape(raw_text)]
+
+            for candidate in list(decoded_variants):
+                try:
+                    decoded_variants.append(bytes(candidate, "utf-8").decode("unicode_escape"))
+                except Exception:
+                    pass
+
+            seen_objects = set()
+            for source in decoded_variants:
+                for match in re.finditer(r'"streamingChannelNumber"\s*:\s*\d+', source):
+                    obj_text = self._json_object_around(source, match.start())
+                    if not obj_text or obj_text in seen_objects:
+                        continue
+                    seen_objects.add(obj_text)
+
+                    try:
+                        item = json.loads(obj_text)
+                    except Exception:
+                        continue
+
+                    channel_number = item.get("streamingChannelNumber") or item.get("xmChannelNumber")
+                    channel_uuid = item.get("uuid")
+                    if not channel_number or not channel_uuid:
+                        continue
+
+                    title = self._normalize_public_text(item.get("displayName") or item.get("name"))
+                    genre = self._normalize_public_text(item.get("genreTitle") or item.get("genre"))
+                    is_xtra = bool(item.get("xtra_channel"))
+
+                    logo_path = ""
+                    web_image = item.get("web_2_0_image")
+                    if isinstance(web_image, dict):
+                        logo_path = web_image.get("url") or ""
+                    logo_path = self._normalize_public_text(
+                        logo_path or item.get("colorLogo") or item.get("greyscaleLogo") or ""
+                    )
+
+                    results[str(channel_number)] = {
+                        "title": title,
+                        "genre": genre,
+                        "channel_type": "channel-xtra" if is_xtra else "channel-linear",
+                        "id": str(channel_uuid),
+                        "logo_path": logo_path,
+                    }
+
+            print(f"🌐 Loaded {len(results)} public channel metadata overrides")
+            return results
+
+        except Exception as e:
+            print(f"Failed to fetch public channel metadata: {e}")
+            return results
+
+    def _format_public_logo_url(self, logo_path: str, width: int = 300, height: int = 300) -> str:
+        """Return a CDN image URL for public channel logo paths."""
+        if not logo_path:
+            return ""
+        logo_path = str(logo_path)
+        if logo_path.startswith("http"):
+            return logo_path
+        return self._build_cdn_image_url(logo_path, width, height)
+
+    def _resolve_channel_type(self, channel: Dict, public_override: Optional[Dict]) -> str:
+        """Resolve channel type while keeping authenticated playback type first."""
+        channel_uuid = str(channel.get("id") or "")
+        if channel_uuid and channel_uuid in self.CHANNEL_TYPE_OVERRIDES:
+            return self.CHANNEL_TYPE_OVERRIDES[channel_uuid]
+
+        auth_type = channel.get("channel_type")
+        if auth_type:
+            return auth_type
+
+        if public_override and public_override.get("channel_type"):
+            return public_override["channel_type"]
+
+        return "channel-linear"
+
+    def _apply_public_channel_metadata(self, channels: List[Dict], public_map: Dict[str, Dict]) -> List[Dict]:
+        """Merge public names/groups into authenticated channel rows."""
+        if not public_map:
+            return channels
+
+        for channel in channels:
+            number = channel.get("number")
+            number_key = str(number) if number is not None else ""
+            override = public_map.get(number_key, {})
+
+            if override.get("title"):
+                channel["name"] = override["title"]
+
+            if override.get("genre"):
+                channel["category"] = override["genre"]
+                channel["genre"] = override["genre"]
+
+            if number_key in self.CHANNEL_GROUP_OVERRIDES:
+                group = self.CHANNEL_GROUP_OVERRIDES[number_key]
+                channel["category"] = group
+                channel["genre"] = group
+
+            channel["channel_type"] = self._resolve_channel_type(channel, override)
+
+            public_logo = self._format_public_logo_url(override.get("logo_path", "")) if override else ""
+            if public_logo:
+                channel["images"] = {
+                    "thumbnail": public_logo,
+                    "large": public_logo,
+                }
+
+        return channels
+
     async def fetch_all_channels(self) -> List[Dict]:
         """
         Fetch complete channel list from API
@@ -411,6 +627,9 @@ class SiriusXMAPI:
                     except KeyError as e:
                         print(f"Error parsing channel data: {e}")
                     
+                    public_map = await self.fetch_public_channels()
+                    channels = self._apply_public_channel_metadata(channels, public_map)
+
                     print(f"✅ Loaded {len(channels)} channels total")
                     return channels
                 
@@ -441,6 +660,15 @@ class SiriusXMAPI:
             description = texts.get("description", {}).get("default", "")
             genre = decorations.get("genre", "")
             channel_id = entity.get("id", "")
+            channel_number = (
+                decorations.get("channelNumber")
+                or decorations.get("streamingChannelNumber")
+                or decorations.get("xmChannelNumber")
+            )
+            try:
+                channel_number = int(channel_number) if channel_number not in (None, "") else None
+            except (TypeError, ValueError):
+                channel_number = None
             
             # Get channel type from actions
             channel_type = "channel-linear"
@@ -450,7 +678,10 @@ class SiriusXMAPI:
             # Build logo URL
             logo_url = None
             try:
-                tile_images = images.get("tile", {}).get("aspect_1x1", {}).get("preferred", {})
+                tile_images = (
+                    images.get("tile", {}).get("aspect_1x1", {}).get("preferred", {})
+                    or images.get("tile", {}).get("aspect_1x1", {}).get("preferredImage", {})
+                )
                 if tile_images:
                     logo_key = tile_images.get("url", "")
                     logo_width = tile_images.get("width", 300)
@@ -472,7 +703,7 @@ class SiriusXMAPI:
             return {
                 'id': channel_id,
                 'name': title,
-                'number': None,  # Not in this API response
+                'number': channel_number,
                 'category': genre,
                 'genre': genre,
                 'description': description,

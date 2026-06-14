@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
+import html as html_lib
+import unicodedata
 
 from fastapi import APIRouter, Depends, Response
 from sqlalchemy.orm import Session as DBSession
@@ -21,7 +23,23 @@ from database import Channel, get_db
 router = APIRouter(prefix="/api", tags=["Playlist"])
 
 
+# Fallback group overrides. The main copy of these lives in sxm_api.py so the
+# database/UI are corrected at refresh time, but keeping them here protects M3U
+# output if the playlist is generated before the next channel refresh.
+CHANNEL_GROUP_OVERRIDES = {
+    "1308": "Workout",
+    "1302": "Party",
+    "1085": "The 70s Decade",
+    "1177": "The 70s Decade",
+    "739": "Country",
+}
+
+
 def build_playlist_base_url() -> str:
+    public_base_url = os.getenv("PLAYLIST_PUBLIC_BASE_URL", "").strip()
+    if public_base_url:
+        return public_base_url.rstrip("/")
+
     scheme = os.getenv("PLAYLIST_SCHEME", "http").strip() or "http"
     host = os.getenv("PLAYLIST_HOST", "localhost").strip() or "localhost"
     port = os.getenv("PLAYLIST_PORT", "").strip()
@@ -32,24 +50,40 @@ def build_playlist_base_url() -> str:
     return f"{scheme}://{host}"
 
 
-def escape_m3u_attr(value: Optional[object]) -> str:
+def clean_m3u_text(value: Optional[object]) -> str:
+    """Return plain M3U text without HTML/XML entity escaping.
+
+    IPTV players generally expect normal display text in EXTINF fields, e.g.
+    Dance/R&B instead of Dance/R&amp;B. Keep values on one line and avoid raw
+    double quotes because EXTINF attributes are quoted.
+    """
     if value is None:
         return ""
 
+    text = html_lib.unescape(str(value))
+
+    try:
+        if any(marker in text for marker in ("\u00c3", "\u00c2", "\u00e2")):
+            repaired = text.encode("latin-1").decode("utf-8")
+            if repaired:
+                text = repaired
+        text = unicodedata.normalize("NFC", text)
+    except Exception:
+        pass
+
     return (
-        str(value)
-        .replace("&", "&amp;")
-        .replace('"', "&quot;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
+        text
         .replace("\n", " ")
         .replace("\r", " ")
+        .replace('"', "'")
+        .strip()
     )
 
 
 def _group_title_for_channel(channel: Channel) -> str:
     channel_type = getattr(channel, "channel_type", None) or "channel-linear"
-    group = channel.category or channel.genre or "SiriusXM"
+    number_key = str(channel.number) if channel.number is not None else ""
+    group = CHANNEL_GROUP_OVERRIDES.get(number_key) or channel.category or channel.genre or "SiriusXM"
 
     if channel_type == "channel-xtra":
         if group.strip().lower() == "all xtra":
@@ -73,24 +107,24 @@ def generate_m3u(db: DBSession) -> str:
 
     lines = ["#EXTM3U"]
 
-    for channel in channels:
-        channel_id = escape_m3u_attr(channel.channel_id)
-        name = escape_m3u_attr(channel.name)
-        group = escape_m3u_attr(_group_title_for_channel(channel))
-        logo = escape_m3u_attr(channel.large_image_url or channel.image_url or "")
-        channel_type = escape_m3u_attr(
+    for index, channel in enumerate(channels, start=1):
+        channel_id = clean_m3u_text(channel.channel_id)
+        tvg_id = clean_m3u_text(channel.number if channel.number is not None else channel.channel_id)
+        tvg_chno = clean_m3u_text(index)
+        name = clean_m3u_text(channel.name)
+        group = clean_m3u_text(_group_title_for_channel(channel))
+        logo = clean_m3u_text(channel.large_image_url or channel.image_url or "")
+        channel_type = clean_m3u_text(
             getattr(channel, "channel_type", None) or "channel-linear"
         )
 
-        channel_number = ""
-        if channel.number is not None:
-            channel_number = f' tvg-chno="{escape_m3u_attr(channel.number)}"'
+        channel_number = f' tvg-chno="{tvg_chno}"'
 
         stream_path_channel_id = quote(str(channel.channel_id), safe="")
         stream_url = f"{base_url}/api/streams/{stream_path_channel_id}/proxy-stream"
 
         lines.append(
-            f'#EXTINF:-1 tvg-id="{channel_id}" '
+            f'#EXTINF:-1 tvg-id="{tvg_id}" '
             f'tvg-name="{name}"'
             f'{channel_number} '
             f'tvg-logo="{logo}" '

@@ -11,7 +11,7 @@ import unicodedata
 from fastapi import APIRouter, Depends, Response
 from sqlalchemy.orm import Session as DBSession
 
-from database import Channel, get_db
+from database import Channel, Config, get_db
 
 # Register this router in main.py with:
 # app.include_router(playlist.router)
@@ -35,11 +35,26 @@ CHANNEL_GROUP_OVERRIDES = {
 }
 
 
-def build_playlist_base_url() -> str:
-    public_base_url = os.getenv("PLAYLIST_PUBLIC_BASE_URL", "").strip()
-    if public_base_url:
-        return public_base_url.rstrip("/")
+def _get_config_value(db: DBSession, key: str, default: str = "") -> str:
+    try:
+        item = db.query(Config).filter(Config.key == key).first()
+        if item and item.value not in (None, ""):
+            return str(item.value).strip()
+    except Exception:
+        pass
+    return default
 
+
+def _normalize_base_url(value: str, default_scheme: str = "https") -> str:
+    value = (value or "").strip().rstrip("/")
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"{default_scheme}://{value}"
+    return value.rstrip("/")
+
+
+def _env_local_base_url() -> str:
     scheme = os.getenv("PLAYLIST_SCHEME", "http").strip() or "http"
     host = os.getenv("PLAYLIST_HOST", "localhost").strip() or "localhost"
     port = os.getenv("PLAYLIST_PORT", "").strip()
@@ -48,6 +63,25 @@ def build_playlist_base_url() -> str:
         return f"{scheme}://{host}:{port}"
 
     return f"{scheme}://{host}"
+
+
+def build_playlist_base_url(db: DBSession) -> str:
+    mode = _get_config_value(db, "playlist_url_mode", os.getenv("PLAYLIST_URL_MODE", "local")).lower()
+
+    # Frontend setting wins. Env vars remain as install/bootstrap fallback.
+    public_base_url = _get_config_value(db, "playlist_public_base_url", os.getenv("PLAYLIST_PUBLIC_BASE_URL", ""))
+    local_base_url = _get_config_value(db, "playlist_local_base_url", os.getenv("PLAYLIST_LOCAL_BASE_URL", _env_local_base_url()))
+
+    if mode == "public":
+        normalized_public = _normalize_base_url(public_base_url, "https")
+        if normalized_public:
+            return normalized_public
+
+    normalized_local = _normalize_base_url(local_base_url, "http")
+    if normalized_local:
+        return normalized_local
+
+    return _env_local_base_url().rstrip("/")
 
 
 def clean_m3u_text(value: Optional[object]) -> str:
@@ -95,7 +129,7 @@ def _group_title_for_channel(channel: Channel) -> str:
 
 
 def generate_m3u(db: DBSession) -> str:
-    base_url = build_playlist_base_url()
+    base_url = build_playlist_base_url(db)
 
     channels = (
         db.query(Channel)
@@ -121,7 +155,7 @@ def generate_m3u(db: DBSession) -> str:
         channel_number = f' tvg-chno="{tvg_chno}"'
 
         stream_path_channel_id = quote(str(channel.channel_id), safe="")
-        url_style = os.getenv("PLAYLIST_URL_STYLE", "listen").strip().lower()
+        url_style = _get_config_value(db, "playlist_url_style", os.getenv("PLAYLIST_URL_STYLE", "listen")).strip().lower()
         if url_style in ("api", "archivexm"):
             stream_url = f"{base_url}/api/streams/{stream_path_channel_id}/proxy-stream"
         else:

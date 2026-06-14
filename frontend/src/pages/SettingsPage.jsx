@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { Link } from 'react-router-dom'
 import { 
   ArrowLeft, Settings, User, Key, Plus, Trash2, Edit2, Check, X, 
-  RefreshCw, Shield, Activity, AlertCircle, CheckCircle
+  RefreshCw, Shield, Activity, AlertCircle, CheckCircle, Globe2, Wifi, Save
 } from 'lucide-react'
 import { api } from '../services/api'
 
@@ -10,6 +10,9 @@ function SettingsPage() {
   const [credentials, setCredentials] = useState([])
   const [loading, setLoading] = useState(true)
   const [stats, setStats] = useState(null)
+  const [config, setConfig] = useState(null)
+  const [configSaving, setConfigSaving] = useState(false)
+  const [configMessage, setConfigMessage] = useState('')
   
   // Add credential modal
   const [showAddModal, setShowAddModal] = useState(false)
@@ -31,16 +34,43 @@ function SettingsPage() {
 
   const loadCredentials = async () => {
     try {
-      const [credsRes, statsRes] = await Promise.all([
+      const [credsRes, statsRes, configRes] = await Promise.all([
         api.get('/api/settings/credentials'),
-        api.get('/api/settings/stream-stats')
+        api.get('/api/settings/stream-stats'),
+        api.get('/api/config')
       ])
       setCredentials(credsRes.data.credentials || [])
       setStats(statsRes.data)
+      setConfig(configRes.data)
     } catch (error) {
       console.error('Error loading credentials:', error)
     } finally {
       setLoading(false)
+    }
+  }
+
+  const handleSaveConfig = async () => {
+    if (!config) return
+    setConfigSaving(true)
+    setConfigMessage('')
+
+    try {
+      const res = await api.post('/api/config', {
+        download_path: config.download_path,
+        audio_quality: config.audio_quality,
+        playlist_url_mode: config.playlist_url_mode,
+        playlist_local_base_url: config.playlist_local_base_url || '',
+        playlist_public_base_url: config.playlist_public_base_url || '',
+        playlist_url_style: config.playlist_url_style || 'listen',
+        playlist_auto_generate: config.playlist_auto_generate
+      })
+      setConfigMessage(res.data?.playlist?.status === 'error' ? `Saved, but playlist generation failed: ${res.data.playlist.message}` : 'Saved and playlist regenerated')
+      const refreshed = await api.get('/api/config')
+      setConfig(refreshed.data)
+    } catch (error) {
+      setConfigMessage(error.response?.data?.detail || 'Failed to save playlist settings')
+    } finally {
+      setConfigSaving(false)
     }
   }
 
@@ -153,6 +183,103 @@ function SettingsPage() {
               <div className="text-2xl font-bold text-sxm-success">{stats.available_capacity}</div>
               <div className="text-gray-400 text-sm">Available</div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Playlist Settings */}
+      {config && (
+        <div className="card mb-6">
+          <h2 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+            <Globe2 className="w-5 h-5 text-sxm-accent" />
+            Playlist Output
+          </h2>
+          <p className="text-gray-400 text-sm mb-4">
+            Choose the URL shape written into generated M3U playlists. Public mode is for reverse proxy access away from home.
+          </p>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+            <button
+              type="button"
+              onClick={() => setConfig({ ...config, playlist_url_mode: 'local' })}
+              className={`p-4 rounded-lg border text-left transition-colors ${config.playlist_url_mode === 'local' ? 'border-sxm-accent bg-sxm-accent/10' : 'border-sxm-border hover:border-gray-600'}`}
+            >
+              <Wifi className="w-5 h-5 text-sxm-accent mb-2" />
+              <div className="text-white font-medium">Local / LAN</div>
+              <div className="text-gray-500 text-sm">Use your local ArchiveXM address</div>
+            </button>
+            <button
+              type="button"
+              onClick={() => setConfig({ ...config, playlist_url_mode: 'public' })}
+              className={`p-4 rounded-lg border text-left transition-colors ${config.playlist_url_mode === 'public' ? 'border-sxm-accent bg-sxm-accent/10' : 'border-sxm-border hover:border-gray-600'}`}
+            >
+              <Globe2 className="w-5 h-5 text-sxm-accent mb-2" />
+              <div className="text-white font-medium">Public / Reverse Proxy</div>
+              <div className="text-gray-500 text-sm">Use your public HTTPS domain</div>
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-gray-400 text-sm mb-1">Local base URL</label>
+              <input
+                type="text"
+                value={config.playlist_local_base_url || ''}
+                onChange={(e) => setConfig({ ...config, playlist_local_base_url: e.target.value })}
+                className="input w-full"
+                placeholder="http://10.0.0.44:8742"
+              />
+            </div>
+            <div>
+              <label className="block text-gray-400 text-sm mb-1">Public proxy base URL</label>
+              <input
+                type="text"
+                value={config.playlist_public_base_url || ''}
+                onChange={(e) => setConfig({ ...config, playlist_public_base_url: e.target.value })}
+                className="input w-full"
+                placeholder="https://yourdomain.com"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+            <div>
+              <label className="block text-gray-400 text-sm mb-1">Playlist URL style</label>
+              <select
+                value={config.playlist_url_style || 'listen'}
+                onChange={(e) => setConfig({ ...config, playlist_url_style: e.target.value })}
+                className="input w-full"
+              >
+                <option value="listen">/listen/&lt;uuid&gt; - M3You compatible</option>
+                <option value="api">/api/streams/&lt;uuid&gt;/proxy-stream</option>
+              </select>
+            </div>
+            <div className="flex items-end">
+              <label className="flex items-center gap-2 cursor-pointer pb-3">
+                <input
+                  type="checkbox"
+                  checked={!!config.playlist_auto_generate}
+                  onChange={(e) => setConfig({ ...config, playlist_auto_generate: e.target.checked })}
+                  className="w-4 h-4 rounded"
+                />
+                <span className="text-gray-300 text-sm">Auto-generate playlist on config changes</span>
+              </label>
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between mt-5">
+            <div className="text-sm text-gray-400">
+              Playlist endpoint: <span className="text-gray-300">/api/playlist.m3u</span>
+              {configMessage && <div className="text-sxm-success mt-1">{configMessage}</div>}
+            </div>
+            <button
+              onClick={handleSaveConfig}
+              disabled={configSaving}
+              className="btn-primary flex items-center gap-2"
+            >
+              {configSaving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+              Save Playlist Settings
+            </button>
           </div>
         </div>
       )}

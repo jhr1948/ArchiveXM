@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Optional
 import os
 
-from database import get_db, Config, Credentials
+from database import get_db, Config, Credentials, Channel
 
 router = APIRouter()
 
@@ -16,12 +16,22 @@ router = APIRouter()
 class ConfigUpdate(BaseModel):
     download_path: Optional[str] = None
     audio_quality: Optional[str] = None
+    playlist_url_mode: Optional[str] = None
+    playlist_local_base_url: Optional[str] = None
+    playlist_public_base_url: Optional[str] = None
+    playlist_url_style: Optional[str] = None
+    playlist_auto_generate: Optional[bool] = None
 
 
 class SetupRequest(BaseModel):
     username: str
     password: str
     download_path: str
+    playlist_url_mode: str = "local"
+    playlist_local_base_url: Optional[str] = None
+    playlist_public_base_url: Optional[str] = None
+    playlist_url_style: str = "listen"
+    playlist_auto_generate: bool = True
 
 
 class ConfigResponse(BaseModel):
@@ -29,6 +39,98 @@ class ConfigResponse(BaseModel):
     download_path: str | None
     audio_quality: str
     has_credentials: bool
+    playlist_url_mode: str
+    playlist_local_base_url: str | None
+    playlist_public_base_url: str | None
+    playlist_url_style: str
+    playlist_auto_generate: bool
+
+
+PLAYLIST_CONFIG_KEYS = {
+    "playlist_url_mode",
+    "playlist_local_base_url",
+    "playlist_public_base_url",
+    "playlist_url_style",
+    "playlist_auto_generate",
+}
+
+
+def _get_config_value(db: DBSession, key: str, default=None):
+    item = db.query(Config).filter(Config.key == key).first()
+    if item is None or item.value in (None, ""):
+        return default
+    return item.value
+
+
+def _set_config_value(db: DBSession, key: str, value):
+    if value is None:
+        return
+    if isinstance(value, bool):
+        value = "true" if value else "false"
+    else:
+        value = str(value).strip()
+    item = db.query(Config).filter(Config.key == key).first()
+    if item:
+        item.value = value
+        item.updated_at = datetime.utcnow()
+    else:
+        db.add(Config(key=key, value=value))
+
+
+def _get_bool_config(db: DBSession, key: str, default: bool = False) -> bool:
+    value = _get_config_value(db, key, None)
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _default_local_base_url() -> str:
+    scheme = os.getenv("PLAYLIST_SCHEME", "http").strip() or "http"
+    host = os.getenv("PLAYLIST_HOST", "localhost").strip() or "localhost"
+    port = os.getenv("PLAYLIST_PORT", "").strip()
+    if port:
+        return f"{scheme}://{host}:{port}"
+    return f"{scheme}://{host}"
+
+
+async def _refresh_channels_for_setup(api, db: DBSession) -> int:
+    channels_data = await api.fetch_all_channels()
+    if not channels_data:
+        return 0
+
+    updated_count = 0
+    for ch_data in channels_data:
+        channel_type = ch_data.get("channel_type") or ch_data.get("type") or "channel-linear"
+        existing = db.query(Channel).filter(Channel.channel_id == ch_data["id"]).first()
+        images = ch_data.get("images", {}) or {}
+
+        if existing:
+            existing.channel_type = channel_type
+            existing.name = ch_data.get("name", existing.name)
+            existing.number = ch_data.get("number", existing.number)
+            existing.category = ch_data.get("category", existing.category)
+            existing.genre = ch_data.get("genre", existing.genre)
+            existing.description = ch_data.get("description", existing.description)
+            existing.image_url = images.get("thumbnail")
+            existing.large_image_url = images.get("large")
+            existing.updated_at = datetime.utcnow()
+        else:
+            db.add(Channel(
+                channel_id=ch_data["id"],
+                channel_type=channel_type,
+                name=ch_data.get("name", "Unknown"),
+                number=ch_data.get("number") or 0,
+                category=ch_data.get("category"),
+                genre=ch_data.get("genre"),
+                description=ch_data.get("description"),
+                image_url=images.get("thumbnail"),
+                large_image_url=images.get("large"),
+            ))
+
+        updated_count += 1
+
+    db.commit()
+    return updated_count
 
 
 @router.get("", response_model=ConfigResponse)
@@ -39,14 +141,19 @@ async def get_config(db: DBSession = Depends(get_db)):
     download_path_config = db.query(Config).filter(Config.key == "download_path").first()
     quality_config = db.query(Config).filter(Config.key == "audio_quality").first()
     creds = db.query(Credentials).first()
-    
+
     is_configured = bool(download_path_config and creds)
-    
+
     return ConfigResponse(
         is_configured=is_configured,
         download_path=download_path_config.value if download_path_config else None,
         audio_quality=quality_config.value if quality_config else "256k",
-        has_credentials=bool(creds)
+        has_credentials=bool(creds),
+        playlist_url_mode=_get_config_value(db, "playlist_url_mode", os.getenv("PLAYLIST_URL_MODE", "local")),
+        playlist_local_base_url=_get_config_value(db, "playlist_local_base_url", os.getenv("PLAYLIST_LOCAL_BASE_URL", _default_local_base_url())),
+        playlist_public_base_url=_get_config_value(db, "playlist_public_base_url", os.getenv("PLAYLIST_PUBLIC_BASE_URL", "")),
+        playlist_url_style=_get_config_value(db, "playlist_url_style", os.getenv("PLAYLIST_URL_STYLE", "listen")),
+        playlist_auto_generate=_get_bool_config(db, "playlist_auto_generate", True),
     )
 
 
@@ -56,30 +163,33 @@ async def update_config(request: ConfigUpdate, db: DBSession = Depends(get_db)):
     Update configuration settings
     """
     updates = {}
-    
+
     if request.download_path:
-        config = db.query(Config).filter(Config.key == "download_path").first()
-        if config:
-            config.value = request.download_path
-            config.updated_at = datetime.utcnow()
-        else:
-            config = Config(key="download_path", value=request.download_path)
-            db.add(config)
+        _set_config_value(db, "download_path", request.download_path)
         updates["download_path"] = request.download_path
-    
+
     if request.audio_quality:
-        config = db.query(Config).filter(Config.key == "audio_quality").first()
-        if config:
-            config.value = request.audio_quality
-            config.updated_at = datetime.utcnow()
-        else:
-            config = Config(key="audio_quality", value=request.audio_quality)
-            db.add(config)
+        _set_config_value(db, "audio_quality", request.audio_quality)
         updates["audio_quality"] = request.audio_quality
-    
+
+    for key in PLAYLIST_CONFIG_KEYS:
+        if hasattr(request, key):
+            value = getattr(request, key)
+            if value is not None:
+                _set_config_value(db, key, value)
+                updates[key] = value
+
     db.commit()
-    
-    return {"success": True, "updated": updates}
+
+    playlist_result = None
+    if request.playlist_auto_generate is not None or any(k in updates for k in PLAYLIST_CONFIG_KEYS):
+        try:
+            from routers.playlist import write_m3u_to_file
+            playlist_result = write_m3u_to_file(db)
+        except Exception as e:
+            playlist_result = {"status": "error", "message": str(e)}
+
+    return {"success": True, "updated": updates, "playlist": playlist_result}
 
 
 @router.get("/setup-status")
@@ -89,7 +199,7 @@ async def get_setup_status(db: DBSession = Depends(get_db)):
     """
     creds = db.query(Credentials).first()
     download_path = db.query(Config).filter(Config.key == "download_path").first()
-    
+
     return {
         "needs_setup": not (creds and download_path),
         "has_credentials": bool(creds),
@@ -100,20 +210,19 @@ async def get_setup_status(db: DBSession = Depends(get_db)):
 @router.post("/setup")
 async def initial_setup(request: SetupRequest, db: DBSession = Depends(get_db)):
     """
-    Complete initial setup (credentials + download path)
+    Complete initial setup (credentials + download path + playlist settings)
     """
     from services.auth_service import AuthService
+    from services.sxm_api import SiriusXMAPI
     import json
-    
+
     try:
-        # Authenticate first
         auth_service = AuthService()
         result = await auth_service.authenticate(request.username, request.password)
-        
+
         if not result["success"]:
             raise HTTPException(status_code=401, detail="Authentication failed")
-        
-        # Store credentials
+
         existing_creds = db.query(Credentials).first()
         if existing_creds:
             existing_creds.username = request.username
@@ -125,11 +234,10 @@ async def initial_setup(request: SetupRequest, db: DBSession = Depends(get_db)):
                 password_encrypted=auth_service.encrypt_password(request.password)
             )
             db.add(creds)
-        
-        # Store session
+
         from database import Session as AuthSession
         db.query(AuthSession).update({"is_valid": False})
-        
+
         session = AuthSession(
             bearer_token=result["bearer_token"],
             cookies=json.dumps(result.get("cookies", {})),
@@ -137,23 +245,39 @@ async def initial_setup(request: SetupRequest, db: DBSession = Depends(get_db)):
             is_valid=True
         )
         db.add(session)
-        
-        # Store download path
-        path_config = db.query(Config).filter(Config.key == "download_path").first()
-        if path_config:
-            path_config.value = request.download_path
-            path_config.updated_at = datetime.utcnow()
-        else:
-            path_config = Config(key="download_path", value=request.download_path)
-            db.add(path_config)
-        
+
+        _set_config_value(db, "download_path", request.download_path)
+        _set_config_value(db, "playlist_url_mode", request.playlist_url_mode or "local")
+        if request.playlist_local_base_url:
+            _set_config_value(db, "playlist_local_base_url", request.playlist_local_base_url)
+        if request.playlist_public_base_url:
+            _set_config_value(db, "playlist_public_base_url", request.playlist_public_base_url)
+        _set_config_value(db, "playlist_url_style", request.playlist_url_style or "listen")
+        _set_config_value(db, "playlist_auto_generate", request.playlist_auto_generate)
+
         db.commit()
-        
+
+        channels_refreshed = 0
+        playlist_result = None
+        setup_warnings = []
+
+        if request.playlist_auto_generate:
+            try:
+                api = SiriusXMAPI(result["bearer_token"])
+                channels_refreshed = await _refresh_channels_for_setup(api, db)
+                from routers.playlist import write_m3u_to_file
+                playlist_result = write_m3u_to_file(db)
+            except Exception as e:
+                setup_warnings.append(f"Playlist auto-generation failed: {str(e)}")
+
         return {
             "success": True,
-            "message": "Setup complete! You can now browse channels."
+            "message": "Setup complete! Channels refreshed and playlist generated." if request.playlist_auto_generate else "Setup complete! You can now browse channels.",
+            "channels_refreshed": channels_refreshed,
+            "playlist": playlist_result,
+            "warnings": setup_warnings,
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -172,10 +296,10 @@ async def get_download_paths():
         "/media",
         "/mnt"
     ]
-    
+
     valid_paths = []
     for path in base_paths:
         if os.path.exists(os.path.dirname(path)) or os.path.exists(path):
             valid_paths.append(path)
-    
+
     return {"paths": valid_paths}

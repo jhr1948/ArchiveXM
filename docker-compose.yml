@@ -10,12 +10,17 @@ services:
     ports:
       - "${BACKEND_PORT:-8742}:8000"
     volumes:
-      - ./data:/app/data
-      - ./downloads:/app/downloads
-      - ${DOWNLOAD_PATH:-./downloads}:/downloads
+      - /mnt/user/appdata/archivexm/data:/app/data
+      - /mnt/user/appdata/archivexm/downloads:/app/downloads
+      - /mnt/user/appdata/archivexm/downloads:/downloads
+      - /mnt/user/appdata/archivexm/output:/app/output
     environment:
       - DATABASE_URL=sqlite:///./data/archivexm.db
       - DOWNLOAD_PATH=/downloads
+      - PLAYLIST_SCHEME=${PLAYLIST_SCHEME:-http}
+      - PLAYLIST_HOST=${PLAYLIST_HOST:-10.0.0.44}
+      - PLAYLIST_PORT=${PLAYLIST_PORT:-8742}
+      - PLAYLIST_OUTPUT=${PLAYLIST_OUTPUT:-/app/output/siriusxm.m3u}
     restart: unless-stopped
     networks:
       - archivexm-network

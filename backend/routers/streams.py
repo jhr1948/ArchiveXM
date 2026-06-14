@@ -15,6 +15,17 @@ from services.hls_service import HLSService
 router = APIRouter()
 
 
+def get_channel_type(channel_id: str, db: DBSession) -> str:
+    """Return stored SiriusXM channel type for playback tuning."""
+    channel = db.query(Channel).filter(Channel.channel_id == channel_id).first()
+
+    if channel and getattr(channel, "channel_type", None):
+        return channel.channel_type
+
+    return "channel-linear"
+
+
+
 class TrackInfo(BaseModel):
     artist: str
     title: str
@@ -156,7 +167,7 @@ async def get_stream_url(channel_id: str, db: DBSession = Depends(get_db)):
     
     try:
         api = SiriusXMAPI(session.bearer_token)
-        result = await api.get_stream_url(channel_id)
+        result = await api.get_stream_url(channel_id, get_channel_type(channel_id, db))
         
         if not result or not result.get('stream_url'):
             raise HTTPException(status_code=500, detail="Failed to get stream URL")
@@ -190,7 +201,7 @@ async def proxy_stream(channel_id: str, db: DBSession = Depends(get_db)):
     
     try:
         api = SiriusXMAPI(session.bearer_token)
-        result = await api.get_stream_url(channel_id)
+        result = await api.get_stream_url(channel_id, get_channel_type(channel_id, db))
         
         if not result or not result.get('stream_url'):
             raise HTTPException(status_code=500, detail="Failed to get stream URL")
@@ -213,16 +224,47 @@ async def proxy_stream(channel_id: str, db: DBSession = Depends(get_db)):
             
             content = response.text
             
-            # Rewrite URLs to go through our proxy endpoint
+            # Rewrite URLs to go through our proxy endpoint.
+            # For XTRA channels, expose only the 256k variant to avoid
+            # player startup switching from 32k to 256k after the first segment.
+            channel_type = get_channel_type(channel_id, db)
+            source_lines = content.split('\n')
+
+            if channel_type == "channel-xtra":
+                filtered_lines = ["#EXTM3U"]
+                i = 0
+
+                while i < len(source_lines):
+                    line = source_lines[i].strip()
+
+                    if line.startswith("#EXT-X-STREAM-INF"):
+                        variant_info = line
+                        variant_uri = source_lines[i + 1].strip() if i + 1 < len(source_lines) else ""
+
+                        if "_256k_" in variant_uri or "BANDWIDTH=281600" in variant_info:
+                            filtered_lines.append(variant_info)
+                            filtered_lines.append(variant_uri)
+
+                        i += 2
+                        continue
+
+                    if line.startswith("#EXT-X-") and not line.startswith("#EXT-X-STREAM-INF"):
+                        filtered_lines.append(line)
+                        i += 1
+                        continue
+
+                    i += 1
+
+                source_lines = filtered_lines
+
             rewritten_lines = []
-            for line in content.split('\n'):
+            for line in source_lines:
                 line = line.strip()
                 if line and not line.startswith('#'):
-                    # Rewrite to proxy URL
                     rewritten_lines.append(f"/api/streams/{channel_id}/hls-proxy/{line}")
                 else:
                     rewritten_lines.append(line)
-            
+
             rewritten_content = '\n'.join(rewritten_lines)
             
             return Response(
@@ -257,7 +299,7 @@ async def hls_proxy(channel_id: str, path: str, db: DBSession = Depends(get_db))
             raise HTTPException(status_code=401, detail="Not authenticated")
         
         api = SiriusXMAPI(session.bearer_token)
-        result = await api.get_stream_url(channel_id)
+        result = await api.get_stream_url(channel_id, get_channel_type(channel_id, db))
         
         if result and result.get('stream_url'):
             base_url = result['stream_url'].rsplit('/', 1)[0] + '/'

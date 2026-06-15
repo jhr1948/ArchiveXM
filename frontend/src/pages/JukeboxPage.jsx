@@ -33,6 +33,7 @@ function JukeboxPage() {
     seek,
     addToQueue,
     removeFromQueue,
+    removeTrackFromPlayback,
     clearQueue,
     playAll,
     shuffleAll,
@@ -130,10 +131,12 @@ function JukeboxPage() {
     return `${mins}:${secs.toString().padStart(2, '0')}`
   }
 
-  // Pause live stream before starting Jukebox playback
+  // Stop live stream before starting Jukebox playback so the Jukebox player
+  // becomes the active bottom banner immediately. Pausing live audio is not enough
+  // because currentChannel remains set and the UI still thinks live is active.
   const pauseLiveIfPlaying = () => {
-    if (livePlayer.isPlaying) {
-      livePlayer.togglePlay()
+    if (livePlayer.currentChannel || livePlayer.isPlaying) {
+      livePlayer.stop()
     }
   }
 
@@ -165,7 +168,13 @@ function JukeboxPage() {
     if (!newPlaylistName.trim()) return
     
     try {
-      await libraryApi.createPlaylist(newPlaylistName)
+      const created = await libraryApi.createPlaylist(newPlaylistName)
+
+      if (trackToAdd && created?.data?.id) {
+        await libraryApi.addToPlaylist(created.data.id, [trackToAdd.id])
+        setTrackToAdd(null)
+      }
+
       setNewPlaylistName('')
       setShowPlaylistModal(false)
       const res = await libraryApi.getPlaylists()
@@ -181,9 +190,14 @@ function JukeboxPage() {
     try {
       await libraryApi.addToPlaylist(playlistId, [trackToAdd.id])
       setTrackToAdd(null)
+      setNewPlaylistName('')
       // Refresh playlists
       const res = await libraryApi.getPlaylists()
       setPlaylists(res.data || [])
+      if (selectedPlaylist?.id === playlistId) {
+        const playlistRes = await libraryApi.getPlaylist(playlistId)
+        setSelectedPlaylist(playlistRes.data)
+      }
     } catch (error) {
       console.error('Error adding to playlist:', error)
     }
@@ -265,6 +279,58 @@ function JukeboxPage() {
     }
   }
 
+  const deleteTrackEverywhere = async (track) => {
+    if (!track) return
+
+    const trackName = track.title || track.filename || 'this song'
+    const confirmed = window.confirm(
+      `Delete "${trackName}" from the Jukebox?
+
+This removes it from all playlists and deletes the local audio file.`
+    )
+
+    if (!confirmed) return
+
+    try {
+      await libraryApi.deleteTrack(track.id, true)
+
+      // Remove from local track list immediately
+      setTracks(prev => prev.filter(t => t.id !== track.id))
+
+      // Remove from selected playlist immediately if it is visible
+      if (selectedPlaylist?.tracks) {
+        setSelectedPlaylist(prev => prev ? {
+          ...prev,
+          tracks: (prev.tracks || []).filter(pt => pt.track?.id !== track.id),
+          track_count: Math.max(0, (prev.track_count || 0) - ((prev.tracks || []).some(pt => pt.track?.id === track.id) ? 1 : 0))
+        } : prev)
+      }
+
+      // Stop playback if this is the currently-playing track, and remove it from queue.
+      if (removeTrackFromPlayback) {
+        removeTrackFromPlayback(track.id)
+      } else {
+        setQueue(prev => prev.filter(t => t.id !== track.id))
+      }
+
+      // Refresh playlists/stats because deleting a track can affect every playlist
+      const [playlistsRes, statsRes] = await Promise.all([
+        libraryApi.getPlaylists(),
+        libraryApi.getStats()
+      ])
+      setPlaylists(playlistsRes.data || [])
+      setStats(statsRes.data)
+
+      if (selectedPlaylist?.id) {
+        const playlistRes = await libraryApi.getPlaylist(selectedPlaylist.id)
+        setSelectedPlaylist(playlistRes.data)
+      }
+    } catch (error) {
+      console.error('Error deleting track:', error)
+      window.alert('Failed to delete the song. Check the backend logs for details.')
+    }
+  }
+
   const getFilteredTracks = () => {
     if (!searchQuery) return tracks
     const query = searchQuery.toLowerCase()
@@ -330,91 +396,8 @@ function JukeboxPage() {
   }
 
   return (
-    <div className="flex flex-col h-screen bg-gray-950" onClick={closeContextMenu}>
-      {/* Live Stream Bar - shows when live stream is active */}
-      {livePlayer.currentChannel && (
-        <div className="bg-gray-900 border-b border-gray-700 px-4 py-2 flex-shrink-0">
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex items-center gap-3 flex-1 min-w-0">
-              <div className="w-10 h-10 rounded overflow-hidden bg-gray-800 flex-shrink-0">
-                {livePlayer.currentChannel.image ? (
-                  <img 
-                    src={livePlayer.currentChannel.image} 
-                    alt={livePlayer.currentChannel.name}
-                    className="w-full h-full object-cover"
-                  />
-                ) : (
-                  <div className="w-full h-full flex items-center justify-center">
-                    <Radio className="w-5 h-5 text-gray-500" />
-                  </div>
-                )}
-              </div>
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <div className="flex items-center gap-1 px-2 py-0.5 bg-red-600/20 rounded-full">
-                    <span className="w-1.5 h-1.5 bg-red-500 rounded-full animate-pulse"></span>
-                    <span className="text-[10px] text-red-400 font-medium">LIVE</span>
-                  </div>
-                  <span className="text-sm text-primary font-medium truncate">
-                    {livePlayer.currentChannel.name}
-                  </span>
-                </div>
-                {livePlayer.currentTrack && (
-                  <p className="text-white text-sm truncate">
-                    {livePlayer.currentTrack.artist} - {livePlayer.currentTrack.title}
-                  </p>
-                )}
-              </div>
-            </div>
-            <div className="flex items-center gap-3">
-              <button
-                onClick={livePlayer.togglePlay}
-                disabled={livePlayer.isLoading}
-                className="w-8 h-8 rounded-full bg-white text-black flex items-center justify-center hover:scale-105 transition-transform disabled:opacity-50"
-              >
-                {livePlayer.isLoading ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : livePlayer.isPlaying ? (
-                  <Pause className="w-4 h-4" />
-                ) : (
-                  <Play className="w-4 h-4 ml-0.5" />
-                )}
-              </button>
-              <button
-                onClick={() => livePlayer.setIsMuted(!livePlayer.isMuted)}
-                className="text-gray-400 hover:text-white transition-colors"
-              >
-                {livePlayer.isMuted || livePlayer.volume === 0 ? (
-                  <VolumeX className="w-4 h-4" />
-                ) : (
-                  <Volume2 className="w-4 h-4" />
-                )}
-              </button>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.01"
-                value={livePlayer.isMuted ? 0 : livePlayer.volume}
-                onChange={(e) => livePlayer.setVolume(parseFloat(e.target.value))}
-                className="w-20 h-1 bg-gray-700 rounded-full appearance-none cursor-pointer
-                  [&::-webkit-slider-thumb]:appearance-none
-                  [&::-webkit-slider-thumb]:w-2
-                  [&::-webkit-slider-thumb]:h-2
-                  [&::-webkit-slider-thumb]:rounded-full
-                  [&::-webkit-slider-thumb]:bg-white"
-              />
-              <button
-                onClick={livePlayer.stop}
-                className="text-gray-400 hover:text-red-400 transition-colors"
-                title="Stop live stream"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+    <div className="fixed inset-0 flex flex-col bg-gray-950 overflow-hidden overscroll-none" onClick={closeContextMenu}>
+      {/* Live streams are handled by the global UnifiedPlayerBar at the bottom. */}
 
       {/* Main Content */}
       <div className="flex-1 flex overflow-hidden">
@@ -726,6 +709,13 @@ function JukeboxPage() {
                           >
                             <ListPlus className="w-4 h-4" />
                           </button>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); deleteTrackEverywhere(track) }}
+                            className="hidden sm:block p-1 text-gray-500 hover:text-red-400"
+                            title="Delete song from Jukebox"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
                         </div>
                       </td>
                     </tr>
@@ -803,7 +793,7 @@ function JukeboxPage() {
                         <th className="px-4 py-3 w-20">
                           <Clock className="w-4 h-4" />
                         </th>
-                        <th className="px-4 py-3 w-12"></th>
+                        <th className="px-4 py-3 w-24"></th>
                       </tr>
                     </thead>
                     <tbody>
@@ -836,16 +826,28 @@ function JukeboxPage() {
                           <td className="px-4 py-3 text-gray-400">{pt.track.artist || 'Unknown'}</td>
                           <td className="px-4 py-3 text-gray-500">{formatTime(pt.track.duration_seconds)}</td>
                           <td className="px-4 py-3">
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation()
-                                removeTrackFromPlaylist(pt.track.id)
-                              }}
-                              className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-400 transition-all"
-                              title="Remove from playlist"
-                            >
-                              <X className="w-4 h-4" />
-                            </button>
+                            <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-all">
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  removeTrackFromPlaylist(pt.track.id)
+                                }}
+                                className="text-gray-500 hover:text-white transition-colors"
+                                title="Remove from this playlist"
+                              >
+                                <X className="w-4 h-4" />
+                              </button>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  deleteTrackEverywhere(pt.track)
+                                }}
+                                className="text-gray-500 hover:text-red-400 transition-colors"
+                                title="Delete song from Jukebox"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       ))}
@@ -940,153 +942,305 @@ function JukeboxPage() {
         )}
       </div>
 
-      {/* Player Bar */}
-      <div className="bg-gray-900 border-t border-gray-800 px-2 sm:px-4 py-2 sm:py-3">
-        {/* Mobile layout */}
-        <div className="sm:hidden">
-          {/* Progress bar on top for mobile */}
-          <div className="flex items-center gap-2 mb-2">
-            <span className="text-xs text-gray-500 w-8 text-right">{formatTime(currentTime)}</span>
-            <input
-              type="range"
-              min={0}
-              max={duration || 100}
-              value={currentTime}
-              onChange={handleSeek}
-              className="flex-1 h-1 bg-gray-700 rounded-full appearance-none cursor-pointer
-                [&::-webkit-slider-thumb]:appearance-none
-                [&::-webkit-slider-thumb]:w-3
-                [&::-webkit-slider-thumb]:h-3
-                [&::-webkit-slider-thumb]:rounded-full
-                [&::-webkit-slider-thumb]:bg-white"
-            />
-            <span className="text-xs text-gray-500 w-8">{formatTime(duration)}</span>
-          </div>
-          
-          <div className="flex items-center gap-2">
-            {/* Track Info */}
-            <div className="flex items-center gap-2 flex-1 min-w-0">
-              {currentTrack ? (
-                <>
-                  <div className="w-10 h-10 bg-gray-800 rounded flex items-center justify-center flex-shrink-0 overflow-hidden">
-                    {currentTrack.cover_art_path ? (
-                      <img src={libraryApi.getCoverUrl(currentTrack.id)} alt="" className="w-full h-full object-cover" />
-                    ) : (
-                      <Music className="w-5 h-5 text-gray-600" />
-                    )}
+      {/* Live Player Bar - shown inside Jukebox when a live stream is active */}
+      {livePlayer.currentChannel && (
+        <div className="bg-gray-900 border-t border-gray-700 px-6 py-4 min-h-[104px] flex-shrink-0">
+          <div className="flex items-center justify-between gap-6">
+            {/* Left: Channel Info */}
+            <div className="flex items-center gap-4 flex-1 min-w-0">
+              <div className="w-20 h-20 rounded-xl overflow-hidden bg-gray-800 flex-shrink-0">
+                {livePlayer.currentTrack?.image_url ? (
+                  <img
+                    src={livePlayer.currentTrack.image_url}
+                    alt={livePlayer.currentTrack.title || livePlayer.currentChannel.name}
+                    className="w-full h-full object-cover"
+                  />
+                ) : livePlayer.currentChannel.image ? (
+                  <img
+                    src={livePlayer.currentChannel.image}
+                    alt={livePlayer.currentChannel.name}
+                    className="w-full h-full object-cover"
+                  />
+                ) : (
+                  <div className="w-full h-full flex items-center justify-center">
+                    <Radio className="w-8 h-8 text-gray-500" />
                   </div>
-                  <div className="min-w-0 flex-1">
-                    <p className="text-white text-sm font-medium truncate">{currentTrack.title || currentTrack.filename}</p>
-                    <p className="text-gray-400 text-xs truncate">{currentTrack.artist || 'Unknown'}</p>
+                )}
+              </div>
+
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-3 mb-1">
+                  <div className={`flex items-center gap-2 px-3 py-1 rounded-full ${livePlayer.isXtra ? 'bg-primary/20' : 'bg-red-600/20'}`}>
+                    <span className={`w-2 h-2 rounded-full animate-pulse ${livePlayer.isXtra ? 'bg-primary' : 'bg-red-500'}`}></span>
+                    <span className={`text-xs font-semibold tracking-wide ${livePlayer.isXtra ? 'text-primary' : 'text-red-400'}`}>
+                      {livePlayer.isXtra ? 'XTRA' : 'LIVE'}
+                    </span>
                   </div>
-                </>
-              ) : (
-                <p className="text-gray-500 text-sm">No track</p>
+
+                  <span className="text-base text-primary font-semibold truncate">
+                    {livePlayer.currentChannel.name}
+                  </span>
+                </div>
+
+                {livePlayer.currentTrack ? (
+                  <div className="min-w-0">
+                    <p className="text-white text-xl font-semibold truncate leading-tight">
+                      {livePlayer.currentTrack.title}
+                    </p>
+                    <p className="text-gray-300 text-base truncate">
+                      {livePlayer.currentTrack.artist || ''}
+                    </p>
+                  </div>
+                ) : (
+                  <p className="text-gray-300 text-base truncate">
+                    Loading track info...
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {/* Center: Controls */}
+            <div className="flex items-center gap-4">
+              <button
+                onClick={livePlayer.togglePlay}
+                disabled={livePlayer.isLoading}
+                className="w-14 h-14 rounded-full bg-white text-black flex items-center justify-center hover:scale-105 transition-transform disabled:opacity-50"
+                title={livePlayer.isPlaying ? 'Pause' : 'Play'}
+              >
+                {livePlayer.isLoading ? (
+                  <Loader2 className="w-7 h-7 animate-spin" />
+                ) : livePlayer.isPlaying ? (
+                  <Pause className="w-7 h-7" />
+                ) : (
+                  <Play className="w-7 h-7 ml-1" />
+                )}
+              </button>
+
+              {livePlayer.isXtra && (
+                <button
+                  onClick={livePlayer.skipNextXtra}
+                  disabled={livePlayer.isLoading || livePlayer.isSkippingNext}
+                  className="w-14 h-14 rounded-full bg-gray-800 text-white flex items-center justify-center hover:bg-gray-700 transition-colors disabled:opacity-50"
+                  title="Next XTRA track"
+                >
+                  {livePlayer.isSkippingNext ? (
+                    <Loader2 className="w-7 h-7 animate-spin" />
+                  ) : (
+                    <SkipForward className="w-7 h-7" />
+                  )}
+                </button>
               )}
             </div>
-            
-            {/* Controls */}
-            <div className="flex items-center gap-1">
-              <button onClick={playPrevious} className="p-2 text-gray-400 hover:text-white">
-                <SkipBack className="w-5 h-5" />
-              </button>
+
+            {/* Right: Volume & Close */}
+            <div className="flex items-center gap-4 flex-1 justify-end">
               <button
-                onClick={togglePlay}
-                disabled={!currentTrack}
-                className="w-10 h-10 bg-white text-black rounded-full flex items-center justify-center disabled:opacity-50"
+                onClick={livePlayer.toggleMute}
+                className="text-gray-400 hover:text-white transition-colors"
+                title={livePlayer.isMuted ? 'Unmute' : 'Mute'}
               >
-                {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5 ml-0.5" />}
+                {livePlayer.isMuted || livePlayer.volume === 0 ? (
+                  <VolumeX className="w-6 h-6" />
+                ) : (
+                  <Volume2 className="w-6 h-6" />
+                )}
               </button>
-              <button onClick={playNext} className="p-2 text-gray-400 hover:text-white">
-                <SkipForward className="w-5 h-5" />
-              </button>
+
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                value={livePlayer.isMuted ? 0 : livePlayer.volume}
+                onChange={(e) => livePlayer.setVolume(parseFloat(e.target.value))}
+                className="w-32 h-2 bg-gray-700 rounded-full appearance-none cursor-pointer
+                  [&::-webkit-slider-thumb]:appearance-none
+                  [&::-webkit-slider-thumb]:w-4
+                  [&::-webkit-slider-thumb]:h-4
+                  [&::-webkit-slider-thumb]:rounded-full
+                  [&::-webkit-slider-thumb]:bg-white"
+              />
+
               <button
-                onClick={() => setShowQueue(!showQueue)}
-                className={`p-2 ${showQueue ? 'text-primary' : 'text-gray-400 hover:text-white'}`}
+                onClick={livePlayer.stop}
+                className="text-gray-400 hover:text-red-400 transition-colors"
+                title="Stop live stream"
               >
-                <List className="w-5 h-5" />
+                <X className="w-6 h-6" />
               </button>
             </div>
           </div>
         </div>
-        
-        {/* Desktop layout */}
-        <div className="hidden sm:flex items-center gap-4">
-          {/* Track Info */}
-          <div className="flex items-center gap-3 w-48 md:w-64">
+      )}
+
+      {/* Player Bar - only show Jukebox controls when a live stream is not active */}
+      {!livePlayer.currentChannel && (
+      <div className="bg-gray-900 border-t border-gray-800 px-6 py-4 min-h-[104px] flex-shrink-0">
+        {/* Mobile layout */}
+        <div className="sm:hidden">
+          <div className="flex items-center gap-3 mb-3">
             {currentTrack ? (
               <>
-                <div className="w-12 md:w-14 h-12 md:h-14 bg-gray-800 rounded flex items-center justify-center flex-shrink-0 overflow-hidden">
+                <div className="w-14 h-14 bg-gray-800 rounded-xl flex items-center justify-center flex-shrink-0 overflow-hidden">
                   {currentTrack.cover_art_path ? (
-                    <img 
-                      src={libraryApi.getCoverUrl(currentTrack.id)} 
-                      alt="" 
+                    <img src={libraryApi.getCoverUrl(currentTrack.id)} alt="" className="w-full h-full object-cover" />
+                  ) : (
+                    <Music className="w-7 h-7 text-gray-600" />
+                  )}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-white text-base font-semibold truncate">{currentTrack.title || currentTrack.filename}</p>
+                  <p className="text-gray-300 text-sm truncate">{currentTrack.artist || 'Unknown'}</p>
+                </div>
+                <button
+                  onClick={() => setTrackToAdd(currentTrack)}
+                  className="p-2 text-gray-400 hover:text-white"
+                  title="Add to playlist"
+                >
+                  <ListPlus className="w-5 h-5" />
+                </button>
+                <button
+                  onClick={() => deleteTrackEverywhere(currentTrack)}
+                  className="p-2 text-gray-400 hover:text-red-400"
+                  title="Delete song from Jukebox"
+                >
+                  <Trash2 className="w-5 h-5" />
+                </button>
+              </>
+            ) : (
+              <p className="text-gray-500 text-sm">No track playing</p>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2 mb-3">
+            <span className="text-xs text-gray-500 w-10 text-right">{formatTime(currentTime)}</span>
+            <input
+              type="range"
+              min={0}
+              max={duration || 100}
+              step="0.1"
+              value={currentTime || 0}
+              onInput={handleSeek}
+              onChange={handleSeek}
+              className="flex-1 h-2 bg-gray-700 rounded-full appearance-none cursor-pointer
+                [&::-webkit-slider-thumb]:appearance-none
+                [&::-webkit-slider-thumb]:w-4
+                [&::-webkit-slider-thumb]:h-4
+                [&::-webkit-slider-thumb]:rounded-full
+                [&::-webkit-slider-thumb]:bg-white"
+            />
+            <span className="text-xs text-gray-500 w-10">{formatTime(duration)}</span>
+          </div>
+
+          <div className="flex items-center justify-center gap-3">
+            <button onClick={() => setShuffle(!shuffle)} className={`p-2 ${shuffle ? 'text-primary' : 'text-gray-400 hover:text-white'}`} title="Shuffle">
+              <Shuffle className="w-5 h-5" />
+            </button>
+            <button onClick={playPrevious} className="p-2 text-gray-400 hover:text-white" title="Previous">
+              <SkipBack className="w-5 h-5" />
+            </button>
+            <button
+              onClick={togglePlay}
+              disabled={!currentTrack}
+              className="w-12 h-12 bg-white text-black rounded-full flex items-center justify-center disabled:opacity-50"
+              title={isPlaying ? 'Pause' : 'Play'}
+            >
+              {isPlaying ? <Pause className="w-6 h-6" /> : <Play className="w-6 h-6 ml-0.5" />}
+            </button>
+            <button onClick={playNext} className="p-2 text-gray-400 hover:text-white" title="Next">
+              <SkipForward className="w-5 h-5" />
+            </button>
+            <button
+              onClick={() => setShowQueue(!showQueue)}
+              className={`p-2 ${showQueue ? 'text-primary' : 'text-gray-400 hover:text-white'}`}
+              title="Queue"
+            >
+              <List className="w-5 h-5" />
+            </button>
+          </div>
+        </div>
+
+        {/* Desktop layout */}
+        <div className="hidden sm:flex items-center justify-between gap-6">
+          {/* Track Info */}
+          <div className="flex items-center gap-4 flex-1 min-w-0">
+            {currentTrack ? (
+              <>
+                <div className="w-20 h-20 bg-gray-800 rounded-xl flex items-center justify-center flex-shrink-0 overflow-hidden">
+                  {currentTrack.cover_art_path ? (
+                    <img
+                      src={libraryApi.getCoverUrl(currentTrack.id)}
+                      alt=""
                       className="w-full h-full object-cover"
                     />
                   ) : (
-                    <Music className="w-6 h-6 text-gray-600" />
+                    <Music className="w-8 h-8 text-gray-600" />
                   )}
                 </div>
                 <div className="min-w-0">
-                  <p className="text-white font-medium truncate text-sm md:text-base">{currentTrack.title || currentTrack.filename}</p>
-                  <p className="text-gray-400 text-xs md:text-sm truncate">{currentTrack.artist || 'Unknown'}</p>
+                  <div className="flex items-center gap-2 mb-1">
+                    <div className="flex items-center gap-2 px-3 py-1 bg-primary/20 rounded-full">
+                      <Disc3 className={`w-3.5 h-3.5 text-primary ${isPlaying ? 'animate-spin' : ''}`} style={{ animationDuration: '3s' }} />
+                      <span className="text-xs text-primary font-semibold tracking-wide">Jukebox</span>
+                    </div>
+                  </div>
+                  <p className="text-white text-xl font-semibold truncate leading-tight">{currentTrack.title || currentTrack.filename}</p>
+                  <p className="text-gray-300 text-base truncate">{currentTrack.artist || 'Unknown'}</p>
                 </div>
               </>
             ) : (
-              <p className="text-gray-500">No track playing</p>
+              <p className="text-gray-500 text-lg">No track playing</p>
             )}
           </div>
 
           {/* Center Controls */}
-          <div className="flex-1 flex flex-col items-center gap-2">
-            <div className="flex items-center gap-3 md:gap-4">
+          <div className="flex flex-col items-center gap-2 flex-[1.2] min-w-[360px]">
+            <div className="flex items-center gap-4">
               <button
                 onClick={() => setShuffle(!shuffle)}
-                className={`hidden md:block transition-colors ${shuffle ? 'text-primary' : 'text-gray-400 hover:text-white'}`}
+                className={`transition-colors ${shuffle ? 'text-primary' : 'text-gray-400 hover:text-white'}`}
+                title="Shuffle"
               >
-                <Shuffle className="w-5 h-5" />
+                <Shuffle className="w-6 h-6" />
               </button>
-              <button
-                onClick={playPrevious}
-                className="text-gray-400 hover:text-white"
-              >
-                <SkipBack className="w-5 h-5" />
+              <button onClick={playPrevious} className="text-gray-400 hover:text-white" title="Previous">
+                <SkipBack className="w-6 h-6" />
               </button>
               <button
                 onClick={togglePlay}
                 disabled={!currentTrack}
-                className="w-10 h-10 bg-white text-black rounded-full flex items-center justify-center hover:scale-105 transition-transform disabled:opacity-50"
+                className="w-14 h-14 bg-white text-black rounded-full flex items-center justify-center hover:scale-105 transition-transform disabled:opacity-50"
+                title={isPlaying ? 'Pause' : 'Play'}
               >
-                {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5 ml-0.5" />}
+                {isPlaying ? <Pause className="w-7 h-7" /> : <Play className="w-7 h-7 ml-1" />}
               </button>
-              <button
-                onClick={playNext}
-                className="text-gray-400 hover:text-white"
-              >
-                <SkipForward className="w-5 h-5" />
+              <button onClick={playNext} className="text-gray-400 hover:text-white" title="Next">
+                <SkipForward className="w-6 h-6" />
               </button>
               <button
                 onClick={() => setRepeat(repeat === 'none' ? 'all' : repeat === 'all' ? 'one' : 'none')}
-                className={`hidden md:block transition-colors ${repeat !== 'none' ? 'text-primary' : 'text-gray-400 hover:text-white'}`}
+                className={`transition-colors relative ${repeat !== 'none' ? 'text-primary' : 'text-gray-400 hover:text-white'}`}
+                title="Repeat"
               >
-                <Repeat className="w-5 h-5" />
-                {repeat === 'one' && <span className="text-xs">1</span>}
+                <Repeat className="w-6 h-6" />
+                {repeat === 'one' && <span className="absolute -top-1 -right-2 text-xs font-bold">1</span>}
               </button>
             </div>
-            
-            {/* Progress Bar */}
-            <div className="flex items-center gap-2 w-full max-w-xl">
+
+            <div className="flex items-center gap-3 w-full max-w-xl">
               <span className="text-xs text-gray-500 w-10 text-right">{formatTime(currentTime)}</span>
               <input
                 type="range"
                 min={0}
                 max={duration || 100}
-                value={currentTime}
+                step="0.1"
+                value={currentTime || 0}
+                onInput={handleSeek}
                 onChange={handleSeek}
-                className="flex-1 h-1 bg-gray-700 rounded-full appearance-none cursor-pointer
+                className="flex-1 h-2 bg-gray-700 rounded-full appearance-none cursor-pointer
                   [&::-webkit-slider-thumb]:appearance-none
-                  [&::-webkit-slider-thumb]:w-3
-                  [&::-webkit-slider-thumb]:h-3
+                  [&::-webkit-slider-thumb]:w-4
+                  [&::-webkit-slider-thumb]:h-4
                   [&::-webkit-slider-thumb]:rounded-full
                   [&::-webkit-slider-thumb]:bg-white
                   [&::-webkit-slider-thumb]:cursor-pointer"
@@ -1096,18 +1250,38 @@ function JukeboxPage() {
           </div>
 
           {/* Right Controls */}
-          <div className="flex items-center gap-4 w-64 justify-end">
+          <div className="flex items-center gap-4 flex-1 justify-end">
+            {currentTrack && (
+              <>
+                <button
+                  onClick={() => setTrackToAdd(currentTrack)}
+                  className="text-gray-400 hover:text-white transition-colors"
+                  title="Add to playlist"
+                >
+                  <ListPlus className="w-6 h-6" />
+                </button>
+                <button
+                  onClick={() => deleteTrackEverywhere(currentTrack)}
+                  className="text-gray-400 hover:text-red-400 transition-colors"
+                  title="Delete song from Jukebox"
+                >
+                  <Trash2 className="w-6 h-6" />
+                </button>
+              </>
+            )}
             <button
               onClick={() => setShowQueue(!showQueue)}
               className={`transition-colors ${showQueue ? 'text-primary' : 'text-gray-400 hover:text-white'}`}
+              title="Queue"
             >
-              <List className="w-5 h-5" />
+              <List className="w-6 h-6" />
             </button>
             <button
               onClick={() => setIsMuted(!isMuted)}
               className="text-gray-400 hover:text-white"
+              title={isMuted ? 'Unmute' : 'Mute'}
             >
-              {isMuted || volume === 0 ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
+              {isMuted || volume === 0 ? <VolumeX className="w-6 h-6" /> : <Volume2 className="w-6 h-6" />}
             </button>
             <input
               type="range"
@@ -1116,10 +1290,10 @@ function JukeboxPage() {
               step={0.01}
               value={isMuted ? 0 : volume}
               onChange={(e) => setVolume(parseFloat(e.target.value))}
-              className="w-24 h-1 bg-gray-700 rounded-full appearance-none cursor-pointer
+              className="w-32 h-2 bg-gray-700 rounded-full appearance-none cursor-pointer
                 [&::-webkit-slider-thumb]:appearance-none
-                [&::-webkit-slider-thumb]:w-3
-                [&::-webkit-slider-thumb]:h-3
+                [&::-webkit-slider-thumb]:w-4
+                [&::-webkit-slider-thumb]:h-4
                 [&::-webkit-slider-thumb]:rounded-full
                 [&::-webkit-slider-thumb]:bg-white
                 [&::-webkit-slider-thumb]:cursor-pointer"
@@ -1127,6 +1301,7 @@ function JukeboxPage() {
           </div>
         </div>
       </div>
+      )}
 
       {/* Create Playlist Modal */}
       {showPlaylistModal && (
@@ -1160,29 +1335,62 @@ function JukeboxPage() {
 
       {/* Add to Playlist Modal */}
       {trackToAdd && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-gray-900 rounded-xl p-6 w-96">
-            <h3 className="text-xl font-bold text-white mb-2">Add to Playlist</h3>
-            <p className="text-gray-400 text-sm mb-4 truncate">{trackToAdd.title || trackToAdd.filename}</p>
-            <div className="space-y-2 max-h-64 overflow-y-auto">
-              {playlists.map(playlist => (
-                <button
-                  key={playlist.id}
-                  onClick={() => addTrackToPlaylist(playlist.id)}
-                  className="w-full flex items-center gap-3 px-4 py-3 bg-gray-800 hover:bg-gray-700 rounded-lg text-left"
-                >
-                  <List className="w-5 h-5 text-gray-500" />
-                  <span className="text-white">{playlist.name}</span>
-                </button>
-              ))}
-            </div>
-            <div className="mt-4 flex justify-end">
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-md shadow-2xl">
+            <div className="flex items-start justify-between gap-4 mb-4">
+              <div>
+                <h3 className="text-xl font-bold text-white">Add to Playlist</h3>
+                <p className="text-gray-400 text-sm mt-1 truncate">
+                  {trackToAdd.artist || 'Unknown'} - {trackToAdd.title || trackToAdd.filename}
+                </p>
+              </div>
               <button
-                onClick={() => setTrackToAdd(null)}
-                className="px-4 py-2 text-gray-400 hover:text-white"
+                onClick={() => { setTrackToAdd(null); setNewPlaylistName('') }}
+                className="text-gray-400 hover:text-white"
+                title="Close"
               >
-                Cancel
+                <X className="w-5 h-5" />
               </button>
+            </div>
+
+            <div className="space-y-2 max-h-64 overflow-y-auto mb-4">
+              {playlists.length === 0 ? (
+                <p className="text-gray-500 text-sm py-2">No playlists yet. Create one below.</p>
+              ) : (
+                playlists.map(playlist => (
+                  <button
+                    key={playlist.id}
+                    onClick={() => addTrackToPlaylist(playlist.id)}
+                    className="w-full flex items-center gap-3 px-4 py-3 bg-gray-800 hover:bg-gray-700 rounded-lg text-left"
+                  >
+                    <List className="w-5 h-5 text-gray-500" />
+                    <div className="min-w-0">
+                      <div className="text-white truncate">{playlist.name}</div>
+                      <div className="text-xs text-gray-500">{playlist.track_count || 0} tracks</div>
+                    </div>
+                  </button>
+                ))
+              )}
+            </div>
+
+            <div className="border-t border-gray-800 pt-4">
+              <label className="block text-sm text-gray-400 mb-2">Create new playlist</label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  placeholder="Playlist name"
+                  value={newPlaylistName}
+                  onChange={(e) => setNewPlaylistName(e.target.value)}
+                  className="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-primary"
+                />
+                <button
+                  onClick={createPlaylist}
+                  disabled={!newPlaylistName.trim()}
+                  className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/80 disabled:opacity-50"
+                >
+                  Create
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -1278,6 +1486,14 @@ function JukeboxPage() {
           >
             <ListPlus className="w-4 h-4" />
             <span>Add to Playlist</span>
+          </button>
+          <div className="border-t border-gray-700 my-1"></div>
+          <button
+            onClick={() => { deleteTrackEverywhere(contextMenu.track); closeContextMenu() }}
+            className="w-full flex items-center gap-3 px-4 py-2 text-left text-red-400 hover:bg-gray-700 transition-colors"
+          >
+            <Trash2 className="w-4 h-4" />
+            <span>Delete Song from Jukebox</span>
           </button>
         </div>
       )}

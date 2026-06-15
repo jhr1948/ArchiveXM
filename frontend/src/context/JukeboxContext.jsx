@@ -6,6 +6,7 @@ const JukeboxContext = createContext(null)
 export function JukeboxProvider({ children }) {
   const audioRef = useRef(null)
   const pauseLiveStreamRef = useRef(null) // Callback to pause live stream
+  const isSeekingRef = useRef(false)
   
   // Register callback from PlayerContext to pause live stream
   const registerPauseLiveStream = useCallback((callback) => {
@@ -32,6 +33,18 @@ export function JukeboxProvider({ children }) {
 
   const currentTrack = queue[currentIndex] || null
 
+  const stopAudioElement = useCallback(() => {
+    if (audioRef.current) {
+      audioRef.current.pause()
+      audioRef.current.removeAttribute('src')
+      audioRef.current.load()
+    }
+    setIsPlaying(false)
+    setCurrentTime(0)
+    setDuration(0)
+    isSeekingRef.current = false
+  }, [])
+
   // Update volume
   useEffect(() => {
     if (audioRef.current) {
@@ -41,14 +54,22 @@ export function JukeboxProvider({ children }) {
 
   // Audio event handlers
   const handleTimeUpdate = useCallback(() => {
-    if (audioRef.current) {
-      setCurrentTime(audioRef.current.currentTime)
+    if (audioRef.current && !isSeekingRef.current) {
+      setCurrentTime(audioRef.current.currentTime || 0)
     }
   }, [])
 
   const handleLoadedMetadata = useCallback(() => {
     if (audioRef.current) {
-      setDuration(audioRef.current.duration)
+      const nextDuration = Number.isFinite(audioRef.current.duration) ? audioRef.current.duration : 0
+      setDuration(nextDuration)
+    }
+  }, [])
+
+  const handleSeeked = useCallback(() => {
+    if (audioRef.current) {
+      isSeekingRef.current = false
+      setCurrentTime(audioRef.current.currentTime || 0)
     }
   }, [])
 
@@ -176,11 +197,39 @@ export function JukeboxProvider({ children }) {
   }, [queue, currentIndex, currentTime, repeat])
 
   const seek = useCallback((time) => {
-    if (audioRef.current) {
-      audioRef.current.currentTime = time
-      setCurrentTime(time)
+    if (!audioRef.current) return
+
+    const requested = Number(time)
+    if (!Number.isFinite(requested)) return
+
+    const maxDuration = Number.isFinite(audioRef.current.duration) && audioRef.current.duration > 0
+      ? audioRef.current.duration
+      : duration
+    const target = Math.max(0, Math.min(requested, maxDuration || requested))
+
+    isSeekingRef.current = true
+    setCurrentTime(target)
+
+    try {
+      if (typeof audioRef.current.fastSeek === 'function') {
+        audioRef.current.fastSeek(target)
+      } else {
+        audioRef.current.currentTime = target
+      }
+    } catch (error) {
+      console.error('[Jukebox] Seek failed:', error)
+      isSeekingRef.current = false
     }
-  }, [])
+
+    // Some browsers do not always fire seeked for short local files. Release
+    // the time-update guard shortly after setting the target.
+    window.setTimeout(() => {
+      isSeekingRef.current = false
+      if (audioRef.current) {
+        setCurrentTime(audioRef.current.currentTime || target)
+      }
+    }, 350)
+  }, [duration])
 
   const addToQueue = useCallback((track) => {
     setQueue(prev => [...prev, track])
@@ -217,15 +266,11 @@ export function JukeboxProvider({ children }) {
       setCurrentIndex(0)
     } else {
       // Full clear - stop playback
-      if (audioRef.current) {
-        audioRef.current.pause()
-        audioRef.current.src = ''
-      }
+      stopAudioElement()
       setQueue([])
       setCurrentIndex(-1)
-      setIsPlaying(false)
     }
-  }, [currentIndex, queue])
+  }, [currentIndex, queue, stopAudioElement])
 
   // Play the queue from the beginning (or from a specific index)
   const playQueue = useCallback((startIndex = 0) => {
@@ -271,6 +316,30 @@ export function JukeboxProvider({ children }) {
     }
   }, [pauseLiveStream])
 
+
+  const removeTrackFromPlayback = useCallback((trackId) => {
+    if (trackId == null) return
+
+    setQueue(prev => {
+      const removedIndex = prev.findIndex(t => t.id === trackId)
+      if (removedIndex === -1) return prev
+
+      const wasCurrent = removedIndex === currentIndex
+      const newQueue = prev.filter(t => t.id !== trackId)
+
+      if (wasCurrent) {
+        stopAudioElement()
+        setCurrentIndex(-1)
+      } else if (removedIndex < currentIndex) {
+        setCurrentIndex(i => Math.max(-1, i - 1))
+      } else if (currentIndex >= newQueue.length) {
+        setCurrentIndex(newQueue.length - 1)
+      }
+
+      return newQueue
+    })
+  }, [currentIndex, stopAudioElement])
+
   const value = {
     // State
     queue,
@@ -293,6 +362,7 @@ export function JukeboxProvider({ children }) {
     seek,
     addToQueue,
     removeFromQueue,
+    removeTrackFromPlayback,
     clearQueue,
     playQueue,
     playAll,
@@ -315,6 +385,7 @@ export function JukeboxProvider({ children }) {
         style={{ display: 'none' }}
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
+        onSeeked={handleSeeked}
         onEnded={handleEnded}
       />
       {children}

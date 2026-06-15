@@ -1,7 +1,7 @@
 """
 Library Router - Handle local music library and playlists (Jukebox)
 """
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session as DBSession
@@ -55,6 +55,25 @@ class PlaylistResponse(BaseModel):
 
 class AddToPlaylistRequest(BaseModel):
     track_ids: List[int]
+
+
+def _playlist_count(db: DBSession, playlist_id: int) -> int:
+    return db.query(PlaylistTrack).filter(PlaylistTrack.playlist_id == playlist_id).count()
+
+
+def _playlist_response_with_count(db: DBSession, playlist: Playlist) -> PlaylistResponse:
+    count = _playlist_count(db, playlist.id)
+    if playlist.track_count != count:
+        playlist.track_count = count
+        db.flush()
+    return PlaylistResponse(
+        id=playlist.id,
+        name=playlist.name,
+        description=playlist.description,
+        cover_image=playlist.cover_image,
+        track_count=count,
+        created_at=playlist.created_at,
+    )
 
 
 # ============ Library Scanning ============
@@ -164,32 +183,84 @@ async def get_track(track_id: int, db: DBSession = Depends(get_db)):
 
 
 @router.get("/tracks/{track_id}/stream")
-async def stream_track(track_id: int, db: DBSession = Depends(get_db)):
+async def stream_track(
+    track_id: int,
+    request: Request,
+    db: DBSession = Depends(get_db)
+):
     """
-    Stream an audio file
+    Stream an audio file with byte-range support so browser seeking works.
     """
     track = db.query(LocalTrack).filter(LocalTrack.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    
+
     file_path = Path(track.file_path)
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found on disk")
-    
+
+    file_size = file_path.stat().st_size
+
     # Update play count
     track.play_count += 1
     track.last_played = datetime.utcnow()
     db.commit()
-    
+
     # Determine mime type
     mime_type, _ = mimetypes.guess_type(str(file_path))
     if not mime_type:
-        mime_type = "audio/mpeg"
-    
-    return FileResponse(
-        path=str(file_path),
+        mime_type = "audio/mp4" if file_path.suffix.lower() in (".m4a", ".mp4") else "audio/mpeg"
+
+    range_header = request.headers.get("range")
+
+    def iter_file(start: int = 0, end: int = file_size - 1, chunk_size: int = 1024 * 1024):
+        with open(file_path, "rb") as f:
+            f.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                chunk = f.read(min(chunk_size, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    if range_header:
+        try:
+            range_value = range_header.strip().lower().replace("bytes=", "", 1)
+            start_text, _, end_text = range_value.partition("-")
+            start = int(start_text) if start_text else 0
+            end = int(end_text) if end_text else file_size - 1
+            start = max(0, start)
+            end = min(file_size - 1, end)
+
+            if start > end or start >= file_size:
+                raise ValueError("Invalid range")
+        except Exception:
+            raise HTTPException(status_code=416, detail="Invalid range request")
+
+        content_length = end - start + 1
+        headers = {
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(content_length),
+            "Cache-Control": "no-cache",
+        }
+        return StreamingResponse(
+            iter_file(start, end),
+            status_code=206,
+            media_type=mime_type,
+            headers=headers,
+        )
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(file_size),
+        "Cache-Control": "no-cache",
+    }
+    return StreamingResponse(
+        iter_file(),
         media_type=mime_type,
-        filename=track.filename
+        headers=headers,
     )
 
 
@@ -221,8 +292,14 @@ async def delete_track(
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
     
-    # Remove from playlists
-    db.query(PlaylistTrack).filter(PlaylistTrack.track_id == track_id).delete()
+    # Remove from playlists and remember affected playlists so counts stay correct
+    affected_playlist_ids = [
+        row[0] for row in db.query(PlaylistTrack.playlist_id)
+        .filter(PlaylistTrack.track_id == track_id)
+        .distinct()
+        .all()
+    ]
+    db.query(PlaylistTrack).filter(PlaylistTrack.track_id == track_id).delete(synchronize_session=False)
     
     # Delete file if requested
     if delete_file:
@@ -235,9 +312,18 @@ async def delete_track(
     
     # Remove from database
     db.delete(track)
+
+    # Update cached playlist counts for any playlist that contained this track
+    for playlist_id in affected_playlist_ids:
+        playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+        if playlist:
+            playlist.track_count = db.query(PlaylistTrack).filter(
+                PlaylistTrack.playlist_id == playlist_id
+            ).count()
+
     db.commit()
     
-    return {"success": True, "message": "Track removed"}
+    return {"success": True, "message": "Track removed", "affected_playlists": affected_playlist_ids}
 
 
 # ============ Artists & Albums ============
@@ -280,10 +366,12 @@ async def get_albums(db: DBSession = Depends(get_db)):
 @router.get("/playlists", response_model=List[PlaylistResponse])
 async def get_playlists(db: DBSession = Depends(get_db)):
     """
-    Get all playlists
+    Get all playlists with live track counts.
     """
     playlists = db.query(Playlist).order_by(Playlist.name).all()
-    return playlists
+    responses = [_playlist_response_with_count(db, playlist) for playlist in playlists]
+    db.commit()
+    return responses
 
 
 @router.post("/playlists", response_model=PlaylistResponse)
@@ -301,7 +389,7 @@ async def create_playlist(
     db.add(new_playlist)
     db.commit()
     db.refresh(new_playlist)
-    return new_playlist
+    return _playlist_response_with_count(db, new_playlist)
 
 
 @router.get("/playlists/{playlist_id}")
@@ -336,12 +424,17 @@ async def get_playlist(playlist_id: int, db: DBSession = Depends(get_db)):
             }
         })
     
+    live_count = len(tracks)
+    if playlist.track_count != live_count:
+        playlist.track_count = live_count
+        db.commit()
+
     return {
         "id": playlist.id,
         "name": playlist.name,
         "description": playlist.description,
         "cover_image": playlist.cover_image,
-        "track_count": playlist.track_count,
+        "track_count": live_count,
         "created_at": playlist.created_at,
         "tracks": tracks
     }
@@ -427,10 +520,11 @@ async def add_tracks_to_playlist(
             db.add(pt)
             added += 1
     
+    db.flush()
     # Update track count
     playlist.track_count = db.query(PlaylistTrack).filter(
         PlaylistTrack.playlist_id == playlist_id
-    ).count() + added
+    ).count()
     
     db.commit()
     
@@ -456,12 +550,13 @@ async def remove_track_from_playlist(
     
     db.delete(pt)
     
+    db.flush()
     # Update track count
     playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
     if playlist:
         playlist.track_count = db.query(PlaylistTrack).filter(
             PlaylistTrack.playlist_id == playlist_id
-        ).count() - 1
+        ).count()
     
     db.commit()
     

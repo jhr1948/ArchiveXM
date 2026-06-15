@@ -169,7 +169,7 @@ class SiriusXMAPI:
         
         return None
     
-    async def get_schedule(self, channel_id: str, hours_back: int = 5) -> List[Dict]:
+    async def get_schedule(self, channel_id: str, hours_back: int = 5, include_interstitials: bool = False) -> List[Dict]:
         """
         Fetch track schedule from liveUpdate API
         
@@ -181,6 +181,8 @@ class SiriusXMAPI:
         Args:
             channel_id: Channel ID
             hours_back: Hours back to fetch (1-5)
+            include_interstitials: Include every timed metadata item. Use this for
+                download boundaries so DJ plugs/talk cuts stop the previous song.
             
         Returns:
             List of tracks with exact timestamps
@@ -221,8 +223,11 @@ class SiriusXMAPI:
                         now = datetime.now(timezone.utc)
                         
                         for item in items:
-                            # Skip promos/interstitials
-                            if item.get('isInterstitial', False):
+                            # The normal UI schedule hides interstitials/promos.
+                            # Download boundary calculations should include them
+                            # because even short DJ plugs have timestamps and mark
+                            # the true end of the previous song.
+                            if item.get('isInterstitial', False) and not include_interstitials:
                                 continue
                             
                             track_timestamp = item.get('timestamp')
@@ -283,13 +288,15 @@ class SiriusXMAPI:
                                             else:
                                                 image_url = self._build_cdn_image_url(raw_image_path)
                                         
+                                        is_interstitial = bool(item.get('isInterstitial', False))
                                         track = {
-                                            'artist': item.get('artistName', 'Unknown'),
-                                            'title': item.get('name', 'Unknown'),
+                                            'artist': item.get('artistName') or item.get('artist') or ('SiriusXM' if is_interstitial else 'Unknown'),
+                                            'title': item.get('name') or item.get('title') or item.get('description') or ('Interstitial' if is_interstitial else 'Unknown'),
                                             'album': item.get('albumName'),
                                             'timestamp_utc': track_timestamp,
                                             'duration_ms': item.get('duration', 0),
-                                            'image_url': image_url
+                                            'image_url': image_url,
+                                            'is_interstitial': is_interstitial
                                         }
                                         tracks.append(track)
                                 except:

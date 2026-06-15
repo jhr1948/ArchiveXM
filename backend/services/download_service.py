@@ -25,7 +25,110 @@ class DownloadService:
         self.bearer_token = bearer_token
         self.hls_service = HLSService(bearer_token)
         self.api = SiriusXMAPI(bearer_token)
+
+    def _get_download_tail_pad_seconds(self, db=None) -> float:
+        """Return extra seconds to keep after the next SXM metadata boundary.
+
+        The raw metadata boundary prevents long DJ/talk bleed. A tiny pad keeps
+        natural fades from sounding clipped when SXM timestamps are slightly
+        early. Clamped to a safe range so this cannot recreate long downloads.
+        """
+        default_value = os.getenv("DOWNLOAD_TAIL_PAD_SECONDS", "2.0")
+        value = default_value
+
+        if db is not None:
+            try:
+                from database import Config
+                item = db.query(Config).filter(Config.key == "download_tail_pad_seconds").first()
+                if item and item.value not in (None, ""):
+                    value = item.value
+            except Exception:
+                value = default_value
+
+        try:
+            pad = float(value)
+        except Exception:
+            pad = 2.0
+
+        # Keep this intentionally conservative. 0 disables padding, 5 is the
+        # upper bound to avoid pulling in whole DJ/talk breaks.
+        if pad < 0:
+            pad = 0.0
+        if pad > 5:
+            pad = 5.0
+        return pad
+
+    def _apply_tail_pad_ms(self, duration_ms: int, db=None, log_prefix: str = "   " ) -> int:
+        pad_seconds = self._get_download_tail_pad_seconds(db)
+        if pad_seconds <= 0:
+            return duration_ms
+        padded_ms = duration_ms + int(pad_seconds * 1000)
+        print(f"{log_prefix}Tail pad: +{pad_seconds:.1f}s -> {padded_ms/1000:.1f}s")
+        return padded_ms
     
+
+    def _extend_segments_for_tail_pad(
+        self,
+        track_segments: List[Dict],
+        all_segments: List[Dict],
+        db=None,
+        log_prefix: str = "   ",
+    ) -> List[Dict]:
+        """Ensure padding has actual audio available after the selected window.
+
+        The normal HLS segment filter can stop on the same last segment even when
+        the trim duration is padded. If the padded tail falls into the next HLS
+        segment, ffmpeg cannot keep those extra seconds unless we also download
+        that following segment. Append a couple of following segments and let
+        ffmpeg's exact -t trim decide the final cut.
+        """
+        if not track_segments or not all_segments:
+            return track_segments
+
+        pad_seconds = self._get_download_tail_pad_seconds(db)
+        if pad_seconds <= 0:
+            return track_segments
+
+        last = track_segments[-1]
+        last_url = last.get("url")
+        last_index = None
+
+        for idx, segment in enumerate(all_segments):
+            if segment is last or (last_url and segment.get("url") == last_url):
+                last_index = idx
+                break
+
+        if last_index is None:
+            return track_segments
+
+        extended = list(track_segments)
+        seen_urls = {seg.get("url") for seg in extended if seg.get("url")}
+
+        # Add enough following audio for the pad. SiriusXM HLS segments are often
+        # around 9-10 seconds, so one segment is usually enough, but two keeps
+        # this robust for unusual segment durations. ffmpeg still trims exactly.
+        added = 0
+        added_duration = 0.0
+        for segment in all_segments[last_index + 1:]:
+            url = segment.get("url")
+            if url and url in seen_urls:
+                continue
+            extended.append(segment)
+            if url:
+                seen_urls.add(url)
+            added += 1
+            try:
+                added_duration += float(segment.get("duration") or 0)
+            except Exception:
+                pass
+            if added >= 2 or added_duration >= pad_seconds + 2.0:
+                break
+
+        if added:
+            print(f"{log_prefix}Tail pad audio: appended {added} following HLS segment(s) so padding can be kept")
+
+        return extended
+
     async def download_track(
         self,
         download_id: int,
@@ -71,6 +174,8 @@ class DownloadService:
                     track_start = datetime.fromisoformat(track["timestamp_utc"].replace('Z', '+00:00'))
                     next_start = datetime.fromisoformat(next_track_timestamp.replace('Z', '+00:00'))
                     actual_duration_ms = int((next_start - track_start).total_seconds() * 1000)
+                    if actual_duration_ms > 0:
+                        actual_duration_ms = self._apply_tail_pad_ms(actual_duration_ms, db, log_prefix="   ")
                     print(f"   Duration from next track: {actual_duration_ms/1000:.1f}s (API said {track['duration_ms']/1000:.1f}s)")
                     track["duration_ms"] = actual_duration_ms
                 except Exception as e:
@@ -95,6 +200,13 @@ class DownloadService:
                 track["duration_ms"]
             )
             
+            track_segments = self._extend_segments_for_tail_pad(
+                track_segments,
+                segments,
+                db=db,
+                log_prefix="   ",
+            )
+
             # If no segments found by timestamp, try using duration-based estimation
             if not track_segments and segments:
                 print(f"   ⚠️ No segments by timestamp, using duration estimation")
@@ -261,6 +373,16 @@ class DownloadService:
             
             if not key_bytes:
                 raise Exception("Could not get decryption key")
+
+            # Fetch raw timed metadata once for boundary calculations.
+            # This includes DJ/talk/interstitial cuts, so downloads stop at the
+            # next real timestamp instead of running until the next selected song.
+            raw_schedule = await self.api.get_schedule(
+                channel_id,
+                hours_back=5,
+                include_interstitials=True,
+            )
+            print(f"   Loaded {len(raw_schedule)} raw metadata boundary items")
             
             successful = 0
             failed = 0
@@ -281,16 +403,30 @@ class DownloadService:
                     download_record.status = "downloading"
                     db.commit()
                     
-                    # Calculate duration from NEXT track's timestamp (more accurate than API duration)
+                    # Calculate duration from the next raw timed metadata boundary.
+                    # This is more accurate than API duration and avoids recording
+                    # through DJ/talk plugs when those plugs have timestamps.
                     actual_duration_ms = track["duration_ms"]
-                    if i + 1 < len(sorted_tracks):
+                    next_boundary_ts = self._find_next_timestamp_from_schedule(
+                        raw_schedule,
+                        track["timestamp_utc"],
+                    )
+
+                    if not next_boundary_ts and i + 1 < len(sorted_tracks):
+                        # Fallback only: use the next selected/downloaded song if
+                        # the raw schedule did not provide a boundary.
+                        next_boundary_ts = sorted_tracks[i + 1][1].get("timestamp_utc")
+
+                    if next_boundary_ts:
                         try:
                             current_start = datetime.fromisoformat(track["timestamp_utc"].replace('Z', '+00:00'))
-                            next_start = datetime.fromisoformat(sorted_tracks[i + 1][1]["timestamp_utc"].replace('Z', '+00:00'))
-                            actual_duration_ms = int((next_start - current_start).total_seconds() * 1000)
-                            print(f"      Duration from next track: {actual_duration_ms/1000:.1f}s (API: {track['duration_ms']/1000:.1f}s)")
-                        except:
-                            pass
+                            next_start = datetime.fromisoformat(next_boundary_ts.replace('Z', '+00:00'))
+                            calculated_ms = int((next_start - current_start).total_seconds() * 1000)
+                            if calculated_ms > 0:
+                                actual_duration_ms = self._apply_tail_pad_ms(calculated_ms, db, log_prefix="      ")
+                                print(f"      Duration from raw boundary: {actual_duration_ms/1000:.1f}s (API: {track['duration_ms']/1000:.1f}s)")
+                        except Exception as e:
+                            print(f"      Could not calculate raw-boundary duration: {e}")
                     
                     # Filter segments for this track using actual duration
                     track_segments = self.hls_service.filter_segments_for_track(
@@ -299,6 +435,13 @@ class DownloadService:
                         actual_duration_ms
                     )
                     
+                    track_segments = self._extend_segments_for_tail_pad(
+                        track_segments,
+                        segments,
+                        db=db,
+                        log_prefix="      ",
+                    )
+
                     if not track_segments:
                         download_record.status = "failed: no segments"
                         db.commit()
@@ -460,39 +603,68 @@ class DownloadService:
             print(f"Decryption error: {e}")
             return None
     
-    async def _get_next_track_timestamp(self, channel_id: str, current_track_timestamp: str) -> Optional[str]:
+    def _find_next_timestamp_from_schedule(
+        self,
+        schedule: List[Dict],
+        current_track_timestamp: str,
+        min_gap_seconds: float = 1.0,
+        max_reasonable_seconds: float = 30 * 60,
+    ) -> Optional[str]:
+        """Return the next timed SXM metadata boundary after current_track_timestamp.
+
+        This intentionally uses raw timed metadata, including DJ plugs, bumpers,
+        and interstitial/talk cuts. Those short cuts are still real boundaries
+        and should stop the previous downloaded song.
         """
-        Get the timestamp of the track that follows the current track.
-        This is used to calculate accurate duration (next_start - current_start).
+        if not schedule:
+            return None
+
+        try:
+            current_time = datetime.fromisoformat(current_track_timestamp.replace('Z', '+00:00'))
+        except Exception:
+            return None
+
+        candidates = []
+        for item in schedule:
+            ts = item.get("timestamp_utc") or item.get("timestamp")
+            if not ts:
+                continue
+            try:
+                item_time = datetime.fromisoformat(str(ts).replace('Z', '+00:00'))
+            except Exception:
+                continue
+
+            delta = (item_time - current_time).total_seconds()
+            if delta >= min_gap_seconds and delta <= max_reasonable_seconds:
+                candidates.append((item_time, ts, item))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda row: row[0])
+        next_time, next_ts, next_item = candidates[0]
+        print(
+            "   Next raw metadata boundary: "
+            f"{next_ts} ({(next_time - current_time).total_seconds():.1f}s) "
+            f"title={next_item.get('title') or next_item.get('name') or 'Unknown'} "
+            f"interstitial={next_item.get('is_interstitial', False)}"
+        )
+        return str(next_ts)
+
+    async def _get_next_track_timestamp(self, channel_id: str, current_track_timestamp: str) -> Optional[str]:
+        """Get the next raw timed metadata item after the selected track.
+
+        Normal schedule display filters out interstitials, but downloads must not:
+        DJ plugs/talk cuts often have their own timestamps and are the correct
+        end boundary for the previous song.
         """
         try:
-            # Get schedule from API
-            schedule = await self.api.get_schedule(channel_id, hours_back=5)
-            
-            if not schedule or "tracks" not in schedule:
-                return None
-            
-            tracks = schedule.get("tracks", [])
-            if not tracks:
-                return None
-            
-            # Parse current track timestamp
-            current_time = datetime.fromisoformat(current_track_timestamp.replace('Z', '+00:00'))
-            
-            # Sort tracks by timestamp
-            sorted_tracks = sorted(tracks, key=lambda t: t.get("timestamp_utc", ""))
-            
-            # Find the track that starts right after the current one
-            for i, track in enumerate(sorted_tracks):
-                track_time = datetime.fromisoformat(track["timestamp_utc"].replace('Z', '+00:00'))
-                
-                # If this track starts at or very close to current track time, return next track's time
-                if abs((track_time - current_time).total_seconds()) < 2:  # Within 2 seconds
-                    if i + 1 < len(sorted_tracks):
-                        return sorted_tracks[i + 1]["timestamp_utc"]
-            
-            return None
-            
+            schedule = await self.api.get_schedule(
+                channel_id,
+                hours_back=5,
+                include_interstitials=True,
+            )
+            return self._find_next_timestamp_from_schedule(schedule, current_track_timestamp)
         except Exception as e:
             print(f"   Could not get next track timestamp: {e}")
             return None

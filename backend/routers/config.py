@@ -21,6 +21,7 @@ class ConfigUpdate(BaseModel):
     playlist_public_base_url: Optional[str] = None
     playlist_url_style: Optional[str] = None
     playlist_auto_generate: Optional[bool] = None
+    download_tail_pad_seconds: Optional[float] = None
 
 
 class SetupRequest(BaseModel):
@@ -32,6 +33,7 @@ class SetupRequest(BaseModel):
     playlist_public_base_url: Optional[str] = None
     playlist_url_style: str = "listen"
     playlist_auto_generate: bool = True
+    download_tail_pad_seconds: float = 2.0
 
 
 class ConfigResponse(BaseModel):
@@ -44,6 +46,7 @@ class ConfigResponse(BaseModel):
     playlist_public_base_url: str | None
     playlist_url_style: str
     playlist_auto_generate: bool
+    download_tail_pad_seconds: float
 
 
 PLAYLIST_CONFIG_KEYS = {
@@ -154,6 +157,7 @@ async def get_config(db: DBSession = Depends(get_db)):
         playlist_public_base_url=_get_config_value(db, "playlist_public_base_url", os.getenv("PLAYLIST_PUBLIC_BASE_URL", "")),
         playlist_url_style=_get_config_value(db, "playlist_url_style", os.getenv("PLAYLIST_URL_STYLE", "listen")),
         playlist_auto_generate=_get_bool_config(db, "playlist_auto_generate", True),
+        download_tail_pad_seconds=float(_get_config_value(db, "download_tail_pad_seconds", os.getenv("DOWNLOAD_TAIL_PAD_SECONDS", "2.0")) or 2.0),
     )
 
 
@@ -171,6 +175,12 @@ async def update_config(request: ConfigUpdate, db: DBSession = Depends(get_db)):
     if request.audio_quality:
         _set_config_value(db, "audio_quality", request.audio_quality)
         updates["audio_quality"] = request.audio_quality
+
+    if request.download_tail_pad_seconds is not None:
+        # Conservative range: 0 disables padding, 5 seconds is the max.
+        pad = max(0.0, min(5.0, float(request.download_tail_pad_seconds)))
+        _set_config_value(db, "download_tail_pad_seconds", pad)
+        updates["download_tail_pad_seconds"] = pad
 
     for key in PLAYLIST_CONFIG_KEYS:
         if hasattr(request, key):
@@ -254,6 +264,7 @@ async def initial_setup(request: SetupRequest, db: DBSession = Depends(get_db)):
             _set_config_value(db, "playlist_public_base_url", request.playlist_public_base_url)
         _set_config_value(db, "playlist_url_style", request.playlist_url_style or "listen")
         _set_config_value(db, "playlist_auto_generate", request.playlist_auto_generate)
+        _set_config_value(db, "download_tail_pad_seconds", max(0.0, min(5.0, float(request.download_tail_pad_seconds))))
 
         db.commit()
 

@@ -62,7 +62,8 @@ function SettingsPage() {
         playlist_local_base_url: config.playlist_local_base_url || '',
         playlist_public_base_url: config.playlist_public_base_url || '',
         playlist_url_style: config.playlist_url_style || 'listen',
-        playlist_auto_generate: config.playlist_auto_generate
+        playlist_auto_generate: config.playlist_auto_generate,
+        download_tail_pad_seconds: Number(config.download_tail_pad_seconds ?? 2)
       })
       setConfigMessage(res.data?.playlist?.status === 'error' ? `Saved, but playlist generation failed: ${res.data.playlist.message}` : 'Saved and playlist regenerated')
       const refreshed = await api.get('/api/config')
@@ -280,6 +281,52 @@ function SettingsPage() {
               {configSaving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
               Save Playlist Settings
             </button>
+          </div>
+        </div>
+      )}
+
+
+      {/* Download Settings */}
+      {config && (
+        <div className="card mb-6">
+          <h2 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+            <Save className="w-5 h-5 text-sxm-accent" />
+            Downloads
+          </h2>
+          <p className="text-gray-400 text-sm mb-4">
+            Add a small tail pad after the raw SiriusXM metadata boundary. This keeps song endings from sounding clipped while still preventing long DJ/talk bleed.
+          </p>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-gray-400 text-sm mb-1">Download tail pad seconds</label>
+              <input
+                type="number"
+                min="0"
+                max="5"
+                step="0.5"
+                value={config.download_tail_pad_seconds ?? 2}
+                onChange={(e) => setConfig({ ...config, download_tail_pad_seconds: e.target.value })}
+                className="input w-full"
+              />
+              <p className="text-gray-500 text-xs mt-1">Recommended: 1.5-2.0. Use 0 to disable. Maximum: 5 seconds.</p>
+            </div>
+          </div>
+
+          <div className="mt-4 flex items-center gap-3">
+            <button
+              onClick={handleSaveConfig}
+              disabled={configSaving}
+              className="btn-primary flex items-center gap-2 disabled:opacity-50"
+            >
+              {configSaving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+              Save Download Settings
+            </button>
+            {configMessage && (
+              <span className={`text-sm ${configMessage.includes('Failed') ? 'text-red-400' : 'text-green-400'}`}>
+                {configMessage}
+              </span>
+            )}
           </div>
         </div>
       )}

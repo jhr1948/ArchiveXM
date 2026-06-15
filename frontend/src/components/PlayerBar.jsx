@@ -1,4 +1,4 @@
-import { Play, Pause, Volume2, VolumeX, X, Radio, Loader2 } from 'lucide-react'
+import { Play, Pause, Volume2, VolumeX, X, Radio, Loader2, SkipForward } from 'lucide-react'
 import { usePlayer } from '../context/PlayerContext'
 
 function PlayerBar() {
@@ -7,9 +7,12 @@ function PlayerBar() {
     currentTrack,
     isPlaying,
     isLoading,
+    isSkippingNext,
+    isXtra,
     volume,
     isMuted,
     togglePlay,
+    skipNextXtra,
     stop,
     setVolume,
     toggleMute
@@ -78,7 +81,7 @@ function PlayerBar() {
           </div>
 
           {/* Center: Playback Controls */}
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3">
             <button
               onClick={togglePlay}
               disabled={isLoading}
@@ -92,14 +95,31 @@ function PlayerBar() {
                 <Play className="w-6 h-6 ml-1" />
               )}
             </button>
+
+            {isXtra && (
+              <button
+                onClick={skipNextXtra}
+                disabled={isLoading || isSkippingNext}
+                className="w-10 h-10 rounded-full bg-gray-800 text-white flex items-center justify-center hover:bg-gray-700 transition-colors disabled:opacity-50"
+                title="Next XTRA track"
+              >
+                {isSkippingNext ? (
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                ) : (
+                  <SkipForward className="w-5 h-5" />
+                )}
+              </button>
+            )}
           </div>
 
           {/* Right: Volume & Close */}
           <div className="flex items-center gap-4 flex-1 justify-end">
-            {/* Live Indicator */}
-            <div className="flex items-center gap-2 px-3 py-1 bg-red-600/20 rounded-full">
-              <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse"></span>
-              <span className="text-xs text-red-400 font-medium">LIVE</span>
+            {/* Live/XTRA Indicator */}
+            <div className={`flex items-center gap-2 px-3 py-1 rounded-full ${isXtra ? 'bg-primary/20' : 'bg-red-600/20'}`}>
+              <span className={`w-2 h-2 rounded-full animate-pulse ${isXtra ? 'bg-primary' : 'bg-red-500'}`}></span>
+              <span className={`text-xs font-medium ${isXtra ? 'text-primary' : 'text-red-400'}`}>
+                {isXtra ? 'XTRA' : 'LIVE'}
+              </span>
             </div>
             
             {/* Volume Controls */}

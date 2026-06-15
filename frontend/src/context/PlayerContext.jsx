@@ -1,9 +1,38 @@
 import { createContext, useContext, useState, useRef, useEffect, useCallback } from 'react'
 import Hls from 'hls.js'
-import { streamsApi } from '../services/api'
+import api, { streamsApi } from '../services/api'
 import { useJukebox } from './JukeboxContext'
 
 const PlayerContext = createContext(null)
+
+function getChannelId(channel) {
+  return channel?.channel_id || channel?.id || channel?.uuid
+}
+
+function isXtraChannel(channel) {
+  const type = String(channel?.channel_type || channel?.channelType || channel?.type || '').toLowerCase()
+  return type === 'channel-xtra' || type.includes('xtra')
+}
+
+function normalizeXtraMetadata(data) {
+  if (!data || data.ok === false) return null
+
+  return {
+    artist: data.artist || 'Unknown',
+    title: data.title || 'Unknown',
+    album: data.album || '',
+    timestamp_utc: data.timestamp_utc || data.startedAt || null,
+    duration_ms: data.duration_ms ?? data.durationMs ?? 0,
+    started_at_ms: data.started_at_ms ?? data.startedAtMs ?? null,
+    image_url: data.image_url || data.imageUrl || null,
+    is_xtra: true,
+    channel_id: data.channelId,
+    track_id: data.trackId,
+    position_ms: data.positionMs,
+    available_forward_skips: data.availableForwardSkips,
+    available_backward_skips: data.availableBackwardSkips
+  }
+}
 
 export function PlayerProvider({ children }) {
   const audioRef = useRef(null)
@@ -17,30 +46,56 @@ export function PlayerProvider({ children }) {
   const [currentTrack, setCurrentTrack] = useState(null)
   const [isPlaying, setIsPlaying] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
-  const [volume, setVolume] = useState(0.8)
   const [isMuted, setIsMuted] = useState(false)
+  const [volume, setVolume] = useState(0.8)
   const [error, setError] = useState(null)
+  const [isSkippingNext, setIsSkippingNext] = useState(false)
 
-  // Poll for current track info
+  // Poll for current track info. Linear channels still use the normal schedule
+  // endpoint; XTRA channels use the root metadata endpoint that tracks the
+  // active XTRA queue by audio position.
   useEffect(() => {
     if (!currentChannel) return
+
+    let cancelled = false
+    const channelId = getChannelId(currentChannel)
+    const isXtra = isXtraChannel(currentChannel)
+    const pollMs = isXtra ? 5000 : 15000
     
     const fetchCurrentTrack = async () => {
+      if (!channelId) return
+
       try {
-        const response = await streamsApi.getSchedule(currentChannel.channel_id, 1)
-        if (response?.data?.current_track) {
-          setCurrentTrack(response.data.current_track)
+        if (isXtra) {
+          const positionMs = Math.max(0, Math.floor((audioRef.current?.currentTime || 0) * 1000))
+          const response = await api.get(`/metadata/${channelId}`, {
+            params: { positionMs }
+          })
+          const track = normalizeXtraMetadata(response?.data)
+          if (!cancelled && track) {
+            setCurrentTrack(track)
+          }
+        } else {
+          const response = await streamsApi.getSchedule(channelId, 1)
+          if (!cancelled && response?.data?.current_track) {
+            setCurrentTrack(response.data.current_track)
+          }
         }
       } catch (e) {
-        console.error('Failed to fetch current track:', e)
+        if (!cancelled) {
+          console.error('Failed to fetch current track:', e)
+        }
       }
     }
     
     fetchCurrentTrack()
-    const interval = setInterval(fetchCurrentTrack, 15000) // Poll every 15 seconds
+    const interval = setInterval(fetchCurrentTrack, pollMs)
     
-    return () => clearInterval(interval)
-  }, [currentChannel])
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [currentChannel, isPlaying])
 
   // Cleanup on unmount
   useEffect(() => {
@@ -73,11 +128,18 @@ export function PlayerProvider({ children }) {
     }
   }, [jukebox])
 
-  const playChannel = useCallback(async (channel) => {
+  const playChannel = useCallback(async (channel, options = {}) => {
     if (!channel) return
+
+    const { force = false, preserveTrack = false } = options
+    const channelId = getChannelId(channel)
+    if (!channelId) {
+      setError('Missing channel id')
+      return
+    }
     
-    // Prevent race conditions - if already changing, ignore
-    if (isChangingChannel.current) {
+    // Prevent race conditions - if already changing, ignore unless forced by XTRA Next
+    if (isChangingChannel.current && !force) {
       console.log('[Player] Already changing channel, ignoring request')
       return
     }
@@ -107,7 +169,9 @@ export function PlayerProvider({ children }) {
       
       // Clear previous state
       setIsPlaying(false)
-      setCurrentTrack(null)
+      if (!preserveTrack) {
+        setCurrentTrack(null)
+      }
       setError(null)
       
       // Small delay to ensure cleanup is complete
@@ -117,7 +181,7 @@ export function PlayerProvider({ children }) {
       setIsLoading(true)
       setCurrentChannel(channel)
       
-      const streamUrl = streamsApi.getProxyStreamUrl(channel.channel_id)
+      const streamUrl = streamsApi.getProxyStreamUrl(channelId)
       console.log('[Player] Stream URL:', streamUrl)
       
       // Make sure audio element exists
@@ -217,6 +281,36 @@ export function PlayerProvider({ children }) {
     }
   }, [jukebox])
 
+  const skipNextXtra = useCallback(async () => {
+    if (!currentChannel || !isXtraChannel(currentChannel) || isSkippingNext) return
+
+    const channelId = getChannelId(currentChannel)
+    if (!channelId) return
+
+    try {
+      setIsSkippingNext(true)
+      setIsLoading(true)
+      setError(null)
+
+      const response = await api.get(`/xtra/${channelId}/next`)
+      const metadata = response?.data?.metadata || response?.data
+      const nextTrack = normalizeXtraMetadata(metadata)
+      if (nextTrack) {
+        setCurrentTrack(nextTrack)
+      }
+
+      // The backend prepares the next XTRA item. Reload the HLS source so the
+      // frontend starts the newly prepared item immediately.
+      await playChannel(currentChannel, { force: true, preserveTrack: true })
+    } catch (err) {
+      console.error('[Player] XTRA next failed:', err)
+      setError('Failed to skip XTRA track')
+      setIsLoading(false)
+    } finally {
+      setIsSkippingNext(false)
+    }
+  }, [currentChannel, isSkippingNext, playChannel])
+
   const togglePlay = useCallback(() => {
     if (!audioRef.current) return
     
@@ -253,19 +347,25 @@ export function PlayerProvider({ children }) {
     setIsMuted(prev => !prev)
   }, [])
 
+  const currentChannelIsXtra = isXtraChannel(currentChannel)
+
   const value = {
     currentChannel,
     currentTrack,
     isPlaying,
     isLoading,
+    isSkippingNext,
+    isXtra: currentChannelIsXtra,
     volume,
     isMuted,
     error,
     playChannel,
     togglePlay,
+    skipNextXtra,
     stop,
     setVolume,
-    toggleMute
+    toggleMute,
+    setIsMuted
   }
 
   return (

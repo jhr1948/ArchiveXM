@@ -165,6 +165,7 @@ function ChannelDetailPage() {
     } else if (channel) {
       playChannel({
         channel_id: channelId,
+        channel_type: channel.channel_type,
         name: channel.name,
         channel_number: channel.number,
         image: channel.large_image_url || channel.image_url

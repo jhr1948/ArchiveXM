@@ -111,6 +111,41 @@ class LibraryService:
             "errors": errors
         }
     
+
+    def import_file(self, file_path) -> Optional[LocalTrack]:
+        """
+        Import or update one audio file in the local library and return its LocalTrack row.
+        This is used after a download completes so playlists can be updated immediately
+        without requiring a manual library scan.
+        """
+        file_path = Path(file_path)
+
+        if not file_path.exists():
+            print(f"Library import skipped; file does not exist: {file_path}")
+            return None
+
+        if file_path.suffix.lower() not in self.SUPPORTED_FORMATS:
+            print(f"Library import skipped; unsupported file type: {file_path}")
+            return None
+
+        track_data = self._extract_metadata(file_path)
+        if not track_data:
+            return None
+
+        existing = self.db.query(LocalTrack).filter(LocalTrack.file_path == str(file_path)).first()
+        if existing:
+            for key, value in track_data.items():
+                setattr(existing, key, value)
+            self.db.commit()
+            self.db.refresh(existing)
+            return existing
+
+        track = LocalTrack(**track_data)
+        self.db.add(track)
+        self.db.commit()
+        self.db.refresh(track)
+        return track
+
     def _extract_metadata(self, file_path: Path) -> Optional[Dict]:
         """
         Extract metadata from an audio file using mutagen

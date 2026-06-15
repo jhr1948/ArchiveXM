@@ -2,9 +2,9 @@ import { useState, useEffect } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { 
   ArrowLeft, Download, Clock, Music, 
-  CheckCircle, Loader2, RefreshCw, Radio, Play, Pause
+  CheckCircle, Loader2, RefreshCw, Radio, Play, Pause, ListPlus, X
 } from 'lucide-react'
-import { channelsApi, streamsApi, downloadsApi } from '../services/api'
+import { channelsApi, streamsApi, downloadsApi, libraryApi } from '../services/api'
 import RecordingPanel from '../components/RecordingPanel'
 import { usePlayer } from '../context/PlayerContext'
 
@@ -17,14 +17,18 @@ function ChannelDetailPage() {
   const [selectedTracks, setSelectedTracks] = useState(new Set())
   const [downloading, setDownloading] = useState(false)
   const [downloadingTracks, setDownloadingTracks] = useState(new Set())
+  const [playlists, setPlaylists] = useState([])
+  const [playlistTarget, setPlaylistTarget] = useState(null)
+  const [newPlaylistName, setNewPlaylistName] = useState('')
+  const [playlistActionLoading, setPlaylistActionLoading] = useState(false)
   
-  const { currentChannel, isPlaying, isLoading: playerLoading, playChannel, togglePlay } = usePlayer()
+  const { currentChannel, currentTrack: playerCurrentTrack, isPlaying, isLoading: playerLoading, playChannel, togglePlay } = usePlayer()
 
   useEffect(() => {
     loadChannelData()
   }, [channelId])
 
-  // Poll for current track updates every 15 seconds
+  // Poll for current track updates every 5 seconds so live metadata offsets feel responsive
   useEffect(() => {
     if (!channelId || loading) return
     
@@ -42,20 +46,22 @@ function ChannelDetailPage() {
       }
     }
     
-    const interval = setInterval(pollCurrentTrack, 15000)
+    const interval = setInterval(pollCurrentTrack, 5000)
     return () => clearInterval(interval)
   }, [channelId, loading])
 
   const loadChannelData = async () => {
     setLoading(true)
     try {
-      const [channelRes, scheduleRes] = await Promise.all([
+      const [channelRes, scheduleRes, playlistsRes] = await Promise.all([
         channelsApi.get(channelId),
-        streamsApi.getSchedule(channelId, 5)
+        streamsApi.getSchedule(channelId, 5),
+        libraryApi.getPlaylists()
       ])
       
       setChannel(channelRes.data)
       setSchedule(scheduleRes.data)
+      setPlaylists(playlistsRes.data || [])
     } catch (error) {
       console.error('Error loading channel:', error)
     } finally {
@@ -156,6 +162,79 @@ function ChannelDetailPage() {
     }
   }
 
+  const buildTrackPayload = (track) => ({
+    channel_id: channelId,
+    artist: track.artist,
+    title: track.title,
+    album: track.album,
+    timestamp_utc: track.timestamp_utc,
+    duration_ms: track.duration_ms,
+    image_url: track.image_url
+  })
+
+  const openAddTrackToPlaylist = (track, index) => {
+    setPlaylistTarget({ type: 'single', track, index })
+    setNewPlaylistName('')
+  }
+
+  const openAddSelectedToPlaylist = () => {
+    if (selectedTracks.size === 0) return
+    setPlaylistTarget({ type: 'selected' })
+    setNewPlaylistName('')
+  }
+
+  const closePlaylistModal = () => {
+    if (playlistActionLoading) return
+    setPlaylistTarget(null)
+    setNewPlaylistName('')
+  }
+
+  const downloadToPlaylist = async (playlistPayload) => {
+    if (!playlistTarget) return
+
+    setPlaylistActionLoading(true)
+    try {
+      if (playlistTarget.type === 'selected') {
+        const tracksToDownload = Array.from(selectedTracks).map(index => buildTrackPayload(schedule.tracks[index]))
+        await downloadsApi.downloadBulk(channelId, tracksToDownload, playlistPayload)
+        setSelectedTracks(new Set())
+        alert(`Started downloading ${tracksToDownload.length} tracks and adding them to playlist.`)
+      } else {
+        const { track, index } = playlistTarget
+        setDownloadingTracks(prev => new Set([...prev, index]))
+        await downloadsApi.downloadTrackToPlaylist(buildTrackPayload(track), playlistPayload)
+        setTimeout(() => {
+          setDownloadingTracks(prev => {
+            const next = new Set(prev)
+            next.delete(index)
+            return next
+          })
+        }, 2000)
+      }
+
+      const res = await libraryApi.getPlaylists()
+      setPlaylists(res.data || [])
+
+      setPlaylistTarget(null)
+      setNewPlaylistName('')
+    } catch (error) {
+      console.error('Download to playlist error:', error)
+      alert('Download + playlist failed. Please try again.')
+    } finally {
+      setPlaylistActionLoading(false)
+    }
+  }
+
+  const downloadToExistingPlaylist = (playlist) => {
+    downloadToPlaylist({ playlist_id: playlist.id })
+  }
+
+  const downloadToNewPlaylist = () => {
+    const name = newPlaylistName.trim()
+    if (!name) return
+    downloadToPlaylist({ playlist_name: name })
+  }
+
   // Check if this channel is currently playing
   const isThisChannelPlaying = currentChannel?.channel_id === channelId && isPlaying
   
@@ -200,7 +279,8 @@ function ChannelDetailPage() {
     )
   }
 
-  const currentTrack = schedule?.current_track
+  const playerChannelId = currentChannel?.channel_id || currentChannel?.id || currentChannel?.uuid
+  const currentTrack = playerChannelId === channelId && playerCurrentTrack ? playerCurrentTrack : schedule?.current_track
   const tracks = schedule?.tracks || []
 
   return (
@@ -334,23 +414,33 @@ function ChannelDetailPage() {
                 <span className="text-sm text-gray-400">
                   {selectedTracks.size} selected
                 </span>
-                <button
-                  onClick={downloadSelected}
-                  disabled={downloading}
-                  className="btn-primary text-sm py-1 px-3 flex items-center gap-2 ml-auto"
-                >
-                  {downloading ? (
-                    <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      Downloading...
-                    </>
-                  ) : (
-                    <>
-                      <Download className="w-4 h-4" />
-                      Download Selected
-                    </>
-                  )}
-                </button>
+                <div className="ml-auto flex items-center gap-2">
+                  <button
+                    onClick={openAddSelectedToPlaylist}
+                    disabled={downloading || playlistActionLoading}
+                    className="btn-secondary text-sm py-1 px-3 flex items-center gap-2"
+                  >
+                    <ListPlus className="w-4 h-4" />
+                    Download + Playlist
+                  </button>
+                  <button
+                    onClick={downloadSelected}
+                    disabled={downloading}
+                    className="btn-primary text-sm py-1 px-3 flex items-center gap-2"
+                  >
+                    {downloading ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Downloading...
+                      </>
+                    ) : (
+                      <>
+                        <Download className="w-4 h-4" />
+                        Download Selected
+                      </>
+                    )}
+                  </button>
+                </div>
               </>
             )}
           </div>
@@ -425,31 +515,110 @@ function ChannelDetailPage() {
                   </p>
                 </div>
 
-                {/* Download Button */}
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    downloadSingle(track, index)
-                  }}
-                  disabled={downloadingTracks.has(index)}
-                  className={`p-2 rounded-lg transition-colors ${
-                    downloadingTracks.has(index)
-                      ? 'bg-sxm-success/20 text-sxm-success'
-                      : 'hover:bg-sxm-accent/20 text-gray-400 hover:text-sxm-accent'
-                  }`}
-                  title={downloadingTracks.has(index) ? 'Downloading...' : 'Download track'}
-                >
-                  {downloadingTracks.has(index) ? (
-                    <Loader2 className="w-5 h-5 animate-spin" />
-                  ) : (
-                    <Download className="w-5 h-5" />
-                  )}
-                </button>
+                {/* Track Actions */}
+                <div className="flex items-center gap-1 shrink-0">
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      openAddTrackToPlaylist(track, index)
+                    }}
+                    disabled={downloadingTracks.has(index)}
+                    className="p-2 rounded-lg transition-colors hover:bg-sxm-accent/20 text-gray-400 hover:text-sxm-accent disabled:opacity-50"
+                    title="Download and add to playlist"
+                  >
+                    <ListPlus className="w-5 h-5" />
+                  </button>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      downloadSingle(track, index)
+                    }}
+                    disabled={downloadingTracks.has(index)}
+                    className={`p-2 rounded-lg transition-colors ${
+                      downloadingTracks.has(index)
+                        ? 'bg-sxm-success/20 text-sxm-success'
+                        : 'hover:bg-sxm-accent/20 text-gray-400 hover:text-sxm-accent'
+                    }`}
+                    title={downloadingTracks.has(index) ? 'Downloading...' : 'Download track'}
+                  >
+                    {downloadingTracks.has(index) ? (
+                      <Loader2 className="w-5 h-5 animate-spin" />
+                    ) : (
+                      <Download className="w-5 h-5" />
+                    )}
+                  </button>
+                </div>
               </div>
             ))}
           </div>
         )}
       </div>
+
+      {/* Download + Add to Playlist Modal */}
+      {playlistTarget && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-md shadow-2xl">
+            <div className="flex items-start justify-between gap-4 mb-4">
+              <div>
+                <h3 className="text-xl font-bold text-white">Download + Add to Playlist</h3>
+                <p className="text-gray-400 text-sm mt-1">
+                  {playlistTarget.type === 'selected'
+                    ? `${selectedTracks.size} selected track${selectedTracks.size === 1 ? '' : 's'}`
+                    : `${playlistTarget.track?.artist || 'Unknown'} - ${playlistTarget.track?.title || 'Unknown'}`}
+                </p>
+              </div>
+              <button
+                onClick={closePlaylistModal}
+                className="text-gray-400 hover:text-white"
+                title="Close"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-2 max-h-60 overflow-y-auto mb-4">
+              {playlists.length === 0 ? (
+                <p className="text-gray-500 text-sm py-2">No playlists yet. Create one below.</p>
+              ) : (
+                playlists.map(playlist => (
+                  <button
+                    key={playlist.id}
+                    onClick={() => downloadToExistingPlaylist(playlist)}
+                    disabled={playlistActionLoading}
+                    className="w-full flex items-center gap-3 px-4 py-3 bg-gray-800 hover:bg-gray-700 rounded-lg text-left disabled:opacity-50"
+                  >
+                    <ListPlus className="w-5 h-5 text-gray-500" />
+                    <div className="min-w-0">
+                      <div className="text-white truncate">{playlist.name}</div>
+                      <div className="text-xs text-gray-500">{playlist.track_count || 0} tracks</div>
+                    </div>
+                  </button>
+                ))
+              )}
+            </div>
+
+            <div className="border-t border-gray-800 pt-4">
+              <label className="block text-sm text-gray-400 mb-2">Create new playlist</label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  placeholder="Playlist name"
+                  value={newPlaylistName}
+                  onChange={(e) => setNewPlaylistName(e.target.value)}
+                  className="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-primary"
+                />
+                <button
+                  onClick={downloadToNewPlaylist}
+                  disabled={!newPlaylistName.trim() || playlistActionLoading}
+                  className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/80 disabled:opacity-50"
+                >
+                  {playlistActionLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Create'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

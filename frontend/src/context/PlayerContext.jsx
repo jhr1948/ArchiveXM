@@ -60,7 +60,7 @@ export function PlayerProvider({ children }) {
     let cancelled = false
     const channelId = getChannelId(currentChannel)
     const isXtra = isXtraChannel(currentChannel)
-    const pollMs = isXtra ? 5000 : 15000
+    const pollMs = 3000
     
     const fetchCurrentTrack = async () => {
       if (!channelId) return
@@ -113,18 +113,34 @@ export function PlayerProvider({ children }) {
     }
   }, [volume, isMuted])
 
-  // Register pause function with JukeboxContext so it can pause live stream
+  // Register stop function with JukeboxContext so Jukebox playback fully takes over live streams.
+  // Important: pausing only left currentChannel set, so the UI could keep showing the
+  // live player banner while a Jukebox song was actually playing.
   useEffect(() => {
     if (jukebox?.registerPauseLiveStream) {
-      const pauseLive = () => {
-        // Check audio element directly to avoid stale closure
-        if (audioRef.current && !audioRef.current.paused) {
-          console.log('[Player] Pausing live stream for Jukebox')
-          audioRef.current.pause()
-          setIsPlaying(false)
+      const stopLiveForJukebox = () => {
+        console.log('[Player] Stopping live stream for Jukebox')
+
+        if (hlsRef.current) {
+          hlsRef.current.destroy()
+          hlsRef.current = null
         }
+
+        if (audioRef.current) {
+          audioRef.current.pause()
+          audioRef.current.src = ''
+          audioRef.current.load()
+        }
+
+        setIsPlaying(false)
+        setIsLoading(false)
+        setCurrentChannel(null)
+        setCurrentTrack(null)
+        setError(null)
+        isChangingChannel.current = false
       }
-      jukebox.registerPauseLiveStream(pauseLive)
+
+      jukebox.registerPauseLiveStream(stopLiveForJukebox)
     }
   }, [jukebox])
 

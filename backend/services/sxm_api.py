@@ -169,7 +169,7 @@ class SiriusXMAPI:
         
         return None
     
-    async def get_schedule(self, channel_id: str, hours_back: int = 5, include_interstitials: bool = False) -> List[Dict]:
+    async def get_schedule(self, channel_id: str, hours_back: int = 5, include_interstitials: bool = False, future_seconds: int = 0) -> List[Dict]:
         """
         Fetch track schedule from liveUpdate API
         
@@ -182,7 +182,9 @@ class SiriusXMAPI:
             channel_id: Channel ID
             hours_back: Hours back to fetch (1-5)
             include_interstitials: Include every timed metadata item. Use this for
-                download boundaries so DJ plugs/talk cuts stop the previous song.
+                download boundaries and live metadata timing.
+            future_seconds: Allow metadata items whose timestamp is slightly in
+                the future. This is used only for live metadata offset support.
             
         Returns:
             List of tracks with exact timestamps
@@ -235,7 +237,7 @@ class SiriusXMAPI:
                                 try:
                                     track_time = datetime.fromisoformat(track_timestamp.replace('Z', '+00:00'))
                                     # Only include tracks in the past
-                                    if track_time <= now:
+                                    if track_time <= now + timedelta(seconds=max(0, int(future_seconds or 0))):
                                         # Extract image URL from various possible locations
                                         image_url = None
                                         raw_image_path = None

@@ -56,8 +56,8 @@ export const channelsApi = {
 
 // Streams API
 export const streamsApi = {
-  getSchedule: (channelId, hoursBack = 5) => 
-    api.get(`/api/streams/${channelId}/schedule`, { params: { hours_back: hoursBack } }),
+  getSchedule: (channelId, hoursBack = 5, options = {}) => 
+    api.get(`/api/streams/${channelId}/schedule`, { params: { hours_back: hoursBack, ...options } }),
   
   getNowPlaying: (channelId) => 
     api.get(`/api/streams/${channelId}/now-playing`),
@@ -74,9 +74,12 @@ export const streamsApi = {
 export const downloadsApi = {
   downloadTrack: (track) => 
     api.post('/api/downloads/track', track),
+
+  downloadTrackToPlaylist: (track, playlist = {}) =>
+    api.post('/api/downloads/track', { ...track, ...playlist }),
   
-  downloadBulk: (channelId, tracks) => 
-    api.post('/api/downloads/bulk', { channel_id: channelId, tracks }),
+  downloadBulk: (channelId, tracks, playlist = {}) => 
+    api.post('/api/downloads/bulk', { channel_id: channelId, tracks, ...playlist }),
   
   getHistory: (limit = 50, offset = 0) => 
     api.get('/api/downloads/history', { params: { limit, offset } }),

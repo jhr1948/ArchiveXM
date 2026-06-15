@@ -26,6 +26,63 @@ class DownloadService:
         self.hls_service = HLSService(bearer_token)
         self.api = SiriusXMAPI(bearer_token)
 
+    def _register_completed_download_in_library(self, db, output_file: Path, playlist_id: int = None, playlist_name: str = None):
+        """Import one completed download into LocalTrack and optionally add it to a playlist."""
+        if not output_file or not Path(output_file).exists():
+            return None
+
+        try:
+            from database import Playlist, PlaylistTrack
+            from services.library_service import LibraryService
+
+            library_service = LibraryService(db)
+            local_track = library_service.import_file(output_file)
+            if not local_track:
+                return None
+
+            playlist = None
+            if playlist_id:
+                playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+            elif playlist_name and str(playlist_name).strip():
+                clean_name = str(playlist_name).strip()
+                playlist = db.query(Playlist).filter(Playlist.name == clean_name).first()
+                if not playlist:
+                    playlist = Playlist(name=clean_name, description="")
+                    db.add(playlist)
+                    db.commit()
+                    db.refresh(playlist)
+
+            if playlist:
+                existing = db.query(PlaylistTrack).filter(
+                    PlaylistTrack.playlist_id == playlist.id,
+                    PlaylistTrack.track_id == local_track.id
+                ).first()
+
+                if not existing:
+                    max_pos = db.query(PlaylistTrack.position).filter(
+                        PlaylistTrack.playlist_id == playlist.id
+                    ).order_by(PlaylistTrack.position.desc()).first()
+                    next_pos = (max_pos[0] if max_pos and max_pos[0] else 0) + 1
+                    db.add(PlaylistTrack(
+                        playlist_id=playlist.id,
+                        track_id=local_track.id,
+                        position=next_pos
+                    ))
+
+                db.flush()
+                playlist.track_count = db.query(PlaylistTrack).filter(
+                    PlaylistTrack.playlist_id == playlist.id
+                ).count()
+                db.commit()
+                db.refresh(playlist)
+                print(f"   🎵 Added library track {local_track.id} to playlist: {playlist.name} ({playlist.track_count} tracks)")
+
+            return local_track
+        except Exception as e:
+            # Download succeeded, so playlist/library registration should not fail the download.
+            print(f"   ⚠️ Library/playlist registration failed: {e}")
+            return None
+
     def _get_download_tail_pad_seconds(self, db=None) -> float:
         """Return extra seconds to keep after the next SXM metadata boundary.
 
@@ -129,13 +186,49 @@ class DownloadService:
 
         return extended
 
+    def _validate_track_start_available(self, track_segments: List[Dict], track: Dict, log_prefix: str = "   "):
+        """Prevent saving partial tracks when the start has rolled out of the DVR buffer.
+
+        SiriusXM's linear DVR window is finite. The oldest history item can still be
+        shown in the UI even when the HLS playlist no longer contains the segment
+        where that song began. Without this guard ArchiveXM can save only the last
+        few seconds of a song and then import that partial file into Jukebox.
+        """
+        if not track_segments:
+            return
+
+        first_ts = track_segments[0].get("timestamp")
+        track_ts = track.get("timestamp_utc") or track.get("timestamp")
+        if not first_ts or not track_ts:
+            return
+
+        try:
+            first_time = datetime.fromisoformat(str(first_ts).replace('Z', '+00:00'))
+            track_start = datetime.fromisoformat(str(track_ts).replace('Z', '+00:00'))
+        except Exception:
+            return
+
+        missing_start_sec = (first_time - track_start).total_seconds()
+        if missing_start_sec > 2.0:
+            title = track.get("title") or "track"
+            print(
+                f"{log_prefix}⚠️ Incomplete DVR window for {title}: "
+                f"first available segment starts {missing_start_sec:.1f}s after track start"
+            )
+            raise Exception(
+                "Track start is no longer available in the SiriusXM DVR buffer. "
+                "Try a newer history item or refresh the station history."
+            )
+
     async def download_track(
         self,
         download_id: int,
         channel_id: str,
         track: Dict,
         download_path: str,
-        next_track_timestamp: str = None
+        next_track_timestamp: str = None,
+        playlist_id: int = None,
+        playlist_name: str = None
     ) -> bool:
         """
         Download a single track from DVR buffer
@@ -206,6 +299,7 @@ class DownloadService:
                 db=db,
                 log_prefix="   ",
             )
+            self._validate_track_start_available(track_segments, track, log_prefix="   ")
 
             # If no segments found by timestamp, try using duration-based estimation
             if not track_segments and segments:
@@ -319,6 +413,12 @@ class DownloadService:
                 download_record.file_path = str(output_file)
                 download_record.file_size = file_size
                 download_record.status = "completed"
+                self._register_completed_download_in_library(
+                    db,
+                    output_file,
+                    playlist_id=playlist_id,
+                    playlist_name=playlist_name
+                )
                 db.commit()
                 
                 print(f"   ✅ Downloaded: {output_file}")
@@ -342,7 +442,9 @@ class DownloadService:
         download_ids: List[int],
         channel_id: str,
         tracks: List[Dict],
-        download_path: str
+        download_path: str,
+        playlist_id: int = None,
+        playlist_name: str = None
     ) -> Dict:
         """
         Download multiple tracks efficiently
@@ -441,6 +543,7 @@ class DownloadService:
                         db=db,
                         log_prefix="      ",
                     )
+                    self._validate_track_start_available(track_segments, track, log_prefix="      ")
 
                     if not track_segments:
                         download_record.status = "failed: no segments"
@@ -506,6 +609,12 @@ class DownloadService:
                             download_record.file_path = str(output_file)
                             download_record.file_size = output_file.stat().st_size
                             download_record.status = "completed"
+                            self._register_completed_download_in_library(
+                                db,
+                                output_file,
+                                playlist_id=playlist_id,
+                                playlist_name=playlist_name
+                            )
                             successful += 1
                         else:
                             download_record.status = "failed: download error"
@@ -519,6 +628,12 @@ class DownloadService:
                     
                 except Exception as e:
                     print(f"   ❌ Error: {e}")
+                    try:
+                        if download_record:
+                            download_record.status = f"failed: {str(e)[:100]}"
+                            db.commit()
+                    except Exception:
+                        pass
                     failed += 1
                     continue
             

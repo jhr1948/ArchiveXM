@@ -5,8 +5,9 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session as DBSession
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict
 import os
+import json
 
 from database import get_db, Config, Credentials, Channel
 
@@ -22,6 +23,10 @@ class ConfigUpdate(BaseModel):
     playlist_url_style: Optional[str] = None
     playlist_auto_generate: Optional[bool] = None
     download_tail_pad_seconds: Optional[float] = None
+    live_metadata_offset_seconds: Optional[float] = None
+    live_metadata_hide_short_cuts: Optional[bool] = None
+    live_metadata_short_cut_max_seconds: Optional[float] = None
+    live_metadata_channel_offsets: Optional[Dict[str, float]] = None
 
 
 class SetupRequest(BaseModel):
@@ -34,6 +39,10 @@ class SetupRequest(BaseModel):
     playlist_url_style: str = "listen"
     playlist_auto_generate: bool = True
     download_tail_pad_seconds: float = 2.0
+    live_metadata_offset_seconds: float = 38.0
+    live_metadata_hide_short_cuts: bool = False
+    live_metadata_short_cut_max_seconds: float = 45.0
+    live_metadata_channel_offsets: Dict[str, float] = {}
 
 
 class ConfigResponse(BaseModel):
@@ -47,6 +56,10 @@ class ConfigResponse(BaseModel):
     playlist_url_style: str
     playlist_auto_generate: bool
     download_tail_pad_seconds: float
+    live_metadata_offset_seconds: float
+    live_metadata_hide_short_cuts: bool
+    live_metadata_short_cut_max_seconds: float
+    live_metadata_channel_offsets: Dict[str, float]
 
 
 PLAYLIST_CONFIG_KEYS = {
@@ -85,6 +98,21 @@ def _get_bool_config(db: DBSession, key: str, default: bool = False) -> bool:
     if value is None:
         return default
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _get_json_config(db: DBSession, key: str, default=None):
+    value = _get_config_value(db, key, None)
+    if value is None:
+        return default if default is not None else {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else (default if default is not None else {})
+    except Exception:
+        return default if default is not None else {}
+
+
+def _set_json_config(db: DBSession, key: str, value):
+    _set_config_value(db, key, json.dumps(value or {}))
 
 
 def _default_local_base_url() -> str:
@@ -158,6 +186,10 @@ async def get_config(db: DBSession = Depends(get_db)):
         playlist_url_style=_get_config_value(db, "playlist_url_style", os.getenv("PLAYLIST_URL_STYLE", "listen")),
         playlist_auto_generate=_get_bool_config(db, "playlist_auto_generate", True),
         download_tail_pad_seconds=float(_get_config_value(db, "download_tail_pad_seconds", os.getenv("DOWNLOAD_TAIL_PAD_SECONDS", "2.0")) or 2.0),
+        live_metadata_offset_seconds=float(_get_config_value(db, "live_metadata_offset_seconds", os.getenv("LIVE_METADATA_OFFSET_SECONDS", "0")) or 0),
+        live_metadata_hide_short_cuts=_get_bool_config(db, "live_metadata_hide_short_cuts", False),
+        live_metadata_short_cut_max_seconds=float(_get_config_value(db, "live_metadata_short_cut_max_seconds", os.getenv("LIVE_METADATA_SHORT_CUT_MAX_SECONDS", "45")) or 45),
+        live_metadata_channel_offsets=_get_json_config(db, "live_metadata_channel_offsets", {}),
     )
 
 
@@ -181,6 +213,30 @@ async def update_config(request: ConfigUpdate, db: DBSession = Depends(get_db)):
         pad = max(0.0, min(5.0, float(request.download_tail_pad_seconds)))
         _set_config_value(db, "download_tail_pad_seconds", pad)
         updates["download_tail_pad_seconds"] = pad
+
+    if request.live_metadata_offset_seconds is not None:
+        offset = max(-120.0, min(120.0, float(request.live_metadata_offset_seconds)))
+        _set_config_value(db, "live_metadata_offset_seconds", offset)
+        updates["live_metadata_offset_seconds"] = offset
+
+    if request.live_metadata_hide_short_cuts is not None:
+        _set_config_value(db, "live_metadata_hide_short_cuts", request.live_metadata_hide_short_cuts)
+        updates["live_metadata_hide_short_cuts"] = request.live_metadata_hide_short_cuts
+
+    if request.live_metadata_short_cut_max_seconds is not None:
+        max_cut = max(1.0, min(300.0, float(request.live_metadata_short_cut_max_seconds)))
+        _set_config_value(db, "live_metadata_short_cut_max_seconds", max_cut)
+        updates["live_metadata_short_cut_max_seconds"] = max_cut
+
+    if request.live_metadata_channel_offsets is not None:
+        clean_offsets = {}
+        for key, value in (request.live_metadata_channel_offsets or {}).items():
+            try:
+                clean_offsets[str(key)] = max(-120.0, min(120.0, float(value)))
+            except Exception:
+                continue
+        _set_json_config(db, "live_metadata_channel_offsets", clean_offsets)
+        updates["live_metadata_channel_offsets"] = clean_offsets
 
     for key in PLAYLIST_CONFIG_KEYS:
         if hasattr(request, key):
@@ -265,6 +321,10 @@ async def initial_setup(request: SetupRequest, db: DBSession = Depends(get_db)):
         _set_config_value(db, "playlist_url_style", request.playlist_url_style or "listen")
         _set_config_value(db, "playlist_auto_generate", request.playlist_auto_generate)
         _set_config_value(db, "download_tail_pad_seconds", max(0.0, min(5.0, float(request.download_tail_pad_seconds))))
+        _set_config_value(db, "live_metadata_offset_seconds", max(-120.0, min(120.0, float(request.live_metadata_offset_seconds))))
+        _set_config_value(db, "live_metadata_hide_short_cuts", request.live_metadata_hide_short_cuts)
+        _set_config_value(db, "live_metadata_short_cut_max_seconds", max(1.0, min(300.0, float(request.live_metadata_short_cut_max_seconds))))
+        _set_json_config(db, "live_metadata_channel_offsets", request.live_metadata_channel_offsets or {})
 
         db.commit()
 

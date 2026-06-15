@@ -5,14 +5,17 @@ import {
   RefreshCw, Shield, Activity, AlertCircle, CheckCircle, Globe2, Wifi, Save
 } from 'lucide-react'
 import { api } from '../services/api'
+import { usePlayer } from '../context/PlayerContext'
 
 function SettingsPage() {
+  const { currentChannel } = usePlayer()
   const [credentials, setCredentials] = useState([])
   const [loading, setLoading] = useState(true)
   const [stats, setStats] = useState(null)
   const [config, setConfig] = useState(null)
   const [configSaving, setConfigSaving] = useState(false)
   const [configMessage, setConfigMessage] = useState('')
+  const [channelCustomOffset, setChannelCustomOffset] = useState('')
   
   // Add credential modal
   const [showAddModal, setShowAddModal] = useState(false)
@@ -31,6 +34,24 @@ function SettingsPage() {
   useEffect(() => {
     loadCredentials()
   }, [])
+
+  const getCurrentChannelId = () => currentChannel?.channel_id || currentChannel?.id || currentChannel?.uuid
+
+  useEffect(() => {
+    if (!config) return
+    const channelId = getCurrentChannelId()
+    if (!channelId) {
+      setChannelCustomOffset('')
+      return
+    }
+
+    const existingOffset = config.live_metadata_channel_offsets?.[channelId]
+    setChannelCustomOffset(
+      existingOffset !== undefined && existingOffset !== null
+        ? String(existingOffset)
+        : String(config.live_metadata_offset_seconds ?? 38)
+    )
+  }, [currentChannel, config?.live_metadata_channel_offsets, config?.live_metadata_offset_seconds])
 
   const loadCredentials = async () => {
     try {
@@ -63,13 +84,84 @@ function SettingsPage() {
         playlist_public_base_url: config.playlist_public_base_url || '',
         playlist_url_style: config.playlist_url_style || 'listen',
         playlist_auto_generate: config.playlist_auto_generate,
-        download_tail_pad_seconds: Number(config.download_tail_pad_seconds ?? 2)
+        download_tail_pad_seconds: Number(config.download_tail_pad_seconds ?? 2),
+        live_metadata_offset_seconds: Number(config.live_metadata_offset_seconds ?? 0),
+        live_metadata_hide_short_cuts: !!config.live_metadata_hide_short_cuts,
+        live_metadata_short_cut_max_seconds: Number(config.live_metadata_short_cut_max_seconds ?? 45),
+        live_metadata_channel_offsets: config.live_metadata_channel_offsets || {}
       })
       setConfigMessage(res.data?.playlist?.status === 'error' ? `Saved, but playlist generation failed: ${res.data.playlist.message}` : 'Saved and playlist regenerated')
       const refreshed = await api.get('/api/config')
       setConfig(refreshed.data)
     } catch (error) {
       setConfigMessage(error.response?.data?.detail || 'Failed to save playlist settings')
+    } finally {
+      setConfigSaving(false)
+    }
+  }
+
+  const handleSaveCurrentChannelOffset = async () => {
+    const channelId = getCurrentChannelId()
+    if (!channelId || !config) return
+
+    const customValue = Number(channelCustomOffset === '' ? config.live_metadata_offset_seconds ?? 38 : channelCustomOffset)
+    const offsets = { ...(config.live_metadata_channel_offsets || {}) }
+    offsets[channelId] = customValue
+    setConfig({ ...config, live_metadata_channel_offsets: offsets })
+
+    setConfigSaving(true)
+    setConfigMessage('')
+    try {
+      await api.post('/api/config', {
+        live_metadata_channel_offsets: offsets
+      })
+      const refreshed = await api.get('/api/config')
+      setConfig(refreshed.data)
+      setChannelCustomOffset(String(refreshed.data?.live_metadata_channel_offsets?.[channelId] ?? customValue))
+      setConfigMessage(`Saved ${customValue}s custom live metadata offset for ${currentChannel?.name || 'current channel'}`)
+    } catch (error) {
+      setConfigMessage(error.response?.data?.detail || 'Failed to save channel offset')
+    } finally {
+      setConfigSaving(false)
+    }
+  }
+
+  const handleResetCurrentChannelOffset = async () => {
+    const channelId = getCurrentChannelId()
+    if (!channelId || !config) return
+
+    const offsets = { ...(config.live_metadata_channel_offsets || {}) }
+    delete offsets[channelId]
+    setConfig({ ...config, live_metadata_channel_offsets: offsets })
+
+    setConfigSaving(true)
+    setConfigMessage('')
+    try {
+      await api.post('/api/config', { live_metadata_channel_offsets: offsets })
+      const refreshed = await api.get('/api/config')
+      setConfig(refreshed.data)
+      setChannelCustomOffset(String(refreshed.data?.live_metadata_offset_seconds ?? 38))
+      setConfigMessage(`Reset ${currentChannel?.name || 'current channel'} to the global offset`)
+    } catch (error) {
+      setConfigMessage(error.response?.data?.detail || 'Failed to reset channel offset')
+    } finally {
+      setConfigSaving(false)
+    }
+  }
+
+  const handleClearLiveMetadataOffsets = async () => {
+    if (!config || !confirm('Clear all custom per-channel live metadata offsets?')) return
+
+    setConfigSaving(true)
+    setConfigMessage('')
+    try {
+      await api.post('/api/config', { live_metadata_channel_offsets: {} })
+      const refreshed = await api.get('/api/config')
+      setConfig(refreshed.data)
+      setChannelCustomOffset(currentChannel ? String(refreshed.data?.live_metadata_offset_seconds ?? 38) : '')
+      setConfigMessage('Cleared all custom live metadata offsets')
+    } catch (error) {
+      setConfigMessage(error.response?.data?.detail || 'Failed to clear custom offsets')
     } finally {
       setConfigSaving(false)
     }
@@ -321,6 +413,135 @@ function SettingsPage() {
             >
               {configSaving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
               Save Download Settings
+            </button>
+            {configMessage && (
+              <span className={`text-sm ${configMessage.includes('Failed') ? 'text-red-400' : 'text-green-400'}`}>
+                {configMessage}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Live Metadata Settings */}
+      {config && (
+        <div className="card mb-6">
+          <h2 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+            <Activity className="w-5 h-5 text-sxm-accent" />
+            Live Metadata
+          </h2>
+          <p className="text-gray-400 text-sm mb-4">
+            Adjust when live metadata changes and whether short DJ/channel plug cuts should be shown in the player. Station History remains song-focused and hides interstitial cuts.
+          </p>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-gray-400 text-sm mb-1">Global metadata offset seconds</label>
+              <input
+                type="number"
+                min="-120"
+                max="120"
+                step="1"
+                value={config.live_metadata_offset_seconds ?? 38}
+                onChange={(e) => setConfig({ ...config, live_metadata_offset_seconds: e.target.value })}
+                className="input w-full"
+              />
+              <p className="text-gray-500 text-xs mt-1">Positive delays metadata. Negative shows it earlier. Example: use 38 if metadata changes 38 seconds too early.</p>
+            </div>
+
+            <div>
+              <label className="block text-gray-400 text-sm mb-1">Short cut max seconds</label>
+              <input
+                type="number"
+                min="1"
+                max="300"
+                step="1"
+                value={config.live_metadata_short_cut_max_seconds ?? 45}
+                onChange={(e) => setConfig({ ...config, live_metadata_short_cut_max_seconds: e.target.value })}
+                className="input w-full"
+              />
+              <p className="text-gray-500 text-xs mt-1">Used only when hiding short DJ/channel plug cuts is enabled.</p>
+            </div>
+          </div>
+
+          <div className="mt-4">
+            <label className="flex items-center gap-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={!!config.live_metadata_hide_short_cuts}
+                onChange={(e) => setConfig({ ...config, live_metadata_hide_short_cuts: e.target.checked })}
+                className="w-4 h-4 rounded"
+              />
+              <span className="text-gray-300 text-sm">Hide short DJ/channel plug cuts in live metadata</span>
+            </label>
+            <p className="text-gray-500 text-xs mt-1 ml-7">Off by default. When off, ArchiveXM can show DJ/plug metadata if SiriusXM provides it.</p>
+          </div>
+
+          <div className="mt-5 p-4 rounded-lg bg-sxm-darker border border-sxm-border">
+            <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+              <div>
+                <div className="text-white font-medium">Current channel custom offset</div>
+                {currentChannel ? (
+                  <div className="space-y-2">
+                    <div className="text-gray-400 text-sm">
+                      {currentChannel.name} {getCurrentChannelId() && config.live_metadata_channel_offsets?.[getCurrentChannelId()] !== undefined
+                        ? `uses ${config.live_metadata_channel_offsets[getCurrentChannelId()]}s custom offset`
+                        : `uses the global ${config.live_metadata_offset_seconds ?? 38}s offset`}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <label className="text-gray-400 text-xs">Custom offset seconds</label>
+                      <input
+                        type="number"
+                        min="-120"
+                        max="120"
+                        step="1"
+                        value={channelCustomOffset}
+                        onChange={(e) => setChannelCustomOffset(e.target.value)}
+                        className="input w-28"
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-gray-500 text-sm">Start a live channel to save a custom offset for it.</div>
+                )}
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={handleSaveCurrentChannelOffset}
+                  disabled={configSaving || !currentChannel}
+                  className="btn-secondary text-sm disabled:opacity-50"
+                >
+                  Save Custom Offset
+                </button>
+                <button
+                  type="button"
+                  onClick={handleResetCurrentChannelOffset}
+                  disabled={configSaving || !currentChannel}
+                  className="btn-secondary text-sm disabled:opacity-50"
+                >
+                  Use Global Offset
+                </button>
+                <button
+                  type="button"
+                  onClick={handleClearLiveMetadataOffsets}
+                  disabled={configSaving}
+                  className="btn-secondary text-sm disabled:opacity-50"
+                >
+                  Clear Custom Offsets
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-4 flex items-center gap-3">
+            <button
+              onClick={handleSaveConfig}
+              disabled={configSaving}
+              className="btn-primary flex items-center gap-2 disabled:opacity-50"
+            >
+              {configSaving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+              Save Live Metadata Settings
             </button>
             {configMessage && (
               <span className={`text-sm ${configMessage.includes('Failed') ? 'text-red-400' : 'text-green-400'}`}>

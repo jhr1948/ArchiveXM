@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session as DBSession
 from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 
-from database import get_db, Channel, Session as AuthSession
+from database import get_db, Channel, Session as AuthSession, Config
 from services.sxm_api import SiriusXMAPI
 from services.hls_service import HLSService
 
@@ -45,6 +45,130 @@ def get_channel_type(channel_id: str, db: DBSession) -> str:
 
 
 
+def _get_config_value(db: DBSession, key: str, default=None):
+    item = db.query(Config).filter(Config.key == key).first()
+    if item is None or item.value in (None, ""):
+        return default
+    return item.value
+
+
+def _get_bool_config(db: DBSession, key: str, default: bool = False) -> bool:
+    value = _get_config_value(db, key, None)
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _get_live_metadata_settings(db: DBSession, channel_id: str) -> dict:
+    import json
+
+    global_offset = float(_get_config_value(db, "live_metadata_offset_seconds", "38") or 38)
+    hide_short_cuts = _get_bool_config(db, "live_metadata_hide_short_cuts", False)
+    short_cut_max_seconds = float(_get_config_value(db, "live_metadata_short_cut_max_seconds", "45") or 45)
+
+    offsets_raw = _get_config_value(db, "live_metadata_channel_offsets", "{}") or "{}"
+    try:
+        channel_offsets = json.loads(offsets_raw)
+        if not isinstance(channel_offsets, dict):
+            channel_offsets = {}
+    except Exception:
+        channel_offsets = {}
+
+    resolved_channel_id = resolve_channel_id(channel_id, db)
+    offset = channel_offsets.get(resolved_channel_id, global_offset)
+    try:
+        offset = float(offset)
+    except Exception:
+        offset = global_offset
+
+    return {
+        "offset_seconds": max(-120.0, min(120.0, offset)),
+        "hide_short_cuts": hide_short_cuts,
+        "short_cut_max_seconds": max(1.0, min(300.0, short_cut_max_seconds)),
+        "channel_offsets": channel_offsets,
+    }
+
+
+def _track_time(track: dict):
+    try:
+        timestamp = track.get("timestamp_utc") or track.get("timestamp")
+        if not timestamp:
+            return None
+        return datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _is_live_cut(track: dict, max_seconds: float) -> bool:
+    if track.get("is_interstitial"):
+        return True
+    try:
+        duration_ms = int(track.get("duration_ms") or 0)
+    except Exception:
+        duration_ms = 0
+    return duration_ms > 0 and duration_ms <= int(max_seconds * 1000)
+
+
+def _select_current_live_track(raw_tracks: list, settings: dict):
+    if not raw_tracks:
+        return None
+
+    offset_seconds = float(settings.get("offset_seconds") or 0)
+    # Positive offset delays metadata: choose the item active at now - offset.
+    # Negative offset advances metadata: choose the item active at now + abs(offset).
+    effective_now = datetime.now(timezone.utc) - timedelta(seconds=offset_seconds)
+    hide_short_cuts = bool(settings.get("hide_short_cuts"))
+    max_seconds = float(settings.get("short_cut_max_seconds") or 45)
+
+    selected = None
+    for track in raw_tracks:
+        t = _track_time(track)
+        if t is None or t > effective_now:
+            continue
+        if hide_short_cuts and _is_live_cut(track, max_seconds):
+            continue
+        selected = track
+
+    if selected is not None:
+        return selected
+
+    # Fallback: pick the latest eligible item if the offset window landed before
+    # the first raw metadata item in the response.
+    for track in reversed(raw_tracks):
+        if hide_short_cuts and _is_live_cut(track, max_seconds):
+            continue
+        return track
+
+    return raw_tracks[-1]
+
+
+def _to_track_info(track: dict, now: datetime):
+    try:
+        track_time = datetime.fromisoformat(track["timestamp_utc"].replace("Z", "+00:00"))
+        delta = now - track_time
+        if delta.total_seconds() < 60:
+            time_ago = "just now"
+        elif delta.total_seconds() < 3600:
+            mins = int(delta.total_seconds() / 60)
+            time_ago = f"{mins} min ago"
+        else:
+            hours = int(delta.total_seconds() / 3600)
+            time_ago = f"{hours}h ago"
+    except Exception:
+        time_ago = None
+
+    return TrackInfo(
+        artist=track.get("artist", "Unknown"),
+        title=track.get("title", "Unknown"),
+        album=track.get("album"),
+        timestamp_utc=track.get("timestamp_utc", ""),
+        duration_ms=track.get("duration_ms", 0),
+        time_ago=time_ago,
+        image_url=track.get("image_url"),
+        is_interstitial=bool(track.get("is_interstitial", False)),
+    )
+
+
 class TrackInfo(BaseModel):
     artist: str
     title: str
@@ -53,6 +177,7 @@ class TrackInfo(BaseModel):
     duration_ms: int
     time_ago: str | None
     image_url: str | None
+    is_interstitial: bool | None = False
 
 
 class ScheduleResponse(BaseModel):
@@ -87,43 +212,25 @@ async def get_schedule(
     
     try:
         api = SiriusXMAPI(session.bearer_token)
-        tracks = await api.get_schedule(channel_id, hours_back)
+        settings = _get_live_metadata_settings(db, channel_id)
+        future_seconds = int(abs(float(settings.get("offset_seconds") or 0))) + 30
+
+        # Raw metadata is used only for the current live item so optional DJ/plug
+        # cuts and timing offsets can be honored. Station History remains clean
+        # and excludes interstitials/short cuts.
+        raw_tracks = await api.get_schedule(
+            channel_id,
+            hours_back,
+            include_interstitials=True,
+            future_seconds=future_seconds,
+        )
+        history_tracks = [track for track in raw_tracks if not track.get("is_interstitial")]
         
         now = datetime.now(timezone.utc)
-        track_list = []
-        
-        for track in tracks:
-            # Calculate time ago
-            try:
-                track_time = datetime.fromisoformat(track["timestamp_utc"].replace("Z", "+00:00"))
-                delta = now - track_time
-                
-                if delta.total_seconds() < 60:
-                    time_ago = "just now"
-                elif delta.total_seconds() < 3600:
-                    mins = int(delta.total_seconds() / 60)
-                    time_ago = f"{mins} min ago"
-                else:
-                    hours = int(delta.total_seconds() / 3600)
-                    time_ago = f"{hours}h ago"
-            except:
-                time_ago = None
-            
-            # Get image URL (now directly from track data)
-            image_url = track.get("image_url")
-            
-            track_list.append(TrackInfo(
-                artist=track.get("artist", "Unknown"),
-                title=track.get("title", "Unknown"),
-                album=track.get("album"),
-                timestamp_utc=track.get("timestamp_utc", ""),
-                duration_ms=track.get("duration_ms", 0),
-                time_ago=time_ago,
-                image_url=image_url
-            ))
-        
-        # Current track is the last one
-        current_track = track_list[-1] if track_list else None
+        track_list = [_to_track_info(track, now) for track in history_tracks]
+
+        current_raw = _select_current_live_track(raw_tracks, settings)
+        current_track = _to_track_info(current_raw, now) if current_raw else (track_list[-1] if track_list else None)
         
         return ScheduleResponse(
             channel_id=channel_id,
@@ -150,13 +257,19 @@ async def get_now_playing(channel_id: str, db: DBSession = Depends(get_db)):
     
     try:
         api = SiriusXMAPI(session.bearer_token)
-        tracks = await api.get_schedule(channel_id, hours_back=1)
+        settings = _get_live_metadata_settings(db, channel_id)
+        future_seconds = int(abs(float(settings.get("offset_seconds") or 0))) + 30
+        tracks = await api.get_schedule(
+            channel_id,
+            hours_back=1,
+            include_interstitials=True,
+            future_seconds=future_seconds,
+        )
         
         if not tracks:
             return {"channel_id": channel_id, "current_track": None}
         
-        current = tracks[-1]
-        images = current.get("images", {})
+        current = _select_current_live_track(tracks, settings)
         
         return {
             "channel_id": channel_id,
@@ -167,7 +280,8 @@ async def get_now_playing(channel_id: str, db: DBSession = Depends(get_db)):
                 "album": current.get("album"),
                 "timestamp_utc": current.get("timestamp_utc"),
                 "duration_ms": current.get("duration_ms", 0),
-                "image_url": images.get("default", {}).get("url") if isinstance(images, dict) else None
+                "image_url": current.get("image_url"),
+                "is_interstitial": bool(current.get("is_interstitial", False)),
             }
         }
         

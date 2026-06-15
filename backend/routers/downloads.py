@@ -22,11 +22,15 @@ class TrackDownloadRequest(BaseModel):
     timestamp_utc: str
     duration_ms: int
     image_url: str | None = None
+    playlist_id: int | None = None
+    playlist_name: str | None = None
 
 
 class BulkDownloadRequest(BaseModel):
     channel_id: str
     tracks: List[TrackDownloadRequest]
+    playlist_id: int | None = None
+    playlist_name: str | None = None
 
 
 class DownloadResponse(BaseModel):
@@ -93,7 +97,9 @@ async def download_track(
             download.id,
             request.channel_id,
             request.dict(),
-            download_path
+            download_path,
+            playlist_id=request.playlist_id,
+            playlist_name=request.playlist_name
         )
         
         return DownloadResponse(
@@ -150,7 +156,9 @@ async def download_bulk(
             download_ids,
             request.channel_id,
             [t.dict() for t in request.tracks],
-            download_path
+            download_path,
+            playlist_id=request.playlist_id,
+            playlist_name=request.playlist_name
         )
         
         return DownloadResponse(

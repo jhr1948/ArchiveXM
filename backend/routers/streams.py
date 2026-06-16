@@ -330,6 +330,9 @@ _xtra_sessions = {}
 # from that prefetched item instead of the normal tuneSource result.
 _xtra_manual_start = {}
 
+# One-track XTRA previous history, matching the official app's single Back behavior.
+_xtra_previous_tracks = {}
+
 
 def _is_xtra_media_playlist_path(path: str) -> bool:
     return path.endswith(".m3u8") and "_full_v3.m3u8" in path
@@ -922,6 +925,27 @@ async def _ensure_xtra_queue(channel_id: str, session_info: dict, requested_path
     return cached
 
 
+
+def _get_current_xtra_track_for_previous(channel_id: str):
+    """Return the best-known currently playing XTRA item for one-step Back."""
+    cached = _xtra_sessions.get(channel_id)
+    if cached and cached.get("tracks"):
+        return cached.get("tracks")[0]
+
+    manual_start = _xtra_manual_start.get(channel_id)
+    if manual_start and manual_start.get("track"):
+        return manual_start.get("track")
+
+    return None
+
+
+def _public_xtra_metadata_from_track(track: dict | None, channel_id: str) -> dict:
+    metadata = dict((track or {}).get("metadata") or {})
+    if metadata:
+        metadata["channelId"] = channel_id
+        metadata["isXtra"] = True
+    return metadata
+
 @router.get("/{channel_id}/xtra/next")
 @router.post("/{channel_id}/xtra/next")
 async def xtra_next(channel_id: str, db: DBSession = Depends(get_db)):
@@ -969,6 +993,8 @@ async def xtra_next(channel_id: str, db: DBSession = Depends(get_db)):
         # Keep bearer current in case the session was created before a token refresh.
         stream_info["bearer"] = session.bearer_token
 
+    previous_track = _get_current_xtra_track_for_previous(channel_id)
+
     next_track = await _fetch_xtra_256k_track(
         channel_id=channel_id,
         bearer=stream_info.get("bearer"),
@@ -979,6 +1005,9 @@ async def xtra_next(channel_id: str, db: DBSession = Depends(get_db)):
 
     if not next_track or not next_track.get("segments"):
         raise HTTPException(status_code=500, detail="Failed to prepare next XTRA item")
+
+    if previous_track and previous_track.get("segments"):
+        _xtra_previous_tracks[channel_id] = previous_track
 
     if next_track.get("source_context_id"):
         stream_info["source_context_id"] = next_track.get("source_context_id")
@@ -1006,11 +1035,90 @@ async def xtra_next(channel_id: str, db: DBSession = Depends(get_db)):
             "channelId": channel_id,
             "requestedChannelId": requested_channel_id,
             "streamUrl": stream_url,
+            "metadata": _public_xtra_metadata_from_track(next_track, channel_id),
+            "availableBackwardSkips": 1 if channel_id in _xtra_previous_tracks else 0,
             "message": "Stop/flush the current player buffer, then reload streamUrl.",
         },
         headers={"Access-Control-Allow-Origin": "*"},
     )
 
+
+
+@router.get("/{channel_id}/xtra/previous")
+@router.post("/{channel_id}/xtra/previous")
+@router.get("/{channel_id}/xtra/back")
+@router.post("/{channel_id}/xtra/back")
+async def xtra_previous(channel_id: str, db: DBSession = Depends(get_db)):
+    """
+    Move an XTRA channel back to the previous item, limited to one item.
+
+    This mirrors the official SiriusXM behavior: Back is available after at
+    least one manual Next/skip and only remembers the immediately previous
+    item. The client should stop/flush the player and reload streamUrl.
+    """
+    from fastapi.responses import JSONResponse
+
+    requested_channel_id = channel_id
+    channel_id = resolve_channel_id(channel_id, db)
+
+    if get_channel_type(channel_id, db) != "channel-xtra":
+        raise HTTPException(status_code=400, detail="Previous is only supported for XTRA channels")
+
+    previous_track = _xtra_previous_tracks.pop(channel_id, None)
+    if not previous_track or not previous_track.get("segments"):
+        return JSONResponse(
+            status_code=404,
+            content={
+                "ok": False,
+                "action": "unavailable",
+                "direction": "previous",
+                "channelId": channel_id,
+                "requestedChannelId": requested_channel_id,
+                "availableBackwardSkips": 0,
+                "message": "No previous XTRA item is available.",
+            },
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+    if not session:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    stream_info = _stream_sessions.get(channel_id) or {}
+    stream_info["bearer"] = session.bearer_token
+    if previous_track.get("source_context_id"):
+        stream_info["source_context_id"] = previous_track.get("source_context_id")
+    if previous_track.get("sequence_token"):
+        stream_info["sequence_token"] = previous_track.get("sequence_token")
+    _stream_sessions[channel_id] = stream_info
+
+    _xtra_sessions.pop(channel_id, None)
+    _xtra_manual_start[channel_id] = {
+        "track": previous_track,
+        "source_context_id": previous_track.get("source_context_id"),
+        "sequence_token": previous_track.get("sequence_token"),
+    }
+
+    print(
+        f"⏮️ XTRA manual previous prepared channel={channel_id} "
+        f"segments={len(previous_track.get('segments') or [])}"
+    )
+
+    stream_url = f"/api/streams/{channel_id}/proxy-stream"
+    return JSONResponse(
+        content={
+            "ok": True,
+            "action": "reload",
+            "direction": "previous",
+            "channelId": channel_id,
+            "requestedChannelId": requested_channel_id,
+            "streamUrl": stream_url,
+            "metadata": _public_xtra_metadata_from_track(previous_track, channel_id),
+            "availableBackwardSkips": 0,
+            "message": "Stop/flush the current player buffer, then reload streamUrl.",
+        },
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
 
 @router.get("/{channel_id}/proxy-stream")
 async def proxy_stream(channel_id: str, db: DBSession = Depends(get_db)):

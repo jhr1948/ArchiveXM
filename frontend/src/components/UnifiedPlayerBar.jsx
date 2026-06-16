@@ -324,18 +324,33 @@ function UnifiedPlayerBar() {
               </button>
 
               {livePlayer.isXtra && (
-                <button
-                  onClick={livePlayer.skipNextXtra}
-                  disabled={livePlayer.isLoading || livePlayer.isSkippingNext}
-                  className="w-14 h-14 rounded-full bg-gray-800 text-white flex items-center justify-center hover:bg-gray-700 transition-colors disabled:opacity-50"
-                  title="Next XTRA track"
-                >
-                  {livePlayer.isSkippingNext ? (
-                    <Loader2 className="w-7 h-7 animate-spin" />
-                  ) : (
-                    <SkipForward className="w-7 h-7" />
-                  )}
-                </button>
+                <>
+                  <button
+                    onClick={livePlayer.skipPreviousXtra}
+                    disabled={livePlayer.isLoading || livePlayer.isSkippingPrevious || !livePlayer.hasXtraPrevious}
+                    className="w-14 h-14 rounded-full bg-gray-800 text-white flex items-center justify-center hover:bg-gray-700 transition-colors disabled:opacity-40"
+                    title={livePlayer.hasXtraPrevious ? 'Previous XTRA track' : 'No previous XTRA track available'}
+                  >
+                    {livePlayer.isSkippingPrevious ? (
+                      <Loader2 className="w-7 h-7 animate-spin" />
+                    ) : (
+                      <SkipBack className="w-7 h-7" />
+                    )}
+                  </button>
+
+                  <button
+                    onClick={livePlayer.skipNextXtra}
+                    disabled={livePlayer.isLoading || livePlayer.isSkippingNext}
+                    className="w-14 h-14 rounded-full bg-gray-800 text-white flex items-center justify-center hover:bg-gray-700 transition-colors disabled:opacity-50"
+                    title="Next XTRA track"
+                  >
+                    {livePlayer.isSkippingNext ? (
+                      <Loader2 className="w-7 h-7 animate-spin" />
+                    ) : (
+                      <SkipForward className="w-7 h-7" />
+                    )}
+                  </button>
+                </>
               )}
             </div>
 

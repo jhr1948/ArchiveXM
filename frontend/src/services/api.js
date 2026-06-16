@@ -109,6 +109,35 @@ export const libraryApi = {
   
   getCoverUrl: (trackId) => 
     `${API_URL}/api/library/tracks/${trackId}/cover`,
+
+  getDownloadsM3uUrl: () =>
+    `${API_URL}/api/library/downloads.m3u`,
+
+  getPlaylistM3uUrl: (playlistId) =>
+    `${API_URL}/api/library/playlists/${playlistId}.m3u`,
+
+  getPlaylistCoverUrl: (playlistId) =>
+    `${API_URL}/api/library/playlists/${playlistId}/cover`,
+
+  setPlaylistCoverUrl: (playlistId, coverImage) =>
+    api.post(`/api/library/playlists/${playlistId}/cover-url`, { cover_image: coverImage }),
+
+  uploadPlaylistCover: (playlistId, file) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    return api.post(`/api/library/playlists/${playlistId}/cover-upload`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    })
+  },
+
+  clearPlaylistCover: (playlistId) =>
+    api.delete(`/api/library/playlists/${playlistId}/cover`),
+
+  getExternalPlayUrl: (trackId) =>
+    `${API_URL}/api/library/files/${trackId}/play`,
+
+  getExternalMetadataUrl: (trackId) =>
+    `${API_URL}/api/library/files/${trackId}/metadata`,
   
   deleteTrack: (trackId, deleteFile = false) => 
     api.delete(`/api/library/tracks/${trackId}`, { params: { delete_file: deleteFile } }),

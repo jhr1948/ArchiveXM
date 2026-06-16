@@ -12,7 +12,7 @@ Routes:
     GET/POST /xtra/{channel_id}/back
     GET      /metadata/{channel_id}
 
-The implementation delegates to routers.streams.xtra_next so both the
+The implementation delegates to routers.streams.xtra_next/xtra_previous so both the
 ArchiveXM REST route and the old m3u8XM route share the same skip logic.
 """
 import json
@@ -79,6 +79,7 @@ def _xtra_metadata_from_queue(channel_id: str, requested_channel_id: str, positi
             if metadata:
                 metadata["channelId"] = requested_channel_id
                 metadata["isXtra"] = True
+                metadata["availableBackwardSkips"] = 1 if channel_id in getattr(streams, "_xtra_previous_tracks", {}) else 0
                 return metadata
         return None
 
@@ -124,6 +125,7 @@ def _xtra_metadata_from_queue(channel_id: str, requested_channel_id: str, positi
 
     metadata["channelId"] = requested_channel_id
     metadata["isXtra"] = True
+    metadata["availableBackwardSkips"] = 1 if channel_id in getattr(streams, "_xtra_previous_tracks", {}) else 0
     metadata["startOffsetMs"] = start_offset_ms
     metadata["endOffsetMs"] = end_offset_ms
     if position_ms is not None:
@@ -207,19 +209,39 @@ async def legacy_xtra_next(channel_id: str, db: DBSession = Depends(get_db)):
     return await _legacy_next_response(channel_id, db)
 
 
+async def _legacy_previous_response(channel_id: str, db: DBSession) -> JSONResponse:
+    response = await streams.xtra_previous(channel_id, db)
+
+    try:
+        payload = json.loads(response.body.decode("utf-8"))
+    except Exception:
+        payload = {
+            "ok": False,
+            "action": "error",
+            "direction": "previous",
+            "channelId": channel_id,
+            "message": "Unable to prepare XTRA previous item.",
+        }
+
+    resolved_channel_id = payload.get("channelId") or channel_id
+    stream_url = payload.get("streamUrl") or f"/api/streams/{resolved_channel_id}/proxy-stream"
+    listen_url = f"/listen/{resolved_channel_id}"
+
+    payload["listenUrl"] = listen_url
+    payload["streamUrl"] = stream_url
+    payload["metadataUrl"] = f"/metadata/{resolved_channel_id}"
+    payload["legacyRoute"] = True
+
+    return JSONResponse(
+        content=payload,
+        status_code=response.status_code,
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
 @router.get("/xtra/{channel_id}/previous")
 @router.post("/xtra/{channel_id}/previous")
 @router.get("/xtra/{channel_id}/back")
 @router.post("/xtra/{channel_id}/back")
-async def legacy_xtra_previous(channel_id: str):
-    return JSONResponse(
-        status_code=501,
-        content={
-            "ok": False,
-            "action": "unsupported",
-            "direction": "previous",
-            "channelId": channel_id,
-            "message": "Previous/back is not implemented server-side yet. Use forward skip first.",
-        },
-        headers={"Access-Control-Allow-Origin": "*"},
-    )
+async def legacy_xtra_previous(channel_id: str, db: DBSession = Depends(get_db)):
+    return await _legacy_previous_response(channel_id, db)

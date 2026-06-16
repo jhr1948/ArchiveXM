@@ -50,6 +50,8 @@ export function PlayerProvider({ children }) {
   const [volume, setVolume] = useState(0.8)
   const [error, setError] = useState(null)
   const [isSkippingNext, setIsSkippingNext] = useState(false)
+  const [isSkippingPrevious, setIsSkippingPrevious] = useState(false)
+  const [hasXtraPrevious, setHasXtraPrevious] = useState(false)
 
   // Poll for current track info. Linear channels still use the normal schedule
   // endpoint; XTRA channels use the root metadata endpoint that tracks the
@@ -60,7 +62,7 @@ export function PlayerProvider({ children }) {
     let cancelled = false
     const channelId = getChannelId(currentChannel)
     const isXtra = isXtraChannel(currentChannel)
-    const pollMs = 3000
+    const pollMs = isXtra ? 3000 : 15000
     
     const fetchCurrentTrack = async () => {
       if (!channelId) return
@@ -74,6 +76,7 @@ export function PlayerProvider({ children }) {
           const track = normalizeXtraMetadata(response?.data)
           if (!cancelled && track) {
             setCurrentTrack(track)
+            setHasXtraPrevious(Number(track.available_backward_skips || track.availableBackwardSkips || 0) > 0)
           }
         } else {
           const response = await streamsApi.getSchedule(channelId, 1)
@@ -314,6 +317,7 @@ export function PlayerProvider({ children }) {
       if (nextTrack) {
         setCurrentTrack(nextTrack)
       }
+      setHasXtraPrevious(Number(response?.data?.availableBackwardSkips || 0) > 0)
 
       // The backend prepares the next XTRA item. Reload the HLS source so the
       // frontend starts the newly prepared item immediately.
@@ -326,6 +330,38 @@ export function PlayerProvider({ children }) {
       setIsSkippingNext(false)
     }
   }, [currentChannel, isSkippingNext, playChannel])
+
+  const skipPreviousXtra = useCallback(async () => {
+    if (!currentChannel || !isXtraChannel(currentChannel) || isSkippingPrevious) return
+
+    const channelId = getChannelId(currentChannel)
+    if (!channelId) return
+
+    try {
+      setIsSkippingPrevious(true)
+      setIsLoading(true)
+      setError(null)
+
+      const response = await api.get(`/xtra/${channelId}/previous`)
+      const metadata = response?.data?.metadata || response?.data
+      const previousTrack = normalizeXtraMetadata(metadata)
+      if (previousTrack) {
+        setCurrentTrack(previousTrack)
+      }
+      setHasXtraPrevious(Number(response?.data?.availableBackwardSkips || 0) > 0)
+
+      // The backend prepares the previous XTRA item. Reload the HLS source so
+      // the frontend starts the prepared item immediately.
+      await playChannel(currentChannel, { force: true, preserveTrack: true })
+    } catch (err) {
+      console.error('[Player] XTRA previous failed:', err)
+      setHasXtraPrevious(false)
+      setError('No previous XTRA track available')
+      setIsLoading(false)
+    } finally {
+      setIsSkippingPrevious(false)
+    }
+  }, [currentChannel, isSkippingPrevious, playChannel])
 
   const togglePlay = useCallback(() => {
     if (!audioRef.current) return
@@ -357,6 +393,7 @@ export function PlayerProvider({ children }) {
     setIsPlaying(false)
     setCurrentChannel(null)
     setCurrentTrack(null)
+    setHasXtraPrevious(false)
   }, [])
 
   const toggleMute = useCallback(() => {
@@ -371,6 +408,8 @@ export function PlayerProvider({ children }) {
     isPlaying,
     isLoading,
     isSkippingNext,
+    isSkippingPrevious,
+    hasXtraPrevious,
     isXtra: currentChannelIsXtra,
     volume,
     isMuted,
@@ -378,6 +417,7 @@ export function PlayerProvider({ children }) {
     playChannel,
     togglePlay,
     skipNextXtra,
+    skipPreviousXtra,
     stop,
     setVolume,
     toggleMute,

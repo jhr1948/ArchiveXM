@@ -4,7 +4,7 @@ import {
   Music, Play, Pause, SkipBack, SkipForward, Volume2, VolumeX,
   Shuffle, Repeat, List, Plus, Search, RefreshCw, Disc3,
   MoreVertical, Trash2, ListPlus, X, ChevronLeft, ChevronRight,
-  Clock, Library, User, Album, Loader2, Radio, Home, Circle, Square
+  Clock, Library, User, Album, Loader2, Radio, Home, Circle, Square, Copy, Image, Upload
 } from 'lucide-react'
 import { libraryApi } from '../services/api'
 import { useJukebox } from '../context/JukeboxContext'
@@ -73,6 +73,12 @@ function JukeboxPage() {
   const [editingPlaylist, setEditingPlaylist] = useState(null)
   const [editPlaylistName, setEditPlaylistName] = useState('')
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(null)
+
+  // Playlist cover editing
+  const [coverEditingPlaylist, setCoverEditingPlaylist] = useState(null)
+  const [coverUrlInput, setCoverUrlInput] = useState('')
+  const [coverUploadFile, setCoverUploadFile] = useState(null)
+  const [coverRefreshKey, setCoverRefreshKey] = useState(0)
   
   // Context menu for track actions
   const [contextMenu, setContextMenu] = useState({ show: false, x: 0, y: 0, track: null, index: -1 })
@@ -129,6 +135,88 @@ function JukeboxPage() {
     const mins = Math.floor(seconds / 60)
     const secs = Math.floor(seconds % 60)
     return `${mins}:${secs.toString().padStart(2, '0')}`
+  }
+
+  const absoluteUrl = (url) => {
+    if (!url) return ''
+    if (url.startsWith('http://') || url.startsWith('https://')) return url
+    return `${window.location.origin}${url}`
+  }
+
+  const copyToClipboard = async (text, label = 'link') => {
+    try {
+      await navigator.clipboard.writeText(text)
+      window.alert(`Copied ${label} to clipboard`)
+    } catch (error) {
+      console.error('Error copying link:', error)
+      window.prompt(`Copy this ${label}:`, text)
+    }
+  }
+
+  const copyDownloadsM3u = () => {
+    copyToClipboard(absoluteUrl(libraryApi.getDownloadsM3uUrl()), 'downloads M3U link')
+  }
+
+  const copyPlaylistM3u = (playlistId, playlistName = 'playlist') => {
+    copyToClipboard(absoluteUrl(libraryApi.getPlaylistM3uUrl(playlistId)), `${playlistName} M3U link`)
+  }
+
+  const playlistCoverSrc = (playlist) => {
+    if (!playlist?.id) return null
+    return `${libraryApi.getPlaylistCoverUrl(playlist.id)}?v=${coverRefreshKey}`
+  }
+
+  const openCoverEditor = (playlist) => {
+    setCoverEditingPlaylist(playlist)
+    setCoverUrlInput(playlist?.cover_image?.startsWith('http') ? playlist.cover_image : '')
+    setCoverUploadFile(null)
+  }
+
+  const refreshPlaylistCoverState = async (playlistId) => {
+    setCoverRefreshKey(prev => prev + 1)
+    const [playlistsRes, playlistRes] = await Promise.all([
+      libraryApi.getPlaylists(),
+      libraryApi.getPlaylist(playlistId)
+    ])
+    setPlaylists(playlistsRes.data || [])
+    setSelectedPlaylist(playlistRes.data)
+    setCoverEditingPlaylist(playlistRes.data)
+  }
+
+  const savePlaylistCoverUrl = async () => {
+    if (!coverEditingPlaylist?.id) return
+    try {
+      await libraryApi.setPlaylistCoverUrl(coverEditingPlaylist.id, coverUrlInput.trim())
+      await refreshPlaylistCoverState(coverEditingPlaylist.id)
+    } catch (error) {
+      console.error('Error saving playlist cover URL:', error)
+      window.alert('Failed to save playlist cover URL.')
+    }
+  }
+
+  const uploadPlaylistCover = async () => {
+    if (!coverEditingPlaylist?.id || !coverUploadFile) return
+    try {
+      await libraryApi.uploadPlaylistCover(coverEditingPlaylist.id, coverUploadFile)
+      setCoverUploadFile(null)
+      await refreshPlaylistCoverState(coverEditingPlaylist.id)
+    } catch (error) {
+      console.error('Error uploading playlist cover:', error)
+      window.alert('Failed to upload playlist cover image.')
+    }
+  }
+
+  const clearPlaylistCover = async () => {
+    if (!coverEditingPlaylist?.id) return
+    try {
+      await libraryApi.clearPlaylistCover(coverEditingPlaylist.id)
+      setCoverUrlInput('')
+      setCoverUploadFile(null)
+      await refreshPlaylistCoverState(coverEditingPlaylist.id)
+    } catch (error) {
+      console.error('Error clearing playlist cover:', error)
+      window.alert('Failed to clear playlist cover.')
+    }
   }
 
   // Stop live stream before starting Jukebox playback so the Jukebox player
@@ -592,6 +680,14 @@ This removes it from all playlists and deletes the local audio file.`
                 <span className="hidden md:inline">{scanning ? 'Scanning...' : 'Scan'}</span>
               </button>
               <button
+                onClick={copyDownloadsM3u}
+                className="hidden sm:flex items-center gap-2 px-3 sm:px-4 py-2 bg-gray-800 hover:bg-gray-700 text-white rounded-lg transition-colors"
+                title="Copy all downloads M3U link"
+              >
+                <Copy className="w-4 h-4" />
+                <span className="hidden md:inline">Copy M3U</span>
+              </button>
+              <button
                 onClick={handlePlayAll}
                 className="hidden xs:flex items-center gap-1 sm:gap-2 px-2 sm:px-4 py-2 bg-primary hover:bg-primary/80 text-white rounded-lg transition-colors"
               >
@@ -727,17 +823,24 @@ This removes it from all playlists and deletes the local audio file.`
             {activeView === 'playlist' && selectedPlaylist && (
               <div className="p-4">
                 <div className="flex items-center gap-4 mb-6">
-                  <div className="w-32 h-32 bg-gradient-to-br from-primary to-purple-600 rounded-lg flex items-center justify-center overflow-hidden">
-                    {selectedPlaylist.tracks?.[0]?.track?.cover_art_path ? (
-                      <img 
-                        src={libraryApi.getCoverUrl(selectedPlaylist.tracks[0].track.id)} 
-                        alt="" 
-                        className="w-full h-full object-cover"
-                      />
-                    ) : (
-                      <List className="w-12 h-12 text-white" />
-                    )}
-                  </div>
+                  <button
+                    onClick={() => openCoverEditor(selectedPlaylist)}
+                    className="relative group w-32 h-32 bg-gradient-to-br from-primary to-purple-600 rounded-lg flex items-center justify-center overflow-hidden hover:ring-2 hover:ring-primary transition-all"
+                    title="Edit playlist cover"
+                  >
+                    <img
+                      src={playlistCoverSrc(selectedPlaylist)}
+                      alt=""
+                      className="w-full h-full object-cover"
+                      onError={(e) => { e.currentTarget.style.display = 'none' }}
+                    />
+                    <div className="absolute inset-0 bg-black/0 group-hover:bg-black/50 flex items-center justify-center transition-colors">
+                      <div className="opacity-0 group-hover:opacity-100 flex flex-col items-center gap-1 text-white text-xs font-medium">
+                        <Image className="w-6 h-6" />
+                        <span>Edit Cover</span>
+                      </div>
+                    </div>
+                  </button>
                   <div className="flex-1">
                     <h2 className="text-2xl font-bold text-white">{selectedPlaylist.name}</h2>
                     <p className="text-gray-400">{selectedPlaylist.track_count} tracks</p>
@@ -755,6 +858,14 @@ This removes it from all playlists and deletes the local audio file.`
                       >
                         <Shuffle className="w-4 h-4" />
                         <span>Shuffle</span>
+                      </button>
+                      <button
+                        onClick={() => copyPlaylistM3u(selectedPlaylist.id, selectedPlaylist.name)}
+                        className="flex items-center gap-2 px-3 py-2 bg-gray-800 hover:bg-gray-700 text-white rounded-full transition-colors"
+                        title="Copy playlist M3U link"
+                      >
+                        <Copy className="w-4 h-4" />
+                        <span>M3U</span>
                       </button>
                       <button
                         onClick={() => {
@@ -1017,18 +1128,33 @@ This removes it from all playlists and deletes the local audio file.`
               </button>
 
               {livePlayer.isXtra && (
-                <button
-                  onClick={livePlayer.skipNextXtra}
-                  disabled={livePlayer.isLoading || livePlayer.isSkippingNext}
-                  className="w-14 h-14 rounded-full bg-gray-800 text-white flex items-center justify-center hover:bg-gray-700 transition-colors disabled:opacity-50"
-                  title="Next XTRA track"
-                >
-                  {livePlayer.isSkippingNext ? (
-                    <Loader2 className="w-7 h-7 animate-spin" />
-                  ) : (
-                    <SkipForward className="w-7 h-7" />
-                  )}
-                </button>
+                <>
+                  <button
+                    onClick={livePlayer.skipPreviousXtra}
+                    disabled={livePlayer.isLoading || livePlayer.isSkippingPrevious || !livePlayer.hasXtraPrevious}
+                    className="w-14 h-14 rounded-full bg-gray-800 text-white flex items-center justify-center hover:bg-gray-700 transition-colors disabled:opacity-40"
+                    title={livePlayer.hasXtraPrevious ? 'Previous XTRA track' : 'No previous XTRA track available'}
+                  >
+                    {livePlayer.isSkippingPrevious ? (
+                      <Loader2 className="w-7 h-7 animate-spin" />
+                    ) : (
+                      <SkipBack className="w-7 h-7" />
+                    )}
+                  </button>
+
+                  <button
+                    onClick={livePlayer.skipNextXtra}
+                    disabled={livePlayer.isLoading || livePlayer.isSkippingNext}
+                    className="w-14 h-14 rounded-full bg-gray-800 text-white flex items-center justify-center hover:bg-gray-700 transition-colors disabled:opacity-50"
+                    title="Next XTRA track"
+                  >
+                    {livePlayer.isSkippingNext ? (
+                      <Loader2 className="w-7 h-7 animate-spin" />
+                    ) : (
+                      <SkipForward className="w-7 h-7" />
+                    )}
+                  </button>
+                </>
               )}
             </div>
 
@@ -1421,6 +1547,97 @@ This removes it from all playlists and deletes the local audio file.`
                 className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/80"
               >
                 Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Playlist Cover Modal */}
+      {coverEditingPlaylist && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-lg shadow-2xl">
+            <div className="flex items-start justify-between gap-4 mb-5">
+              <div>
+                <h3 className="text-xl font-bold text-white">Edit Playlist Cover</h3>
+                <p className="text-gray-400 text-sm mt-1 truncate">{coverEditingPlaylist.name}</p>
+              </div>
+              <button
+                onClick={() => { setCoverEditingPlaylist(null); setCoverUrlInput(''); setCoverUploadFile(null) }}
+                className="text-gray-400 hover:text-white"
+                title="Close"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="flex items-center gap-4 mb-5">
+              <div className="w-24 h-24 bg-gray-800 rounded-lg overflow-hidden flex items-center justify-center flex-shrink-0">
+                <img
+                  src={playlistCoverSrc(coverEditingPlaylist)}
+                  alt=""
+                  className="w-full h-full object-cover"
+                  onError={(e) => { e.currentTarget.style.display = 'none' }}
+                />
+              </div>
+              <div className="text-sm text-gray-400">
+                Use a public image URL, upload a local image, or clear the custom cover to fall back to the first track album art.
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm text-gray-400 mb-2">Custom image URL</label>
+                <div className="flex gap-2">
+                  <input
+                    type="url"
+                    placeholder="https://example.com/cover.jpg"
+                    value={coverUrlInput}
+                    onChange={(e) => setCoverUrlInput(e.target.value)}
+                    className="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-primary"
+                  />
+                  <button
+                    onClick={savePlaylistCoverUrl}
+                    className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/80"
+                  >
+                    Save URL
+                  </button>
+                </div>
+              </div>
+
+              <div className="border-t border-gray-800 pt-4">
+                <label className="block text-sm text-gray-400 mb-2">Upload local image</label>
+                <div className="flex gap-2 items-center">
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => setCoverUploadFile(e.target.files?.[0] || null)}
+                    className="flex-1 text-sm text-gray-300 file:mr-3 file:px-3 file:py-2 file:rounded-lg file:border-0 file:bg-gray-800 file:text-white hover:file:bg-gray-700"
+                  />
+                  <button
+                    onClick={uploadPlaylistCover}
+                    disabled={!coverUploadFile}
+                    className="flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 text-white rounded-lg disabled:opacity-50"
+                  >
+                    <Upload className="w-4 h-4" />
+                    Upload
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex justify-between gap-2 mt-6 pt-4 border-t border-gray-800">
+              <button
+                onClick={clearPlaylistCover}
+                className="px-4 py-2 text-gray-400 hover:text-red-400"
+              >
+                Clear Custom Cover
+              </button>
+              <button
+                onClick={() => { setCoverEditingPlaylist(null); setCoverUrlInput(''); setCoverUploadFile(null) }}
+                className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-white rounded-lg"
+              >
+                Done
               </button>
             </div>
           </div>

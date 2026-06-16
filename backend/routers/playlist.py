@@ -10,8 +10,9 @@ import unicodedata
 
 from fastapi import APIRouter, Depends, Response
 from sqlalchemy.orm import Session as DBSession
+from sqlalchemy import func
 
-from database import Channel, Config, get_db
+from database import Channel, Config, LocalTrack, Playlist, PlaylistTrack, get_db
 
 # Register this router in main.py with:
 # app.include_router(playlist.router)
@@ -35,26 +36,27 @@ CHANNEL_GROUP_OVERRIDES = {
 }
 
 
-def _get_config_value(db: DBSession, key: str, default: str = "") -> str:
-    try:
-        item = db.query(Config).filter(Config.key == key).first()
-        if item and item.value not in (None, ""):
-            return str(item.value).strip()
-    except Exception:
-        pass
-    return default
+def _get_config_value(db: DBSession, key: str, default=None):
+    item = db.query(Config).filter(Config.key == key).first()
+    if item is None or item.value in (None, ""):
+        return default
+    return item.value
 
 
-def _normalize_base_url(value: str, default_scheme: str = "https") -> str:
-    value = (value or "").strip().rstrip("/")
+def _normalize_base_url(value: Optional[str]) -> str:
+    value = (value or "").strip()
     if not value:
         return ""
-    if "://" not in value:
-        value = f"{default_scheme}://{value}"
+    if not value.startswith(("http://", "https://")):
+        value = f"https://{value}"
     return value.rstrip("/")
 
 
-def _env_local_base_url() -> str:
+def _default_env_base_url() -> str:
+    public_base_url = os.getenv("PLAYLIST_PUBLIC_BASE_URL", "").strip()
+    if public_base_url:
+        return _normalize_base_url(public_base_url)
+
     scheme = os.getenv("PLAYLIST_SCHEME", "http").strip() or "http"
     host = os.getenv("PLAYLIST_HOST", "localhost").strip() or "localhost"
     port = os.getenv("PLAYLIST_PORT", "").strip()
@@ -65,23 +67,31 @@ def _env_local_base_url() -> str:
     return f"{scheme}://{host}"
 
 
-def build_playlist_base_url(db: DBSession) -> str:
-    mode = _get_config_value(db, "playlist_url_mode", os.getenv("PLAYLIST_URL_MODE", "local")).lower()
+def build_playlist_base_url(db: Optional[DBSession] = None) -> str:
+    """Return the base URL used inside generated M3U files.
 
-    # Frontend setting wins. Env vars remain as install/bootstrap fallback.
-    public_base_url = _get_config_value(db, "playlist_public_base_url", os.getenv("PLAYLIST_PUBLIC_BASE_URL", ""))
-    local_base_url = _get_config_value(db, "playlist_local_base_url", os.getenv("PLAYLIST_LOCAL_BASE_URL", _env_local_base_url()))
+    Prefer the saved ArchiveXM playlist settings so generated files follow the
+    same Local/Public URL mode used by the UI. Fall back to env vars for older
+    setups or during early setup before config rows exist.
+    """
+    if db is not None:
+        mode = str(_get_config_value(db, "playlist_url_mode", os.getenv("PLAYLIST_URL_MODE", "local")) or "local").strip().lower()
+        if mode == "public":
+            public_base = _normalize_base_url(_get_config_value(db, "playlist_public_base_url", os.getenv("PLAYLIST_PUBLIC_BASE_URL", "")))
+            if public_base:
+                return public_base
 
-    if mode == "public":
-        normalized_public = _normalize_base_url(public_base_url, "https")
-        if normalized_public:
-            return normalized_public
+        local_base = _normalize_base_url(_get_config_value(db, "playlist_local_base_url", os.getenv("PLAYLIST_LOCAL_BASE_URL", "")))
+        if local_base:
+            return local_base
 
-    normalized_local = _normalize_base_url(local_base_url, "http")
-    if normalized_local:
-        return normalized_local
+    return _default_env_base_url()
 
-    return _env_local_base_url().rstrip("/")
+
+def _playlist_url_style(db: Optional[DBSession] = None) -> str:
+    if db is not None:
+        return str(_get_config_value(db, "playlist_url_style", os.getenv("PLAYLIST_URL_STYLE", "listen")) or "listen").strip().lower()
+    return os.getenv("PLAYLIST_URL_STYLE", "listen").strip().lower()
 
 
 def clean_m3u_text(value: Optional[object]) -> str:
@@ -128,6 +138,72 @@ def _group_title_for_channel(channel: Channel) -> str:
     return group
 
 
+def _playlist_cover_url(db: DBSession, playlist_id: int, base_url: str) -> str:
+    playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+    if playlist and playlist.cover_image:
+        cover = str(playlist.cover_image).strip()
+        if cover.startswith(("http://", "https://")):
+            return clean_m3u_text(cover)
+        if Path(cover).exists():
+            return f"{base_url}/api/library/playlists/{playlist_id}/cover"
+
+    first_track = (
+        db.query(LocalTrack)
+        .join(PlaylistTrack, PlaylistTrack.track_id == LocalTrack.id)
+        .filter(PlaylistTrack.playlist_id == playlist_id)
+        .filter(LocalTrack.cover_art_path.isnot(None))
+        .order_by(PlaylistTrack.position.asc())
+        .first()
+    )
+    if first_track and first_track.cover_art_path and Path(first_track.cover_art_path).exists():
+        return f"{base_url}/api/library/files/{first_track.id}/cover"
+    return ""
+
+
+def _playlist_entries(db: DBSession, base_url: str, start_channel_number: int) -> list[str]:
+    playlists = (
+        db.query(
+            Playlist,
+            func.count(PlaylistTrack.id).label("live_track_count"),
+        )
+        .outerjoin(PlaylistTrack, PlaylistTrack.playlist_id == Playlist.id)
+        .group_by(Playlist.id)
+        .order_by(Playlist.name.asc())
+        .all()
+    )
+
+    lines: list[str] = []
+    channel_number = start_channel_number
+
+    for playlist, live_track_count in playlists:
+        if not live_track_count:
+            continue
+
+        channel_number += 1
+        playlist_id = f"archivexm-playlist-{playlist.id}"
+        name = clean_m3u_text(playlist.name or f"Playlist {playlist.id}")
+        group = "Playlists"
+        logo = clean_m3u_text(_playlist_cover_url(db, playlist.id, base_url))
+        playlist_url = f"{base_url}/api/library/playlists/{quote(str(playlist.id), safe='')}.m3u"
+
+        # This is intentionally a virtual/VOD-style channel entry. Players that
+        # support nested M3U/VOD sources can open the playlist URL and then play
+        # its saved local tracks. The direct playlist M3U endpoint remains
+        # available too for apps that prefer adding each playlist as a source.
+        lines.append(
+            f'#EXTINF:-1 tvg-id="{clean_m3u_text(playlist_id)}" '
+            f'tvg-name="{name}" '
+            f'tvg-chno="{clean_m3u_text(channel_number)}" '
+            f'tvg-logo="{logo}" '
+            f'group-title="{group}" '
+            f'x-sxm-type="archivexm-playlist" '
+            f',{name}'
+        )
+        lines.append(playlist_url)
+
+    return lines
+
+
 def generate_m3u(db: DBSession) -> str:
     base_url = build_playlist_base_url(db)
 
@@ -155,7 +231,7 @@ def generate_m3u(db: DBSession) -> str:
         channel_number = f' tvg-chno="{tvg_chno}"'
 
         stream_path_channel_id = quote(str(channel.channel_id), safe="")
-        url_style = _get_config_value(db, "playlist_url_style", os.getenv("PLAYLIST_URL_STYLE", "listen")).strip().lower()
+        url_style = _playlist_url_style(db)
         if url_style in ("api", "archivexm"):
             stream_url = f"{base_url}/api/streams/{stream_path_channel_id}/proxy-stream"
         else:
@@ -171,6 +247,8 @@ def generate_m3u(db: DBSession) -> str:
             f'x-sxm-type="{channel_type}",{name}'
         )
         lines.append(stream_url)
+
+    lines.extend(_playlist_entries(db, base_url, start_channel_number=len(channels)))
 
     return "\n".join(lines) + "\n"
 

@@ -26,6 +26,18 @@ class DownloadService:
         self.hls_service = HLSService(bearer_token)
         self.api = SiriusXMAPI(bearer_token)
 
+    def _is_download_cancelled(self, db, download_id: int) -> bool:
+        try:
+            from database import Download
+            row = db.query(Download).filter(Download.id == download_id).first()
+            return bool(row and str(row.status or '').startswith('cancelled'))
+        except Exception:
+            return False
+
+    def _raise_if_cancelled(self, db, download_id: int):
+        if self._is_download_cancelled(db, download_id):
+            raise Exception('Download cancelled')
+
     def _get_download_tail_pad_seconds(self, db=None) -> float:
         """Return extra seconds to keep after the next SXM metadata boundary.
 
@@ -160,6 +172,10 @@ class DownloadService:
         download_record = db.query(Download).filter(Download.id == download_id).first()
         
         try:
+            if self._is_download_cancelled(db, download_id):
+                print(f"📥 Download already cancelled: {track['artist']} - {track['title']}")
+                return False
+
             print(f"📥 Starting download: {track['artist']} - {track['title']}")
             
             # Update status
@@ -196,6 +212,8 @@ class DownloadService:
                 except Exception as e:
                     print(f"   Could not calculate duration from next track: {e}")
             
+            self._raise_if_cancelled(db, download_id)
+
             # Get variant playlist
             playlist_data = await self.hls_service.get_variant_playlist(channel_id)
             
@@ -272,6 +290,8 @@ class DownloadService:
                     # timestamp parsing errors explicit too so they are visible in logs.
                     raise
             
+            self._raise_if_cancelled(db, download_id)
+
             print(f"   Found {len(track_segments)} segments for track")
             
             # Log segment details for debugging exact timing
@@ -353,6 +373,8 @@ class DownloadService:
                 if not decrypted_files:
                     raise Exception("No segments downloaded")
                 
+                self._raise_if_cancelled(db, download_id)
+
                 # Concatenate segments with precise trimming
                 await self._concatenate_segments(
                     decrypted_files, 
@@ -361,6 +383,8 @@ class DownloadService:
                     duration_sec=duration_sec
                 )
                 
+                self._raise_if_cancelled(db, download_id)
+
                 # Add metadata
                 await self._add_metadata(
                     output_file,
@@ -396,9 +420,16 @@ class DownloadService:
                     shutil.rmtree(temp_dir)
             
         except Exception as e:
-            print(f"   ❌ Download error: {e}")
-            download_record.status = f"failed: {str(e)[:100]}"
-            db.commit()
+            if str(e) == 'Download cancelled' or self._is_download_cancelled(db, download_id):
+                print(f"   ⏹️ Download cancelled: {track.get('artist', 'Unknown')} - {track.get('title', 'Unknown')}")
+                if download_record:
+                    download_record.status = 'cancelled'
+                    db.commit()
+            else:
+                print(f"   ❌ Download error: {e}")
+                if download_record:
+                    download_record.status = f"failed: {str(e)[:100]}"
+                    db.commit()
             return False
         finally:
             db.close()
@@ -594,6 +625,10 @@ class DownloadService:
         download_record = db.query(Download).filter(Download.id == download_id).first()
 
         try:
+            if self._is_download_cancelled(db, download_id):
+                print(f"📥 XTRA capture already cancelled: {track.get('artist', 'Unknown')} - {track.get('title', 'Unknown')}")
+                return False
+
             print(f"📥 Starting XTRA capture: {track.get('artist', 'Unknown')} - {track.get('title', 'Unknown')}")
             if download_record:
                 download_record.status = "downloading"
@@ -640,12 +675,14 @@ class DownloadService:
                     "-movflags", "+faststart",
                     str(output_file),
                 ]
+                self._raise_if_cancelled(db, download_id)
                 print(f"   FFmpeg XTRA: {' '.join(ffmpeg_cmd[-8:])}")
                 result = subprocess.run(ffmpeg_cmd, capture_output=True)
                 if result.returncode != 0 or not output_file.exists():
                     err = result.stderr.decode(errors="ignore")[-1200:]
                     raise Exception(f"ffmpeg XTRA capture failed: {err}")
 
+                self._raise_if_cancelled(db, download_id)
                 await self._add_metadata(output_file, track, track.get("image_url"))
 
                 file_size = output_file.stat().st_size if output_file.exists() else 0
@@ -662,10 +699,16 @@ class DownloadService:
                     shutil.rmtree(temp_dir)
 
         except Exception as e:
-            print(f"   ❌ XTRA download error: {e}")
-            if download_record:
-                download_record.status = f"failed: {str(e)[:100]}"
-                db.commit()
+            if str(e) == 'Download cancelled' or self._is_download_cancelled(db, download_id):
+                print(f"   ⏹️ XTRA capture cancelled: {track.get('artist', 'Unknown')} - {track.get('title', 'Unknown')}")
+                if download_record:
+                    download_record.status = 'cancelled'
+                    db.commit()
+            else:
+                print(f"   ❌ XTRA download error: {e}")
+                if download_record:
+                    download_record.status = f"failed: {str(e)[:100]}"
+                    db.commit()
             return False
         finally:
             db.close()
@@ -733,6 +776,11 @@ class DownloadService:
                     
                     print(f"   [{i+1}/{len(tracks)}] {track['artist']} - {track['title']}")
                     
+                    if self._is_download_cancelled(db, download_id):
+                        print(f"      Skipping cancelled download {download_id}")
+                        failed += 1
+                        continue
+
                     download_record.status = "downloading"
                     db.commit()
                     

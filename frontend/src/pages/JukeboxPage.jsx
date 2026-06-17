@@ -86,6 +86,13 @@ function JukeboxPage() {
   // Bulk selection
   const [selectedTrackIds, setSelectedTrackIds] = useState(new Set())
 
+  // Metadata lookup modal
+  const [metadataTarget, setMetadataTarget] = useState(null)
+  const [metadataCandidates, setMetadataCandidates] = useState([])
+  const [metadataLoading, setMetadataLoading] = useState(false)
+  const [metadataApplying, setMetadataApplying] = useState(false)
+  const [metadataError, setMetadataError] = useState('')
+
   useEffect(() => {
     loadLibrary()
   }, [])
@@ -423,6 +430,71 @@ This removes it from all playlists and deletes the local audio file.`
     } catch (error) {
       console.error('Error deleting track:', error)
       window.alert('Failed to delete the song. Check the backend logs for details.')
+    }
+  }
+
+  const refreshTrackAfterMetadataApply = async (trackId) => {
+    try {
+      const [tracksRes, playlistsRes, statsRes] = await Promise.all([
+        libraryApi.getTracks({ limit: 500 }),
+        libraryApi.getPlaylists(),
+        libraryApi.getStats()
+      ])
+      setTracks(tracksRes.data || [])
+      setPlaylists(playlistsRes.data || [])
+      setStats(statsRes.data)
+
+      if (selectedPlaylist?.id) {
+        const playlistRes = await libraryApi.getPlaylist(selectedPlaylist.id)
+        setSelectedPlaylist(playlistRes.data)
+      }
+    } catch (error) {
+      console.error('Error refreshing after metadata apply:', error)
+    }
+  }
+
+  const openMetadataLookup = async (track) => {
+    if (!track) return
+    setMetadataTarget(track)
+    setMetadataCandidates([])
+    setMetadataError('')
+    setMetadataLoading(true)
+
+    try {
+      const response = await libraryApi.searchTrackMetadata(track.id)
+      setMetadataCandidates(response.data?.candidates || [])
+      if (!response.data?.candidates?.length) {
+        setMetadataError('No metadata matches found. Try editing artist/title manually later or search again after correcting the track name.')
+      }
+    } catch (error) {
+      console.error('Error searching metadata:', error)
+      setMetadataError(error.response?.data?.detail || 'Metadata lookup failed')
+    } finally {
+      setMetadataLoading(false)
+    }
+  }
+
+  const closeMetadataLookup = () => {
+    if (metadataApplying) return
+    setMetadataTarget(null)
+    setMetadataCandidates([])
+    setMetadataError('')
+  }
+
+  const applyMetadataCandidate = async (candidate) => {
+    if (!metadataTarget || !candidate) return
+    setMetadataApplying(true)
+    setMetadataError('')
+
+    try {
+      await libraryApi.applyTrackMetadata(metadataTarget.id, candidate)
+      await refreshTrackAfterMetadataApply(metadataTarget.id)
+      closeMetadataLookup()
+    } catch (error) {
+      console.error('Error applying metadata:', error)
+      setMetadataError(error.response?.data?.detail || 'Failed to apply metadata')
+    } finally {
+      setMetadataApplying(false)
     }
   }
 
@@ -960,6 +1032,13 @@ This removes it from all playlists and deletes the local audio file.`
                             title="Add to queue"
                           >
                             <Plus className="w-4 h-4" />
+                          </button>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); openMetadataLookup(track) }}
+                            className="hidden sm:block p-1 text-gray-500 hover:text-primary"
+                            title="Find missing metadata"
+                          >
+                            <Search className="w-4 h-4" />
                           </button>
                           <button
                             onClick={(e) => { e.stopPropagation(); setTrackToAdd(track) }}
@@ -1569,6 +1648,13 @@ This removes it from all playlists and deletes the local audio file.`
                   <ListPlus className="w-6 h-6" />
                 </button>
                 <button
+                  onClick={() => openMetadataLookup(currentTrack)}
+                  className="text-gray-400 hover:text-primary transition-colors"
+                  title="Find metadata"
+                >
+                  <Search className="w-6 h-6" />
+                </button>
+                <button
                   onClick={() => deleteTrackEverywhere(currentTrack)}
                   className="text-gray-400 hover:text-red-400 transition-colors"
                   title="Delete song from Jukebox"
@@ -1700,6 +1786,88 @@ This removes it from all playlists and deletes the local audio file.`
                 </button>
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Metadata Lookup Modal */}
+      {metadataTarget && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-2xl shadow-2xl">
+            <div className="flex items-start justify-between gap-4 mb-4">
+              <div>
+                <h3 className="text-xl font-bold text-white">Find Metadata</h3>
+                <p className="text-gray-400 text-sm mt-1 truncate">
+                  {metadataTarget.artist || 'Unknown'} - {metadataTarget.title || metadataTarget.filename}
+                </p>
+              </div>
+              <button
+                onClick={closeMetadataLookup}
+                className="text-gray-400 hover:text-white"
+                title="Close"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {metadataLoading ? (
+              <div className="flex items-center justify-center gap-3 py-10 text-gray-300">
+                <Loader2 className="w-6 h-6 animate-spin text-primary" />
+                Searching MusicBrainz...
+              </div>
+            ) : (
+              <>
+                {metadataError && (
+                  <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300">
+                    {metadataError}
+                  </div>
+                )}
+
+                <div className="space-y-3 max-h-96 overflow-y-auto">
+                  {metadataCandidates.map((candidate, index) => (
+                    <div
+                      key={`${candidate.release_id || candidate.recording_id || index}-${index}`}
+                      className="flex items-center gap-4 rounded-lg bg-gray-800/80 border border-gray-700 p-3"
+                    >
+                      <div className="w-16 h-16 rounded bg-gray-950 flex items-center justify-center overflow-hidden shrink-0">
+                        {candidate.cover_url ? (
+                          <img
+                            src={candidate.cover_url}
+                            alt=""
+                            className="w-full h-full object-cover"
+                            onError={(e) => { e.currentTarget.style.display = 'none' }}
+                          />
+                        ) : (
+                          <Album className="w-7 h-7 text-gray-600" />
+                        )}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-white font-medium truncate">{candidate.album || candidate.title || 'Unknown release'}</p>
+                        <p className="text-gray-300 text-sm truncate">{candidate.artist || 'Unknown'} - {candidate.title || metadataTarget.title}</p>
+                        <p className="text-gray-500 text-xs truncate">
+                          {candidate.year || 'No year'} • {candidate.release_type || 'Release'} • Confidence {Math.round((candidate.confidence || 0) * 100)}%
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => applyMetadataCandidate(candidate)}
+                        disabled={metadataApplying}
+                        className="px-4 py-2 bg-primary hover:bg-primary/80 text-white rounded-lg disabled:opacity-50 flex items-center gap-2"
+                      >
+                        {metadataApplying ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                        Apply
+                      </button>
+                    </div>
+                  ))}
+
+                  {!metadataCandidates.length && !metadataError && (
+                    <div className="py-10 text-center text-gray-500">
+                      <Search className="w-10 h-10 mx-auto mb-3 opacity-60" />
+                      <p>No candidates found.</p>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -1879,6 +2047,13 @@ This removes it from all playlists and deletes the local audio file.`
             <span>Add to Queue</span>
           </button>
           <div className="border-t border-gray-700 my-1"></div>
+          <button
+            onClick={() => { openMetadataLookup(contextMenu.track); closeContextMenu() }}
+            className="w-full flex items-center gap-3 px-4 py-2 text-left text-white hover:bg-gray-700 transition-colors"
+          >
+            <Search className="w-4 h-4" />
+            <span>Find Metadata</span>
+          </button>
           <button
             onClick={() => { setTrackToAdd(contextMenu.track); closeContextMenu() }}
             className="w-full flex items-center gap-3 px-4 py-2 text-left text-white hover:bg-gray-700 transition-colors"

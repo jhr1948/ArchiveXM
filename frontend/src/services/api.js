@@ -85,7 +85,13 @@ export const downloadsApi = {
     api.get('/api/downloads/history', { params: { limit, offset } }),
   
   getStatus: (downloadId) => 
-    api.get(`/api/downloads/${downloadId}/status`)
+    api.get(`/api/downloads/${downloadId}/status`),
+
+  cancel: (downloadId) =>
+    api.post(`/api/downloads/${downloadId}/cancel`),
+
+  clearHistory: () =>
+    api.post('/api/downloads/clear-history')
 }
 
 // Library API (Jukebox)
@@ -103,6 +109,12 @@ export const libraryApi = {
   
   getTrack: (trackId) => 
     api.get(`/api/library/tracks/${trackId}`),
+
+  searchTrackMetadata: (trackId, params = {}) =>
+    api.get(`/api/library/tracks/${trackId}/metadata/search`, { params }),
+
+  applyTrackMetadata: (trackId, metadata) =>
+    api.post(`/api/library/tracks/${trackId}/metadata/apply`, metadata),
   
   getStreamUrl: (trackId) => 
     `${API_URL}/api/library/tracks/${trackId}/stream`,
@@ -178,7 +190,10 @@ export const libraryApi = {
     api.post(`/api/library/playlists/${playlistId}/tracks/bulk-remove`, { track_ids: trackIds }),
   
   reorderPlaylist: (playlistId, trackIds) => 
-    api.put(`/api/library/playlists/${playlistId}/reorder`, trackIds)
+    api.put(`/api/library/playlists/${playlistId}/reorder`, trackIds),
+
+  captureCurrentToPlaylist: (playlistId, payload) =>
+    api.post(`/api/library/playlists/${playlistId}/capture-current`, payload)
 }
 
 export default api

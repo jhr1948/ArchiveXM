@@ -17,6 +17,9 @@ function UnifiedPlayerBar() {
   const [playlists, setPlaylists] = useState([])
   const [trackToAdd, setTrackToAdd] = useState(null)
   const [newPlaylistName, setNewPlaylistName] = useState('')
+  const [captureLiveOpen, setCaptureLiveOpen] = useState(false)
+  const [captureLoading, setCaptureLoading] = useState(false)
+  const [captureNewPlaylistName, setCaptureNewPlaylistName] = useState('')
 
   const loadPlaylists = async () => {
     try {
@@ -57,6 +60,86 @@ function UnifiedPlayerBar() {
       await loadPlaylists()
     } catch (error) {
       console.error('Error adding track to playlist:', error)
+    }
+  }
+
+  const currentLiveChannelId = () => (
+    livePlayer.currentChannel?.channel_id ||
+    livePlayer.currentChannel?.id ||
+    livePlayer.currentChannel?.uuid
+  )
+
+  const buildLiveCapturePayload = (playlistNamePayload = {}) => {
+    const channel = livePlayer.currentChannel || {}
+    const track = livePlayer.currentTrack || {}
+    const channelType = channel.channel_type || channel.channelType || (livePlayer.isXtra ? 'channel-xtra' : 'channel-linear')
+    const payload = {
+      channel_id: currentLiveChannelId(),
+      channel_type: channelType,
+      source: 'archivexm-frontend',
+      ...playlistNamePayload
+    }
+
+    // For linear live channels, do not send the displayed metadata as a strong
+    // hint. ArchiveXM's UI can intentionally lag/offset live metadata, so the
+    // visible title may be the previous song while the true SXM boundary has
+    // already advanced. The backend will resolve the active schedule item.
+    // XTRA still sends metadata because it is tied to the active XTRA queue item.
+    if (livePlayer.isXtra || String(channelType).toLowerCase().includes('xtra')) {
+      payload.track = {
+        title: track.title,
+        artist: track.artist,
+        album: track.album,
+        duration_ms: track.duration_ms ?? track.durationMs,
+        timestamp_utc: track.timestamp_utc,
+        started_at_ms: track.started_at_ms ?? track.startedAtMs,
+        image_url: track.image_url || track.imageUrl
+      }
+    }
+
+    return payload
+  }
+
+  const captureLiveToPlaylist = async (playlistId) => {
+    const channelId = currentLiveChannelId()
+    if (!channelId) return
+
+    try {
+      setCaptureLoading(true)
+      const res = await libraryApi.captureCurrentToPlaylist(playlistId, buildLiveCapturePayload())
+      const captured = res?.data?.track
+      setCaptureLiveOpen(false)
+      setCaptureNewPlaylistName('')
+      await loadPlaylists()
+      if (captured?.artist || captured?.title) {
+        window.alert(`Queued ${captured.artist || 'Unknown'} - ${captured.title || 'Unknown'} for playlist capture.`)
+      }
+    } catch (error) {
+      console.error('Error capturing current live/XTRA track:', error)
+      window.alert(error.response?.data?.detail || 'Failed to queue current track for playlist capture.')
+    } finally {
+      setCaptureLoading(false)
+    }
+  }
+
+  const captureLiveToNewPlaylist = async () => {
+    const name = captureNewPlaylistName.trim()
+    if (!name) return
+    try {
+      setCaptureLoading(true)
+      const created = await libraryApi.createPlaylist(name)
+      if (created?.data?.id) {
+        await libraryApi.captureCurrentToPlaylist(created.data.id, buildLiveCapturePayload())
+      }
+      setCaptureLiveOpen(false)
+      setCaptureNewPlaylistName('')
+      await loadPlaylists()
+      window.alert(`Queued current track for playlist capture: ${name}`)
+    } catch (error) {
+      console.error('Error creating playlist and capturing current track:', error)
+      window.alert(error.response?.data?.detail || 'Failed to queue current track for playlist capture.')
+    } finally {
+      setCaptureLoading(false)
     }
   }
 
@@ -357,6 +440,14 @@ function UnifiedPlayerBar() {
             {/* Right: Volume & Close */}
             <div className="flex items-center gap-4 flex-1 justify-end">
               <button
+                onClick={() => setCaptureLiveOpen(true)}
+                className="text-gray-400 hover:text-white transition-colors"
+                title="Add current Live/XTRA song to playlist"
+              >
+                <ListPlus className="w-6 h-6" />
+              </button>
+
+              <button
                 onClick={livePlayer.toggleMute}
                 className="text-gray-400 hover:text-white transition-colors"
                 title={livePlayer.isMuted ? 'Unmute' : 'Mute'}
@@ -395,6 +486,65 @@ function UnifiedPlayerBar() {
         </div>
       )}
 
+
+
+      {/* Capture current Live/XTRA song to playlist */}
+      {captureLiveOpen && hasLiveStream && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[70]">
+          <div className="bg-gray-900 rounded-xl p-6 w-96 max-w-[calc(100vw-2rem)] border border-gray-800">
+            <h3 className="text-xl font-bold text-white mb-2">Add current song to playlist</h3>
+            <p className="text-gray-400 text-sm mb-4 truncate">
+              {livePlayer.currentTrack?.artist ? `${livePlayer.currentTrack.artist} - ` : ''}{livePlayer.currentTrack?.title || livePlayer.currentChannel?.name || 'Current track'}
+            </p>
+
+            <div className="space-y-2 max-h-48 overflow-y-auto mb-4">
+              {playlists.length === 0 ? (
+                <p className="text-gray-500 text-sm">No playlists yet. Create one below.</p>
+              ) : playlists.map(playlist => (
+                <button
+                  key={playlist.id}
+                  onClick={() => captureLiveToPlaylist(playlist.id)}
+                  disabled={captureLoading}
+                  className="w-full text-left px-3 py-2 bg-gray-800 hover:bg-gray-700 text-white rounded-lg transition-colors flex items-center justify-between disabled:opacity-50"
+                >
+                  <span className="truncate">{playlist.name}</span>
+                  <span className="text-xs text-gray-500 ml-3">{playlist.track_count || 0}</span>
+                </button>
+              ))}
+            </div>
+
+            <div className="border-t border-gray-800 pt-4">
+              <label className="block text-sm text-gray-400 mb-2">Create new playlist</label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  placeholder="Playlist name"
+                  value={captureNewPlaylistName}
+                  onChange={(e) => setCaptureNewPlaylistName(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') captureLiveToNewPlaylist() }}
+                  className="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-primary"
+                />
+                <button
+                  onClick={captureLiveToNewPlaylist}
+                  disabled={!captureNewPlaylistName.trim() || captureLoading}
+                  className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/80 disabled:opacity-50"
+                >
+                  {captureLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Add'}
+                </button>
+              </div>
+            </div>
+
+            <div className="flex justify-end mt-4">
+              <button
+                onClick={() => { if (!captureLoading) { setCaptureLiveOpen(false); setCaptureNewPlaylistName('') } }}
+                className="px-4 py-2 text-gray-400 hover:text-white"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Add current Jukebox track to playlist */}
       {trackToAdd && (

@@ -205,6 +205,40 @@ async def get_download_history(
     }
 
 
+@router.post("/{download_id}/cancel")
+async def cancel_download(download_id: int, db: DBSession = Depends(get_db)):
+    """
+    Cancel a pending/downloading job. This stops queued/deferred jobs cleanly and
+    asks in-progress jobs to stop before they save/import anything.
+    """
+    download = db.query(Download).filter(Download.id == download_id).first()
+    if not download:
+        raise HTTPException(status_code=404, detail="Download not found")
+
+    if download.status == "completed":
+        raise HTTPException(status_code=400, detail="Completed downloads cannot be cancelled")
+
+    if not str(download.status or "").startswith("cancelled"):
+        download.status = "cancelled"
+        db.commit()
+
+    return {"success": True, "message": "Download cancelled", "download_id": download_id}
+
+
+@router.post("/clear-history")
+async def clear_download_history(db: DBSession = Depends(get_db)):
+    """
+    Clear completed/failed/cancelled download history records. Does not delete audio files.
+    Active pending/downloading jobs are kept.
+    """
+    rows = db.query(Download).filter(~Download.status.in_(["pending", "downloading"])).all()
+    cleared = len(rows)
+    for row in rows:
+        db.delete(row)
+    db.commit()
+    return {"success": True, "cleared": cleared}
+
+
 @router.get("/{download_id}/status")
 async def get_download_status(download_id: int, db: DBSession = Depends(get_db)):
     """

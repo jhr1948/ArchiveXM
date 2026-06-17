@@ -4,7 +4,7 @@ import {
   Music, Play, Pause, SkipBack, SkipForward, Volume2, VolumeX,
   Shuffle, Repeat, List, Plus, Search, RefreshCw, Disc3,
   MoreVertical, Trash2, ListPlus, X, ChevronLeft, ChevronRight,
-  Clock, Library, User, Album, Loader2, Radio, Home, Circle, Square, Copy, Image, Upload
+  Clock, Library, User, Album, Loader2, Radio, Home, Circle, Square, Copy, Image, Upload, CheckSquare
 } from 'lucide-react'
 import { libraryApi } from '../services/api'
 import { useJukebox } from '../context/JukeboxContext'
@@ -83,9 +83,16 @@ function JukeboxPage() {
   // Context menu for track actions
   const [contextMenu, setContextMenu] = useState({ show: false, x: 0, y: 0, track: null, index: -1 })
 
+  // Bulk selection
+  const [selectedTrackIds, setSelectedTrackIds] = useState(new Set())
+
   useEffect(() => {
     loadLibrary()
   }, [])
+
+  useEffect(() => {
+    setSelectedTrackIds(new Set())
+  }, [activeView, selectedPlaylist?.id])
 
   const loadLibrary = async () => {
     setLoading(true)
@@ -419,6 +426,113 @@ This removes it from all playlists and deletes the local audio file.`
     }
   }
 
+  const selectedTrackCount = selectedTrackIds.size
+
+  const currentVisibleTrackIds = () => {
+    if (activeView === 'playlist' && selectedPlaylist?.tracks) {
+      return selectedPlaylist.tracks.map(pt => pt.track?.id).filter(Boolean)
+    }
+    return getFilteredTracks().map(track => track.id).filter(Boolean)
+  }
+
+  const isTrackSelected = (trackId) => selectedTrackIds.has(trackId)
+
+  const toggleTrackSelected = (trackId) => {
+    setSelectedTrackIds(prev => {
+      const next = new Set(prev)
+      if (next.has(trackId)) {
+        next.delete(trackId)
+      } else {
+        next.add(trackId)
+      }
+      return next
+    })
+  }
+
+  const clearSelection = () => {
+    setSelectedTrackIds(new Set())
+  }
+
+  const toggleSelectAllVisible = () => {
+    const visibleIds = currentVisibleTrackIds()
+    const allSelected = visibleIds.length > 0 && visibleIds.every(id => selectedTrackIds.has(id))
+    setSelectedTrackIds(prev => {
+      const next = new Set(prev)
+      if (allSelected) {
+        visibleIds.forEach(id => next.delete(id))
+      } else {
+        visibleIds.forEach(id => next.add(id))
+      }
+      return next
+    })
+  }
+
+  const refreshAfterBulkChange = async (playlistId = selectedPlaylist?.id) => {
+    const [tracksRes, playlistsRes, statsRes] = await Promise.all([
+      libraryApi.getTracks({ limit: 500 }),
+      libraryApi.getPlaylists(),
+      libraryApi.getStats()
+    ])
+    setTracks(tracksRes.data || [])
+    setPlaylists(playlistsRes.data || [])
+    setStats(statsRes.data)
+    if (playlistId) {
+      try {
+        const playlistRes = await libraryApi.getPlaylist(playlistId)
+        setSelectedPlaylist(playlistRes.data)
+      } catch (error) {
+        // Playlist may have been removed elsewhere; ignore here.
+      }
+    }
+  }
+
+  const handleBulkDeleteSelected = async () => {
+    const ids = Array.from(selectedTrackIds)
+    if (ids.length === 0) return
+
+    const confirmed = window.confirm(
+      `Delete ${ids.length} selected song${ids.length === 1 ? '' : 's'} from the Jukebox?\n\nThis removes them from all playlists and deletes the local audio files.`
+    )
+    if (!confirmed) return
+
+    try {
+      await libraryApi.bulkDeleteTracks(ids, true)
+      ids.forEach(id => {
+        if (removeTrackFromPlayback) {
+          removeTrackFromPlayback(id)
+        }
+      })
+      if (!removeTrackFromPlayback) {
+        setQueue(prev => prev.filter(track => !ids.includes(track.id)))
+      }
+      clearSelection()
+      await refreshAfterBulkChange()
+    } catch (error) {
+      console.error('Error bulk deleting tracks:', error)
+      window.alert('Failed to delete selected songs. Check the backend logs for details.')
+    }
+  }
+
+  const handleBulkRemoveFromPlaylist = async () => {
+    if (!selectedPlaylist) return
+    const ids = Array.from(selectedTrackIds)
+    if (ids.length === 0) return
+
+    const confirmed = window.confirm(
+      `Remove ${ids.length} selected song${ids.length === 1 ? '' : 's'} from "${selectedPlaylist.name}"?\n\nThe files will stay in the Jukebox.`
+    )
+    if (!confirmed) return
+
+    try {
+      await libraryApi.bulkRemoveFromPlaylist(selectedPlaylist.id, ids)
+      clearSelection()
+      await refreshAfterBulkChange(selectedPlaylist.id)
+    } catch (error) {
+      console.error('Error bulk removing tracks from playlist:', error)
+      window.alert('Failed to remove selected songs from this playlist.')
+    }
+  }
+
   const getFilteredTracks = () => {
     if (!searchQuery) return tracks
     const query = searchQuery.toLowerCase()
@@ -720,12 +834,51 @@ This removes it from all playlists and deletes the local audio file.`
             </div>
           </div>
 
+          {/* Bulk Actions */}
+          {selectedTrackCount > 0 && (
+            <div className="px-3 sm:px-4 py-3 border-b border-gray-800 bg-primary/10 flex flex-wrap items-center gap-2">
+              <div className="flex items-center gap-2 text-white font-medium mr-2">
+                <CheckSquare className="w-5 h-5 text-primary" />
+                <span>{selectedTrackCount} selected</span>
+              </div>
+              {activeView === 'playlist' && selectedPlaylist && (
+                <button
+                  onClick={handleBulkRemoveFromPlaylist}
+                  className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-white rounded-lg text-sm transition-colors"
+                >
+                  Remove from playlist
+                </button>
+              )}
+              <button
+                onClick={handleBulkDeleteSelected}
+                className="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm transition-colors"
+              >
+                Delete songs
+              </button>
+              <button
+                onClick={clearSelection}
+                className="px-3 py-1.5 text-gray-400 hover:text-white rounded-lg text-sm transition-colors"
+              >
+                Clear
+              </button>
+            </div>
+          )}
+
           {/* Track List */}
           <div className="flex-1 overflow-y-auto">
             {activeView === 'tracks' && (
               <table className="w-full">
                 <thead className="sticky top-0 bg-gray-900 text-left text-sm text-gray-400 border-b border-gray-800">
                   <tr>
+                    <th className="px-2 sm:pl-4 sm:pr-2 py-2 sm:py-3 w-10">
+                      <input
+                        type="checkbox"
+                        checked={currentVisibleTrackIds().length > 0 && currentVisibleTrackIds().every(id => selectedTrackIds.has(id))}
+                        onChange={toggleSelectAllVisible}
+                        className="w-4 h-4 rounded bg-gray-800 border-gray-600"
+                        title="Select all visible"
+                      />
+                    </th>
                     <th className="px-2 sm:px-4 py-2 sm:py-3 w-10 sm:w-12">#</th>
                     <th className="px-2 sm:px-4 py-2 sm:py-3">Title</th>
                     <th className="hidden md:table-cell px-4 py-3">Artist</th>
@@ -746,6 +899,16 @@ This removes it from all playlists and deletes the local audio file.`
                       onClick={(e) => handleTrackClick(e, track, index)}
                       onDoubleClick={() => handlePlayTrack(track, index, filteredTracks)}
                     >
+                      <td className="px-2 sm:pl-4 sm:pr-2 py-2 sm:py-3">
+                        <input
+                          type="checkbox"
+                          checked={isTrackSelected(track.id)}
+                          onClick={(e) => e.stopPropagation()}
+                          onChange={() => toggleTrackSelected(track.id)}
+                          className="w-4 h-4 rounded bg-gray-800 border-gray-600"
+                          title="Select song"
+                        />
+                      </td>
                       <td className="px-2 sm:px-4 py-2 sm:py-3 text-gray-500">
                         {currentTrack?.id === track.id && isPlaying ? (
                           <div className="flex items-center gap-0.5">
@@ -898,6 +1061,15 @@ This removes it from all playlists and deletes the local audio file.`
                   <table className="w-full">
                     <thead className="text-left text-sm text-gray-400 border-b border-gray-800">
                       <tr>
+                        <th className="px-4 py-3 w-10">
+                          <input
+                            type="checkbox"
+                            checked={currentVisibleTrackIds().length > 0 && currentVisibleTrackIds().every(id => selectedTrackIds.has(id))}
+                            onChange={toggleSelectAllVisible}
+                            className="w-4 h-4 rounded bg-gray-800 border-gray-600"
+                            title="Select all playlist tracks"
+                          />
+                        </th>
                         <th className="px-4 py-3 w-12">#</th>
                         <th className="px-4 py-3">Title</th>
                         <th className="px-4 py-3">Artist</th>
@@ -917,6 +1089,16 @@ This removes it from all playlists and deletes the local audio file.`
                             handlePlayTrack(pt.track, index, playlistTracks)
                           }}
                         >
+                          <td className="px-4 py-3">
+                            <input
+                              type="checkbox"
+                              checked={isTrackSelected(pt.track.id)}
+                              onClick={(e) => e.stopPropagation()}
+                              onChange={() => toggleTrackSelected(pt.track.id)}
+                              className="w-4 h-4 rounded bg-gray-800 border-gray-600"
+                              title="Select song"
+                            />
+                          </td>
                           <td className="px-4 py-3 text-gray-500">{index + 1}</td>
                           <td className="px-4 py-3">
                             <div className="flex items-center gap-3">

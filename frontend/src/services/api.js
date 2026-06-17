@@ -141,6 +141,9 @@ export const libraryApi = {
   
   deleteTrack: (trackId, deleteFile = false) => 
     api.delete(`/api/library/tracks/${trackId}`, { params: { delete_file: deleteFile } }),
+
+  bulkDeleteTracks: (trackIds, deleteFiles = true) =>
+    api.post('/api/library/tracks/bulk-delete', { track_ids: trackIds, delete_files: deleteFiles }),
   
   // Artists & Albums
   getArtists: () => 
@@ -170,6 +173,9 @@ export const libraryApi = {
   
   removeFromPlaylist: (playlistId, trackId) => 
     api.delete(`/api/library/playlists/${playlistId}/tracks/${trackId}`),
+
+  bulkRemoveFromPlaylist: (playlistId, trackIds) =>
+    api.post(`/api/library/playlists/${playlistId}/tracks/bulk-remove`, { track_ids: trackIds }),
   
   reorderPlaylist: (playlistId, trackIds) => 
     api.put(`/api/library/playlists/${playlistId}/reorder`, trackIds)

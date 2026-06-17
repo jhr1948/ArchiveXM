@@ -86,6 +86,15 @@ class AddToPlaylistRequest(BaseModel):
     track_ids: List[int]
 
 
+class BulkDeleteTracksRequest(BaseModel):
+    track_ids: List[int]
+    delete_files: bool = True
+
+
+class BulkRemoveFromPlaylistRequest(BaseModel):
+    track_ids: List[int]
+
+
 class RemoveCurrentPlaylistRequest(BaseModel):
     track_id: Optional[int] = None
     track_url: Optional[str] = None
@@ -886,6 +895,78 @@ async def cover_file_alias(track_id: int, db: DBSession = Depends(get_db)):
     return await get_track_cover(track_id, db)
 
 
+
+@router.post("/tracks/bulk-delete")
+async def bulk_delete_tracks(
+    request: BulkDeleteTracksRequest,
+    db: DBSession = Depends(get_db)
+):
+    """
+    Remove multiple tracks from the Jukebox, all playlists, and optionally delete files.
+    This is used by the Jukebox bulk-select UI.
+    """
+    track_ids = []
+    seen = set()
+    for track_id in request.track_ids or []:
+        try:
+            track_id = int(track_id)
+        except Exception:
+            continue
+        if track_id > 0 and track_id not in seen:
+            seen.add(track_id)
+            track_ids.append(track_id)
+
+    if not track_ids:
+        raise HTTPException(status_code=400, detail="No valid track IDs supplied")
+
+    tracks = db.query(LocalTrack).filter(LocalTrack.id.in_(track_ids)).all()
+    found_ids = {track.id for track in tracks}
+    missing_ids = [track_id for track_id in track_ids if track_id not in found_ids]
+
+    affected_playlist_ids = [
+        row[0] for row in db.query(PlaylistTrack.playlist_id)
+        .filter(PlaylistTrack.track_id.in_(track_ids))
+        .distinct()
+        .all()
+    ]
+
+    db.query(PlaylistTrack).filter(PlaylistTrack.track_id.in_(track_ids)).delete(synchronize_session=False)
+
+    deleted_files = []
+    file_errors = []
+    if request.delete_files:
+        for track in tracks:
+            try:
+                file_path = Path(track.file_path)
+                if file_path.exists():
+                    file_path.unlink()
+                    deleted_files.append(str(file_path))
+            except Exception as e:
+                file_errors.append({"track_id": track.id, "error": str(e)})
+
+    for track in tracks:
+        db.delete(track)
+
+    for playlist_id in affected_playlist_ids:
+        playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+        if playlist:
+            playlist.track_count = db.query(PlaylistTrack).filter(
+                PlaylistTrack.playlist_id == playlist_id
+            ).count()
+
+    db.commit()
+
+    return {
+        "success": True,
+        "deleted": len(tracks),
+        "deleted_ids": sorted(found_ids),
+        "missing_ids": missing_ids,
+        "affected_playlists": affected_playlist_ids,
+        "deleted_files": deleted_files,
+        "file_errors": file_errors,
+    }
+
+
 @router.get("/tracks/{track_id}")
 async def get_track(track_id: int, db: DBSession = Depends(get_db)):
     """
@@ -1577,6 +1658,53 @@ def _compact_playlist_positions(db: DBSession, playlist_id: int):
     playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
     if playlist:
         playlist.track_count = len(rows)
+
+
+
+@router.post("/playlists/{playlist_id}/tracks/bulk-remove")
+async def bulk_remove_tracks_from_playlist(
+    playlist_id: int,
+    request: BulkRemoveFromPlaylistRequest,
+    db: DBSession = Depends(get_db)
+):
+    """
+    Remove multiple tracks from one playlist only. Does not delete files or library rows.
+    """
+    playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+
+    track_ids = []
+    seen = set()
+    for track_id in request.track_ids or []:
+        try:
+            track_id = int(track_id)
+        except Exception:
+            continue
+        if track_id > 0 and track_id not in seen:
+            seen.add(track_id)
+            track_ids.append(track_id)
+
+    if not track_ids:
+        raise HTTPException(status_code=400, detail="No valid track IDs supplied")
+
+    deleted = db.query(PlaylistTrack).filter(
+        PlaylistTrack.playlist_id == playlist_id,
+        PlaylistTrack.track_id.in_(track_ids)
+    ).delete(synchronize_session=False)
+
+    playlist.track_count = db.query(PlaylistTrack).filter(
+        PlaylistTrack.playlist_id == playlist_id
+    ).count()
+    db.commit()
+
+    return {
+        "success": True,
+        "removed": deleted,
+        "playlist_id": playlist_id,
+        "track_ids": track_ids,
+        "track_count": playlist.track_count,
+    }
 
 
 @router.delete("/playlists/{playlist_id}/tracks/{track_id}")

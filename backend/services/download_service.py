@@ -135,7 +135,11 @@ class DownloadService:
         channel_id: str,
         track: Dict,
         download_path: str,
-        next_track_timestamp: str = None
+        next_track_timestamp: str = None,
+        playlist_id: Optional[int] = None,
+        playlist_name: Optional[str] = None,
+        create_playlist_name: Optional[str] = None,
+        **kwargs
     ) -> bool:
         """
         Download a single track from DVR buffer
@@ -370,6 +374,18 @@ class DownloadService:
                 download_record.file_size = file_size
                 download_record.status = "completed"
                 db.commit()
+
+                # Some routers call DownloadService.download_track with playlist
+                # kwargs so a Station History download can also be added to a
+                # Jukebox playlist. Keep this support here so older/newer router
+                # call styles do not crash with unexpected keyword arguments.
+                await self._add_completed_download_to_playlist_if_requested(
+                    db,
+                    output_file,
+                    playlist_id=playlist_id,
+                    playlist_name=playlist_name,
+                    create_playlist_name=create_playlist_name,
+                )
                 
                 print(f"   ✅ Downloaded: {output_file}")
                 return True
@@ -387,6 +403,84 @@ class DownloadService:
         finally:
             db.close()
     
+
+    async def _add_completed_download_to_playlist_if_requested(
+        self,
+        db,
+        output_file: Path,
+        playlist_id: Optional[int] = None,
+        playlist_name: Optional[str] = None,
+        create_playlist_name: Optional[str] = None,
+    ) -> None:
+        """Import a completed download and optionally add it to a playlist.
+
+        This is used by Channel History / download-and-add flows. It is kept
+        tolerant on purpose: a normal download should still succeed even if the
+        playlist add step cannot complete.
+        """
+        target_playlist_name = (create_playlist_name or playlist_name or "").strip()
+        if not playlist_id and not target_playlist_name:
+            return
+
+        try:
+            from sqlalchemy import func
+            from database import LocalTrack, Playlist, PlaylistTrack
+            from services.library_service import LibraryService
+
+            try:
+                library_service = LibraryService(db)
+                await library_service.scan_library()
+            except Exception as scan_error:
+                print(f"   Warning: playlist add scan failed: {scan_error}")
+
+            output_path = str(output_file)
+            local_track = db.query(LocalTrack).filter(LocalTrack.file_path == output_path).first()
+            if not local_track:
+                local_track = db.query(LocalTrack).filter(LocalTrack.filename == output_file.name).first()
+
+            if not local_track:
+                print(f"   Warning: playlist add skipped; library track not found for {output_file.name}")
+                return
+
+            playlist = None
+            if playlist_id:
+                playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+
+            if not playlist and target_playlist_name:
+                playlist = db.query(Playlist).filter(Playlist.name == target_playlist_name).first()
+                if not playlist and create_playlist_name:
+                    playlist = Playlist(name=target_playlist_name, description="Created from download")
+                    db.add(playlist)
+                    db.flush()
+
+            if not playlist:
+                print(f"   Warning: playlist add skipped; playlist not found id={playlist_id} name={target_playlist_name!r}")
+                return
+
+            existing = db.query(PlaylistTrack).filter(
+                PlaylistTrack.playlist_id == playlist.id,
+                PlaylistTrack.track_id == local_track.id,
+            ).first()
+
+            if not existing:
+                max_pos = db.query(func.max(PlaylistTrack.position)).filter(
+                    PlaylistTrack.playlist_id == playlist.id
+                ).scalar() or 0
+                db.add(PlaylistTrack(
+                    playlist_id=playlist.id,
+                    track_id=local_track.id,
+                    position=max_pos + 1,
+                ))
+
+            playlist.track_count = db.query(PlaylistTrack).filter(
+                PlaylistTrack.playlist_id == playlist.id
+            ).count()
+            db.commit()
+            print(f"   🎵 Added downloaded track {local_track.id} to playlist: {playlist.name}")
+        except Exception as e:
+            db.rollback()
+            print(f"   Warning: playlist add failed: {e}")
+
 
     async def _local_xtra_playlist_text(self, xtra_track: Dict, temp_dir: Path) -> str:
         """Build a standalone XTRA playlist for ffmpeg without using live proxy routes.

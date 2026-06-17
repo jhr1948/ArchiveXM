@@ -13,6 +13,8 @@ import os
 import mimetypes
 import re
 import asyncio
+import httpx
+import json
 
 from database import get_db, LocalTrack, Playlist, PlaylistTrack, Config, Channel, Download, Session as AuthSession
 from services.library_service import LibraryService
@@ -105,6 +107,17 @@ class RemoveCurrentPlaylistRequest(BaseModel):
     track: Optional[Dict[str, Any]] = None
 
 
+class MetadataApplyRequest(BaseModel):
+    artist: Optional[str] = None
+    title: Optional[str] = None
+    album: Optional[str] = None
+    year: Optional[str] = None
+    cover_url: Optional[str] = None
+    provider: Optional[str] = None
+    recording_id: Optional[str] = None
+    release_id: Optional[str] = None
+
+
 
 def _first_text(*values, default: str = "") -> str:
     for value in values:
@@ -159,6 +172,8 @@ async def _resolve_capture_track(session_token: str, request: CaptureCurrentRequ
     """
     requested = _capture_track_from_request(request)
     channel_type = (request.channel_type or "").strip().lower()
+    source = (request.source or "").strip().lower()
+    frontend_live_capture = source in {"archivexm-frontend", "archivexm-ui", "archive-xm-frontend"} and channel_type not in {"channel-xtra", "xtra"}
 
     def _norm(value) -> str:
         return re.sub(r"\s+", " ", str(value or "").strip().lower())
@@ -203,8 +218,14 @@ async def _resolve_capture_track(session_token: str, request: CaptureCurrentRequ
             except Exception as e:
                 print(f"Capture current: current metadata lookup failed: {e}")
 
-            requested_title = _norm(requested.get("title"))
-            requested_artist = _norm(requested.get("artist"))
+            # ArchiveXM's own frontend may display delayed/offset metadata so
+            # the visible title can lag the true SXM boundary by several seconds.
+            # For frontend live captures, ignore the displayed title/artist as a
+            # matching hint and capture the active schedule window containing now.
+            # External players such as M3You still get to provide metadata hints
+            # because they may need fallback matching.
+            requested_title = "" if frontend_live_capture else _norm(requested.get("title"))
+            requested_artist = "" if frontend_live_capture else _norm(requested.get("artist"))
             current_title = _norm((current or {}).get("title"))
             current_artist = _norm((current or {}).get("artist"))
 
@@ -283,10 +304,16 @@ async def _resolve_capture_track(session_token: str, request: CaptureCurrentRequ
                     payload = _item_payload(item, current or requested)
                     if next_start and not payload.get("duration_ms"):
                         payload["duration_ms"] = int((next_start - start_time).total_seconds() * 1000)
-                    print(
-                        "Capture current: using active schedule boundary "
-                        f"{payload.get('artist')} - {payload.get('title')} @ {payload.get('timestamp_utc')}"
-                    )
+                    if frontend_live_capture:
+                        print(
+                            "Capture current: frontend live capture using active schedule boundary "
+                            f"{payload.get('artist')} - {payload.get('title')} @ {payload.get('timestamp_utc')}"
+                        )
+                    else:
+                        print(
+                            "Capture current: using active schedule boundary "
+                            f"{payload.get('artist')} - {payload.get('title')} @ {payload.get('timestamp_utc')}"
+                        )
                     return payload
 
             # If clock/offset mismatch prevents the window check, fall back to the
@@ -329,14 +356,50 @@ async def _resolve_capture_track(session_token: str, request: CaptureCurrentRequ
                 served = cached.get("served") or set()
                 tracks = cached.get("tracks") or []
 
-                # Pick the first queued XTRA item that has not been fully served.
-                # This maps to the item the listener is currently hearing, while
-                # still downloading its full playlist from the beginning.
-                for candidate in tracks:
-                    names = set(candidate.get("segment_names") or [])
-                    if not names or not names.issubset(served):
-                        xtra_track = candidate
-                        break
+                requested_title = _norm(requested.get("title"))
+                requested_artist = _norm(requested.get("artist"))
+
+                def _xtra_matches_requested(candidate: Dict[str, Any]) -> bool:
+                    metadata = candidate.get("metadata") or {}
+                    title = _norm(metadata.get("title"))
+                    artist = _norm(metadata.get("artist"))
+                    if requested_title and title and requested_title == title:
+                        if not requested_artist or not artist or requested_artist == artist:
+                            return True
+                    return False
+
+                # For ArchiveXM frontend captures, the displayed XTRA metadata is
+                # the best signal for the item the user clicked + on. The queue can
+                # contain previous/current/next XTRA tracks, and segment accounting
+                # may leave a previous track looking "not fully served" even after
+                # playback has moved on. Prefer an exact metadata match first so a
+                # visible "Push It" click cannot capture a queued Beastie Boys item.
+                matching_tracks = [candidate for candidate in tracks if _xtra_matches_requested(candidate)]
+                if matching_tracks:
+                    xtra_track = matching_tracks[-1]
+                    md = xtra_track.get("metadata") or {}
+                    print(
+                        "Capture current: matched requested XTRA metadata "
+                        f"{md.get('artist')} - {md.get('title')}"
+                    )
+
+                if not xtra_track:
+                    # Next best: pick the latest track with any served segment that
+                    # is not fully served. This better represents the current item
+                    # than the earliest not-complete track.
+                    for candidate in reversed(tracks):
+                        names = set(candidate.get("segment_names") or [])
+                        if names and names.intersection(served) and not names.issubset(served):
+                            xtra_track = candidate
+                            break
+
+                if not xtra_track:
+                    # Fallback: first queued XTRA item that has not been fully served.
+                    for candidate in tracks:
+                        names = set(candidate.get("segment_names") or [])
+                        if not names or not names.issubset(served):
+                            xtra_track = candidate
+                            break
 
                 if not xtra_track and tracks:
                     xtra_track = tracks[-1]
@@ -365,10 +428,31 @@ async def _resolve_capture_track(session_token: str, request: CaptureCurrentRequ
                 if not timestamp_utc:
                     timestamp_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
+                xtra_channel_name = ""
+                try:
+                    from database import SessionLocal, Channel
+                    db_tmp = SessionLocal()
+                    try:
+                        channel_row = db_tmp.query(Channel).filter(Channel.channel_id == request.channel_id).first()
+                        xtra_channel_name = channel_row.name if channel_row else ""
+                    finally:
+                        db_tmp.close()
+                except Exception:
+                    xtra_channel_name = ""
+
                 payload = {
                     "artist": _first_text(metadata.get("artist"), requested.get("artist"), default="Unknown"),
                     "title": _first_text(metadata.get("title"), requested.get("title"), default="Unknown"),
-                    "album": _first_text(metadata.get("album"), requested.get("album"), default=""),
+                    "album": _first_text(
+                        metadata.get("album"),
+                        metadata.get("albumName"),
+                        metadata.get("albumTitle"),
+                        metadata.get("releaseTitle"),
+                        metadata.get("collectionName"),
+                        requested.get("album"),
+                        xtra_channel_name,
+                        default="",
+                    ),
                     "duration_ms": int(duration_ms or requested.get("duration_ms") or 0),
                     "timestamp_utc": timestamp_utc,
                     "image_url": metadata.get("imageUrl") or requested.get("image_url"),
@@ -397,7 +481,7 @@ async def _resolve_capture_track(session_token: str, request: CaptureCurrentRequ
     return requested
 
 
-async def _wait_until_capture_track_complete(track_payload: Dict[str, Any], max_wait_seconds: int = 900):
+async def _wait_until_capture_track_complete(track_payload: Dict[str, Any], max_wait_seconds: int = 900, download_id: int | None = None):
     """For current live captures, wait until the full song window exists.
 
     When a user clicks + during a live song, the station-history boundary gives
@@ -452,7 +536,26 @@ async def _wait_until_capture_track_complete(track_payload: Dict[str, Any], max_
         artist = track_payload.get("artist") or "Unknown"
         title = track_payload.get("title") or "Unknown"
         print(f"Capture current: waiting {capped:.1f}s for full live track window {artist} - {title}")
-        await asyncio.sleep(capped)
+
+        slept = 0.0
+        while slept < capped:
+            if download_id is not None:
+                try:
+                    from database import SessionLocal, Download
+                    db_check = SessionLocal()
+                    try:
+                        row = db_check.query(Download).filter(Download.id == download_id).first()
+                        if row and str(row.status or '').startswith('cancelled'):
+                            print(f"Capture current: cancelled while waiting {artist} - {title}")
+                            return False
+                    finally:
+                        db_check.close()
+                except Exception:
+                    pass
+            step = min(2.0, capped - slept)
+            await asyncio.sleep(step)
+            slept += step
+    return True
 
 async def _download_capture_and_add_to_playlist(
     download_id: int,
@@ -472,7 +575,9 @@ async def _download_capture_and_add_to_playlist(
         # until the full start-to-end replay window exists. Otherwise the file
         # imports as a clipped beginning that ends at the click time.
         if track_payload.get("require_full_window"):
-            await _wait_until_capture_track_complete(track_payload)
+            still_ok = await _wait_until_capture_track_complete(track_payload, download_id=download_id)
+            if still_ok is False:
+                return
 
         service = DownloadService(bearer_token)
         if track_payload.get("is_xtra_capture"):
@@ -734,6 +839,465 @@ def _playlist_response_with_count(db: DBSession, playlist: Playlist) -> Playlist
     )
 
 
+
+
+def _musicbrainz_artist_credit(recording: Dict[str, Any]) -> str:
+    parts = []
+    for credit in recording.get("artist-credit") or []:
+        if isinstance(credit, dict):
+            name = credit.get("name") or (credit.get("artist") or {}).get("name")
+            if name:
+                parts.append(str(name))
+        elif isinstance(credit, str):
+            parts.append(credit)
+    return "".join(parts).strip()
+
+
+
+def _metadata_clean_text(value: str) -> str:
+    text = str(value or "").lower()
+    text = text.replace("&", " and ")
+    text = re.sub(r"\bfeat(?:uring)?\.?\b", " ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _metadata_words(value: str) -> List[str]:
+    stop = {"the", "a", "an", "and", "or"}
+    return [w for w in _metadata_clean_text(value).split() if len(w) > 1 and w not in stop]
+
+
+def _metadata_word_set(value: str) -> set:
+    return set(_metadata_words(value))
+
+
+def _metadata_similarity(a: str, b: str) -> float:
+    aw = _metadata_word_set(a)
+    bw = _metadata_word_set(b)
+    if not aw or not bw:
+        return 0.0
+    inter = len(aw & bw)
+    union = len(aw | bw)
+    if union <= 0:
+        return 0.0
+    # Blend Jaccard with containment so titles with extra parenthetical wording
+    # like "(You Gotta) Fight for Your Right (to Party!)" still score high
+    # against SXM's simplified display title.
+    containment = inter / max(1, min(len(aw), len(bw)))
+    return (inter / union * 0.55) + (containment * 0.45)
+
+
+def _metadata_artist_variants(artist: str) -> List[str]:
+    """Return search-friendly artist variants.
+
+    MusicBrainz commonly stores punk/new-wave artists without a leading
+    article, e.g. SXM/Jukebox may show "The Ramones" while MusicBrainz uses
+    "Ramones". Search both forms so strict artist+title queries do not return
+    zero candidates.
+    """
+    raw = re.sub(r"\s+", " ", str(artist or "").strip())
+    if not raw:
+        return []
+
+    variants = []
+
+    def add(value: str):
+        value = re.sub(r"\s+", " ", str(value or "").strip())
+        if value and value.lower() not in {v.lower() for v in variants}:
+            variants.append(value)
+
+    add(raw)
+    no_article = re.sub(r"^(the|a|an)\s+", "", raw, flags=re.I).strip()
+    add(no_article)
+    if no_article and no_article.lower() == raw.lower():
+        add(f"The {raw}")
+
+    return variants
+
+
+def _metadata_artist_similarity(a: str, b: str) -> float:
+    variants_a = _metadata_artist_variants(a) or [a]
+    variants_b = _metadata_artist_variants(b) or [b]
+
+    best = 0.0
+    for va in variants_a:
+        for vb in variants_b:
+            ac = _metadata_clean_text(va)
+            bc = _metadata_clean_text(vb)
+            if not ac or not bc:
+                continue
+            if ac == bc:
+                best = max(best, 1.0)
+            elif ac in bc or bc in ac:
+                best = max(best, 0.90)
+            else:
+                best = max(best, _metadata_similarity(ac, bc))
+    return best
+
+
+def _musicbrainz_release_artist(release: Dict[str, Any], fallback: str = "") -> str:
+    parts = []
+    for credit in release.get("artist-credit") or []:
+        if isinstance(credit, dict):
+            name = credit.get("name") or (credit.get("artist") or {}).get("name")
+            if name:
+                parts.append(str(name))
+        elif isinstance(credit, str):
+            parts.append(credit)
+    return "".join(parts).strip() or fallback
+
+
+def _candidate_key(candidate: Dict[str, Any]) -> tuple:
+    return (
+        str(candidate.get("artist") or "").lower(),
+        str(candidate.get("title") or "").lower(),
+        str(candidate.get("album") or "").lower(),
+        str(candidate.get("year") or ""),
+        str(candidate.get("release_id") or ""),
+    )
+
+
+def _metadata_title_variants(title: str) -> List[str]:
+    """Return search-friendly variants for SXM/XTRA titles.
+
+    SXM often appends the release year in parentheses, e.g.
+    "Push It (88)". MusicBrainz generally stores the canonical title without
+    that suffix, so search both the displayed title and cleaned variants.
+    """
+    raw = (title or "").strip()
+    if not raw:
+        return []
+
+    variants = []
+
+    def add(value: str):
+        value = re.sub(r"\s+", " ", str(value or "").strip())
+        if value and value.lower() not in {v.lower() for v in variants}:
+            variants.append(value)
+
+    add(raw)
+
+    # Remove SXM year suffixes like (87), (1987), [87], or [1987].
+    cleaned = re.sub(r"\s*[\(\[]\s*(?:19|20)?\d{2}\s*[\)\]]\s*$", "", raw).strip()
+    add(cleaned)
+
+    # Drop common mix/remaster/radio edit suffixes only as fallback variants.
+    cleaned2 = re.sub(
+        r"\s*[\(\[]\s*(?:remaster(?:ed)?|radio edit|single version|album version|extended(?: mix)?|mono|stereo)\s*[\)\]]\s*$",
+        "",
+        cleaned,
+        flags=re.I,
+    ).strip()
+    add(cleaned2)
+
+    # A loose punctuation-normalized fallback helps titles like
+    # "You Gotta Fight For Your Right To Party" match MusicBrainz's
+    # "(You Gotta) Fight for Your Right (To Party!)".
+    loose = re.sub(r"[^A-Za-z0-9]+", " ", cleaned2).strip()
+    add(loose)
+
+    # Common MusicBrainz/SXM wording variants. Covers and older titles often
+    # differ by colloquial spelling: "Wanna" vs "Want to", "Gonna" vs
+    # "Going to". Keep both so tracks like "Do You Wanna Dance?" can find
+    # canonical entries stored as "Do You Want to Dance".
+    swaps = [
+        (r"\bwanna\b", "want to"),
+        (r"\bwant to\b", "wanna"),
+        (r"\bgonna\b", "going to"),
+        (r"\bgoing to\b", "gonna"),
+        (r"\bgotta\b", "got to"),
+        (r"\bgot to\b", "gotta"),
+        (r"\byou gotta\b", "you got to"),
+    ]
+    for source in list(variants):
+        lower = source.lower()
+        for pattern, replacement in swaps:
+            swapped = re.sub(pattern, replacement, lower, flags=re.I)
+            if swapped != lower:
+                add(swapped.title())
+
+    # Extra useful variants for common SXM display titles that include leading
+    # informal wording. These are still searched with the artist, so they do not
+    # become dangerously broad, but they help canonical titles rank correctly.
+    words = _metadata_words(cleaned2)
+    if len(words) >= 5:
+        for marker in ("fight", "love", "dance", "walk", "shake", "dream", "want", "need"):
+            if marker in words and words.index(marker) > 0:
+                add(" ".join(words[words.index(marker):]))
+                break
+
+    return variants
+
+
+def _metadata_query_word_clause(value: str, field: str) -> str:
+    words = [w for w in re.findall(r"[A-Za-z0-9]+", value or "") if len(w) > 1]
+    # Keep enough words to be useful without over-constraining long titles.
+    words = words[:8]
+    if not words:
+        return ""
+    return " AND ".join(f'{field}:{word}' for word in words)
+
+
+def _metadata_release_score(
+    recording_score: int,
+    requested_artist: str,
+    requested_title: str,
+    rec_artist: str,
+    rec_title: str,
+    release: Optional[Dict[str, Any]],
+) -> float:
+    """Score MusicBrainz release candidates for a human-friendly picker.
+
+    The MusicBrainz search score is only one ingredient. For Jukebox cleanup we
+    usually want the original/studio album before compilations. This scoring
+    heavily rewards artist/title matches and penalizes compilation/various-artist
+    releases so results like "Licensed to Ill" beat "80s Mix" for Beastie Boys.
+    """
+    score = max(0.0, min(1.0, (recording_score or 0) / 100.0)) * 0.35
+    score += _metadata_artist_similarity(requested_artist, rec_artist) * 0.28
+    score += _metadata_similarity(requested_title, rec_title) * 0.22
+
+    if not release:
+        return score
+
+    release_artist = _musicbrainz_release_artist(release, rec_artist)
+    score += _metadata_artist_similarity(requested_artist, release_artist) * 0.10
+
+    status = str(release.get("status") or "").lower()
+    if status == "official":
+        score += 0.03
+
+    rg = release.get("release-group") or {}
+    primary_type = str(rg.get("primary-type") or "")
+    secondary_types = [str(t) for t in (rg.get("secondary-types") or [])]
+    secondary_lower = {t.lower() for t in secondary_types}
+    release_artist_clean = _metadata_clean_text(release_artist)
+
+    if primary_type.lower() == "album":
+        score += 0.12
+    elif primary_type.lower() == "single":
+        score += 0.03
+    elif primary_type:
+        score += 0.01
+
+    bad_secondary = {"compilation", "soundtrack", "live", "remix", "dj-mix", "mixtape/street"}
+    if secondary_lower & bad_secondary:
+        score -= 0.24
+
+    if release_artist_clean in {"various artists", "various"}:
+        score -= 0.30
+
+    # Prefer older/original releases over later compilations when all else is
+    # equal, but keep the effect small so bad early matches do not win.
+    date = str(release.get("date") or "")
+    try:
+        year = int(date[:4])
+        if 1950 <= year <= 2030:
+            score += max(0.0, min(0.04, (2030 - year) / 2000.0))
+    except Exception:
+        pass
+
+    return max(0.0, min(1.0, score))
+
+
+async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """Find likely album/cover candidates using MusicBrainz + Cover Art Archive.
+
+    This is deliberately user-triggered. Music metadata is not always unique,
+    especially for singles, remasters, compilations, and live versions, so the
+    frontend presents candidates and lets the user choose.
+    """
+    artist = (artist or "").strip()
+    title = (title or "").strip()
+    if not title:
+        return []
+
+    headers = {
+        "User-Agent": "ArchiveXM/1.0 (metadata lookup; local user initiated)",
+        "Accept": "application/json",
+    }
+
+    query_attempts = []
+    seen_queries = set()
+
+    def add_query(query: str):
+        query = re.sub(r"\s+", " ", str(query or "").strip())
+        if query and query.lower() not in seen_queries:
+            seen_queries.add(query.lower())
+            query_attempts.append(query)
+
+    title_variants = _metadata_title_variants(title)
+    artist_variants = _metadata_artist_variants(artist)
+    artist_known = bool(artist_variants) and artist.lower() != "unknown"
+
+    for variant in title_variants:
+        quoted_title = variant.replace('"', '\\"')
+        if artist_known:
+            for artist_variant in artist_variants:
+                quoted_artist = artist_variant.replace('"', '\\"')
+                add_query(f'artist:"{quoted_artist}" AND recording:"{quoted_title}"')
+                add_query(f'artistname:"{quoted_artist}" AND recording:"{quoted_title}"')
+        else:
+            add_query(f'recording:"{quoted_title}"')
+
+    # Fallback to word-based recording clauses. This catches SXM display titles
+    # that differ from canonical MusicBrainz titles, especially XTRA tracks with
+    # extra year suffixes or missing punctuation.
+    for variant in title_variants:
+        word_clause = _metadata_query_word_clause(variant, "recording")
+        if not word_clause:
+            continue
+        if artist_known:
+            for artist_variant in artist_variants:
+                quoted_artist = artist_variant.replace('"', '\\"')
+                add_query(f'artist:"{quoted_artist}" AND {word_clause}')
+                add_query(f'artistname:"{quoted_artist}" AND {word_clause}')
+        else:
+            add_query(word_clause)
+
+    # Last-resort title-only search. Results are still ranked by artist
+    # similarity, so the requested artist rises above covers by other artists.
+    # This helps cover songs or artist-name variants that MusicBrainz stores
+    # differently than SXM.
+    for variant in title_variants[:4]:
+        quoted_title = variant.replace('"', '\\"')
+        add_query(f'recording:"{quoted_title}"')
+
+    async def run_query(client: httpx.AsyncClient, query: str) -> List[Dict[str, Any]]:
+        params = {
+            "query": query,
+            "fmt": "json",
+            "limit": "25",
+            "inc": "artist-credits+releases+release-groups",
+        }
+        response = await client.get("https://musicbrainz.org/ws/2/recording/", params=params, headers=headers)
+        response.raise_for_status()
+        return response.json().get("recordings") or []
+
+    recordings_by_id: Dict[str, Dict[str, Any]] = {}
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        for query in query_attempts:
+            found = await run_query(client, query)
+            for recording in found:
+                rid = recording.get("id") or json.dumps(recording, sort_keys=True)[:80]
+                if rid not in recordings_by_id:
+                    recordings_by_id[rid] = recording
+            if len(recordings_by_id) >= 40:
+                break
+
+    candidates: List[Dict[str, Any]] = []
+    seen = set()
+
+    for recording in recordings_by_id.values():
+        rec_title = recording.get("title") or title
+        rec_artist = _musicbrainz_artist_credit(recording) or artist or "Unknown"
+        try:
+            mb_score = int(recording.get("score") or 0)
+        except Exception:
+            mb_score = 0
+
+        releases = recording.get("releases") or []
+        if not releases:
+            confidence = _metadata_release_score(mb_score, artist, title, rec_artist, rec_title, None)
+            candidate = {
+                "provider": "musicbrainz",
+                "recording_id": recording.get("id"),
+                "release_id": None,
+                "artist": rec_artist,
+                "title": rec_title,
+                "album": "",
+                "year": "",
+                "cover_url": None,
+                "confidence": round(confidence, 3),
+                "release_type": "Recording",
+                "label": f"{rec_artist} - {rec_title}",
+            }
+            key = _candidate_key(candidate)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(candidate)
+            continue
+
+        for release in releases[:20]:
+            release_id = release.get("id")
+            album = release.get("title") or ""
+            date = str(release.get("date") or "")
+            year = date[:4] if date else ""
+            rg = release.get("release-group") or {}
+            primary_type = rg.get("primary-type") or ""
+            secondary_types = rg.get("secondary-types") or []
+            release_type_parts = []
+            if primary_type:
+                release_type_parts.append(primary_type)
+            release_type_parts.extend([str(t) for t in secondary_types if t])
+            release_type = ", ".join(release_type_parts) or "Release"
+            confidence = _metadata_release_score(mb_score, artist, title, rec_artist, rec_title, release)
+
+            candidate = {
+                "provider": "musicbrainz",
+                "recording_id": recording.get("id"),
+                "release_id": release_id,
+                "artist": rec_artist,
+                "title": rec_title,
+                "album": album,
+                "year": year,
+                "cover_url": f"https://coverartarchive.org/release/{release_id}/front-250" if release_id else None,
+                "confidence": round(confidence, 3),
+                "release_type": release_type,
+                "label": f"{album or rec_title}" + (f" ({year})" if year else "") + (f" · {release_type}" if release_type else ""),
+            }
+            key = _candidate_key(candidate)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(candidate)
+
+    def sort_key(c: Dict[str, Any]):
+        album = str(c.get("album") or "")
+        reltype = str(c.get("release_type") or "").lower()
+        non_compilation = 0 if "compilation" in reltype else 1
+        has_album = 1 if album else 0
+        return (float(c.get("confidence") or 0), non_compilation, has_album)
+
+    candidates.sort(key=sort_key, reverse=True)
+    return candidates[:limit]
+
+async def _save_track_cover_from_url(db: DBSession, track: LocalTrack, cover_url: str | None) -> str | None:
+    cover_url = (cover_url or "").strip()
+    if not cover_url:
+        return None
+    if not cover_url.lower().startswith(("http://", "https://")):
+        return None
+
+    headers = {
+        "User-Agent": "ArchiveXM/1.0 (cover art lookup; local user initiated)",
+        "Accept": "image/*,*/*",
+    }
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+        response = await client.get(cover_url, headers=headers)
+    if response.status_code >= 400 or not response.content:
+        raise Exception(f"Cover fetch failed status={response.status_code}")
+
+    content_type = (response.headers.get("content-type") or "").lower()
+    suffix = ".jpg"
+    if "png" in content_type:
+        suffix = ".png"
+    elif "webp" in content_type:
+        suffix = ".webp"
+    elif "jpeg" in content_type or "jpg" in content_type:
+        suffix = ".jpg"
+    else:
+        path_suffix = Path(str(response.url).split("?", 1)[0]).suffix.lower()
+        if path_suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+            suffix = path_suffix
+
+    cover_dir = _download_path(db) / ".archivexm" / "covers"
+    cover_dir.mkdir(parents=True, exist_ok=True)
+    cover_path = cover_dir / _safe_cover_filename(track.id, suffix)
+    cover_path.write_bytes(response.content)
+    track.cover_art_path = str(cover_path)
+    return str(cover_path)
+
 # ============ Library Scanning ============
 
 @router.post("/scan")
@@ -964,6 +1528,88 @@ async def bulk_delete_tracks(
         "affected_playlists": affected_playlist_ids,
         "deleted_files": deleted_files,
         "file_errors": file_errors,
+    }
+
+
+
+@router.get("/tracks/{track_id}/metadata/search")
+async def search_track_metadata(
+    track_id: int,
+    artist: Optional[str] = None,
+    title: Optional[str] = None,
+    db: DBSession = Depends(get_db),
+):
+    """
+    Search external metadata candidates for a local Jukebox track.
+
+    Uses MusicBrainz for release/album candidates and Cover Art Archive URLs for
+    cover previews. This is user-triggered so ambiguous matches can be reviewed
+    before applying.
+    """
+    track = db.query(LocalTrack).filter(LocalTrack.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+
+    search_artist = _first_text(artist, track.artist, default="")
+    search_title = _first_text(title, track.title, track.filename, default="")
+    if not search_title:
+        raise HTTPException(status_code=400, detail="Track title is required for metadata search")
+
+    try:
+        candidates = await _search_musicbrainz_candidates(search_artist, search_title)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"MusicBrainz lookup failed: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Metadata lookup failed: {e}")
+
+    return {
+        "track_id": track.id,
+        "query": {"artist": search_artist, "title": search_title},
+        "candidates": candidates,
+    }
+
+
+@router.post("/tracks/{track_id}/metadata/apply")
+async def apply_track_metadata(
+    track_id: int,
+    request: MetadataApplyRequest,
+    db: DBSession = Depends(get_db),
+):
+    """
+    Apply user-selected metadata to a local Jukebox track.
+    """
+    track = db.query(LocalTrack).filter(LocalTrack.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+
+    if request.artist is not None and str(request.artist).strip():
+        track.artist = str(request.artist).strip()
+    if request.title is not None and str(request.title).strip():
+        track.title = str(request.title).strip()
+    if request.album is not None:
+        track.album = str(request.album).strip() or None
+
+    cover_error = None
+    if request.cover_url:
+        try:
+            await _save_track_cover_from_url(db, track, request.cover_url)
+        except Exception as e:
+            cover_error = str(e)
+            print(f"Metadata apply: cover download failed for track {track.id}: {e}")
+
+    db.commit()
+    db.refresh(track)
+
+    return {
+        "success": True,
+        "track": TrackResponse.from_orm(track),
+        "cover_error": cover_error,
+        "metadata": {
+            "provider": request.provider,
+            "recording_id": request.recording_id,
+            "release_id": request.release_id,
+            "year": request.year,
+        },
     }
 
 

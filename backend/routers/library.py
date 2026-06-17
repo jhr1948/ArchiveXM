@@ -86,6 +86,16 @@ class AddToPlaylistRequest(BaseModel):
     track_ids: List[int]
 
 
+class RemoveCurrentPlaylistRequest(BaseModel):
+    track_id: Optional[int] = None
+    track_url: Optional[str] = None
+    url: Optional[str] = None
+    tvg_id: Optional[str] = None
+    source: Optional[str] = None
+    remove_all: bool = False
+    track: Optional[Dict[str, Any]] = None
+
+
 
 def _first_text(*values, default: str = "") -> str:
     for value in values:
@@ -1512,6 +1522,63 @@ async def add_tracks_to_playlist(
     return {"success": True, "added": added}
 
 
+
+def _extract_track_id_from_remove_request(request: RemoveCurrentPlaylistRequest) -> int | None:
+    if request.track_id is not None:
+        try:
+            return int(request.track_id)
+        except Exception:
+            return None
+
+    candidates = [request.track_url, request.url, request.tvg_id]
+
+    if request.track:
+        for key in ("track_id", "id", "local_track_id", "localTrackId", "tvg_id", "url", "track_url"):
+            value = request.track.get(key)
+            if value not in (None, ""):
+                candidates.append(str(value))
+
+    patterns = [
+        r"archivexm-track-(\d+)",
+        r"/api/library/files/(\d+)/(?:play|metadata|cover)(?:\.[A-Za-z0-9]+)?",
+        r"/library/files/(\d+)/(?:play|metadata|cover)(?:\.[A-Za-z0-9]+)?",
+        r"/api/library/tracks/(\d+)/(?:stream|cover)(?:\.[A-Za-z0-9]+)?",
+        r"/library/tracks/(\d+)/(?:stream|cover)(?:\.[A-Za-z0-9]+)?",
+        r"/api/library/tracks/(\d+)(?:\b|$)",
+        r"/library/tracks/(\d+)(?:\b|$)",
+    ]
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        text = str(candidate)
+        if text.isdigit():
+            return int(text)
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                try:
+                    return int(match.group(1))
+                except Exception:
+                    continue
+
+    return None
+
+
+def _compact_playlist_positions(db: DBSession, playlist_id: int):
+    rows = db.query(PlaylistTrack).filter(
+        PlaylistTrack.playlist_id == playlist_id
+    ).order_by(PlaylistTrack.position, PlaylistTrack.id).all()
+
+    for index, row in enumerate(rows, 1):
+        if row.position != index:
+            row.position = index
+
+    playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+    if playlist:
+        playlist.track_count = len(rows)
+
+
 @router.delete("/playlists/{playlist_id}/tracks/{track_id}")
 async def remove_track_from_playlist(
     playlist_id: int,
@@ -1543,6 +1610,76 @@ async def remove_track_from_playlist(
     
     return {"success": True, "message": "Track removed from playlist"}
 
+
+
+@router.post("/playlists/{playlist_id}/remove-current")
+async def remove_current_track_from_playlist(
+    playlist_id: int,
+    request: RemoveCurrentPlaylistRequest,
+    db: DBSession = Depends(get_db)
+):
+    """
+    Remove the currently playing ArchiveXM playlist/VOD item from a playlist.
+
+    This is intended for external players such as M3You. They can pass either
+    track_id directly or any URL/tvg-id that contains the LocalTrack id, such as:
+      /api/library/files/91/play.m4a
+      /api/library/files/91/metadata
+      archivexm-track-91
+
+    This removes the song from the playlist only. It does not delete the local
+    audio file or remove the song from the Jukebox library.
+    """
+    playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+
+    track_id = _extract_track_id_from_remove_request(request)
+    if not track_id:
+        raise HTTPException(status_code=400, detail="track_id or a recognizable ArchiveXM track URL is required")
+
+    track = db.query(LocalTrack).filter(LocalTrack.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+
+    query = db.query(PlaylistTrack).filter(
+        PlaylistTrack.playlist_id == playlist_id,
+        PlaylistTrack.track_id == track_id
+    )
+
+    removed = 0
+    if request.remove_all:
+        removed = query.count()
+        query.delete(synchronize_session=False)
+    else:
+        pt = query.order_by(PlaylistTrack.position, PlaylistTrack.id).first()
+        if pt:
+            db.delete(pt)
+            removed = 1
+
+    if removed <= 0:
+        raise HTTPException(status_code=404, detail="Track not in playlist")
+
+    db.flush()
+    _compact_playlist_positions(db, playlist_id)
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "Track removed from playlist",
+        "playlist_id": playlist_id,
+        "playlist_name": playlist.name,
+        "track_id": track_id,
+        "removed": removed,
+        "track": {
+            "id": track.id,
+            "artist": track.artist,
+            "title": track.title,
+            "album": track.album,
+            "filename": track.filename,
+        },
+        "track_count": playlist.track_count,
+    }
 
 @router.put("/playlists/{playlist_id}/reorder")
 async def reorder_playlist(

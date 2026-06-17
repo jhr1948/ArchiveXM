@@ -21,16 +21,57 @@ function ChannelDetailPage() {
   const [playlistTarget, setPlaylistTarget] = useState(null)
   const [newPlaylistName, setNewPlaylistName] = useState('')
   const [playlistActionLoading, setPlaylistActionLoading] = useState(false)
+  const [xtraQueue, setXtraQueue] = useState(null)
+  const [xtraQueueLoading, setXtraQueueLoading] = useState(false)
   
   const { currentChannel, currentTrack: playerCurrentTrack, isPlaying, isLoading: playerLoading, playChannel, togglePlay } = usePlayer()
+
+  const isXtraChannel = (item = channel) => {
+    const type = String(item?.channel_type || item?.channelType || item?.type || '').toLowerCase()
+    return type === 'channel-xtra' || type.includes('xtra')
+  }
 
   useEffect(() => {
     loadChannelData()
   }, [channelId])
 
+  useEffect(() => {
+    if (!channelId || loading || !channel || !isXtraChannel(channel)) {
+      setXtraQueue(null)
+      return
+    }
+
+    let cancelled = false
+    const loadXtraQueue = async () => {
+      try {
+        setXtraQueueLoading(true)
+        const response = await streamsApi.getXtraQueue(channelId)
+        if (!cancelled) {
+          setXtraQueue(response.data || null)
+        }
+      } catch (e) {
+        if (!cancelled) {
+          console.error('Error loading XTRA queue:', e)
+          setXtraQueue(null)
+        }
+      } finally {
+        if (!cancelled) {
+          setXtraQueueLoading(false)
+        }
+      }
+    }
+
+    loadXtraQueue()
+    const interval = setInterval(loadXtraQueue, 5000)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [channelId, loading, channel?.channel_type])
+
   // Poll for current track updates every 5 seconds so live metadata offsets feel responsive
   useEffect(() => {
-    if (!channelId || loading) return
+    if (!channelId || loading || isXtraChannel(channel)) return
     
     const pollCurrentTrack = async () => {
       try {
@@ -48,7 +89,7 @@ function ChannelDetailPage() {
     
     const interval = setInterval(pollCurrentTrack, 5000)
     return () => clearInterval(interval)
-  }, [channelId, loading])
+  }, [channelId, loading, channel?.channel_type])
 
   const loadChannelData = async () => {
     setLoading(true)
@@ -252,6 +293,37 @@ function ChannelDetailPage() {
     }
   }
 
+  const formatTrackDuration = (ms) => {
+    if (!ms) return '--:--'
+    const seconds = Math.floor(Number(ms || 0) / 1000)
+    const mins = Math.floor(seconds / 60)
+    const secs = seconds % 60
+    return `${mins}:${secs.toString().padStart(2, '0')}`
+  }
+
+  const XtraQueueRow = ({ label, track, muted = false }) => {
+    if (!track) return null
+    return (
+      <div className={`flex items-center gap-3 p-3 rounded-lg ${muted ? 'bg-sxm-darker/40' : 'bg-sxm-darker'}`}>
+        <div className="w-12 h-12 rounded-lg bg-black/30 overflow-hidden flex items-center justify-center shrink-0">
+          {(track.imageUrl || track.image_url) ? (
+            <img src={track.imageUrl || track.image_url} alt="" className="w-full h-full object-cover" />
+          ) : (
+            <Music className="w-5 h-5 text-gray-600" />
+          )}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 mb-0.5">
+            <span className="text-xs uppercase tracking-wide text-sxm-accent font-semibold">{label}</span>
+            {(track.durationMs || track.duration_ms) ? <span className="text-xs text-gray-500">{formatTrackDuration(track.durationMs || track.duration_ms)}</span> : null}
+          </div>
+          <p className="text-white font-medium truncate">{track.title || 'Unknown title'}</p>
+          <p className="text-gray-400 text-sm truncate">{track.artist || 'Unknown artist'}{track.album ? ` • ${track.album}` : ''}</p>
+        </div>
+      </div>
+    )
+  }
+
   const formatDuration = (ms) => {
     if (!ms) return '--:--'
     const seconds = Math.floor(ms / 1000)
@@ -282,6 +354,7 @@ function ChannelDetailPage() {
   const playerChannelId = currentChannel?.channel_id || currentChannel?.id || currentChannel?.uuid
   const currentTrack = playerChannelId === channelId && playerCurrentTrack ? playerCurrentTrack : schedule?.current_track
   const tracks = schedule?.tracks || []
+  const isXtraPage = isXtraChannel(channel)
 
   return (
     <div>
@@ -364,18 +437,76 @@ function ChannelDetailPage() {
         </button>
       </div>
 
+      {/* XTRA Queue */}
+      {isXtraPage && (
+        <div className="card mb-6">
+          <div className="flex items-center justify-between gap-4 mb-4">
+            <div>
+              <h2 className="text-xl font-bold text-white">XTRA Queue</h2>
+              <p className="text-gray-400 text-sm">
+                Now playing, coming up, and the one-track Back item when available.
+              </p>
+            </div>
+            <button
+              onClick={async () => {
+                try {
+                  setXtraQueueLoading(true)
+                  const response = await streamsApi.getXtraQueue(channelId)
+                  setXtraQueue(response.data || null)
+                } catch (e) {
+                  console.error('Error refreshing XTRA queue:', e)
+                } finally {
+                  setXtraQueueLoading(false)
+                }
+              }}
+              disabled={xtraQueueLoading}
+              className="btn-secondary flex items-center gap-2"
+            >
+              <RefreshCw className={`w-4 h-4 ${xtraQueueLoading ? 'animate-spin' : ''}`} />
+              Refresh
+            </button>
+          </div>
+
+          {!xtraQueue?.hasActiveQueue && (
+            <div className="p-4 rounded-lg bg-sxm-darker text-gray-400 text-sm">
+              Start this XTRA channel to let ArchiveXM build the queue. Upcoming songs appear as ArchiveXM prefetches them.
+            </div>
+          )}
+
+          {xtraQueue?.hasActiveQueue && (
+            <div className="space-y-3">
+              {xtraQueue.previous && <XtraQueueRow label="Previous" track={xtraQueue.previous} muted />}
+              <XtraQueueRow label="Now" track={xtraQueue.current || currentTrack} />
+              {xtraQueue.upcoming?.length > 0 ? (
+                <div className="space-y-2">
+                  {xtraQueue.upcoming.map((track, idx) => (
+                    <XtraQueueRow key={`${track.trackId || track.title}-${idx}`} label={idx === 0 ? 'Coming Up' : `Up Next ${idx + 1}`} track={track} muted />
+                  ))}
+                </div>
+              ) : (
+                <div className="p-3 rounded-lg bg-sxm-darker/40 text-gray-500 text-sm">
+                  No upcoming XTRA items prefetched yet. Keep playback running or use Next to build the queue.
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Recording Panel */}
-      <div className="card mb-6">
-        <RecordingPanel channelId={channelId} channelName={channel.name} channel={channel} />
-      </div>
+      {!isXtraPage && (
+        <div className="card mb-6">
+          <RecordingPanel channelId={channelId} channelName={channel.name} channel={channel} />
+        </div>
+      )}
 
       {/* DVR Buffer / Track History */}
       <div className="card">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
           <div>
-            <h2 className="text-xl font-bold text-white">Station History</h2>
+            <h2 className="text-xl font-bold text-white">{isXtraPage ? 'XTRA History' : 'Station History'}</h2>
             <p className="text-gray-400 text-sm">
-              Last 5 hours • {tracks.length} tracks
+              {isXtraPage ? 'XTRA station history may be limited' : 'Last 5 hours'} • {tracks.length} tracks
             </p>
           </div>
 

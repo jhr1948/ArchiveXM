@@ -64,6 +64,9 @@ export const streamsApi = {
   
   getStreamUrl: (channelId) => 
     api.get(`/api/streams/${channelId}/stream-url`),
+
+  getXtraQueue: (channelId) =>
+    api.get(`/api/streams/${channelId}/xtra/queue`),
   
   // Get proxy stream URL for HLS playback (bypasses CORS)
   getProxyStreamUrl: (channelId) => 

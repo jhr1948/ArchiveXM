@@ -885,13 +885,14 @@ async def _ensure_xtra_queue(channel_id: str, session_info: dict, requested_path
 
     cached["last_access"] = now
 
-    # Keep at least two tracks queued, and append another when the queue is
-    # mostly consumed. This avoids ENDLIST stops without aggressively prefetching.
+    # Keep a small look-ahead queue so the XTRA Queue UI can show
+    # a few upcoming items without changing playback. This still appends
+    # lazily as the player accesses the proxy, so it should not hammer SXM.
     total_segments = sum(len(track.get("segments") or []) for track in cached.get("tracks", []))
     served_count = len(cached.get("served", set()))
     remaining = total_segments - served_count
 
-    should_append = len(cached.get("tracks", [])) < 2 or remaining <= 8
+    should_append = len(cached.get("tracks", [])) < 4 or remaining <= 8
 
     if should_append and not cached.get("append_in_progress"):
         cached["append_in_progress"] = True
@@ -945,6 +946,150 @@ def _public_xtra_metadata_from_track(track: dict | None, channel_id: str) -> dic
         metadata["channelId"] = channel_id
         metadata["isXtra"] = True
     return metadata
+
+
+def _xtra_duration_ms_for_track(track: dict | None) -> int:
+    metadata = (track or {}).get("metadata") or {}
+    duration_ms = metadata.get("durationMs") or metadata.get("duration_ms") or 0
+    try:
+        duration_ms = int(duration_ms)
+    except (TypeError, ValueError):
+        duration_ms = 0
+
+    if duration_ms <= 0:
+        try:
+            duration_ms = int(float((track or {}).get("duration") or 0) * 1000)
+        except (TypeError, ValueError):
+            duration_ms = 0
+    return max(0, duration_ms)
+
+
+def _xtra_track_summary(track: dict | None, channel_id: str, role: str = "queue", index: int | None = None) -> dict | None:
+    metadata = _public_xtra_metadata_from_track(track, channel_id)
+    if not metadata:
+        return None
+
+    duration_ms = metadata.get("durationMs") or _xtra_duration_ms_for_track(track)
+    try:
+        duration_ms = int(duration_ms or 0)
+    except (TypeError, ValueError):
+        duration_ms = 0
+
+    return {
+        "role": role,
+        "index": index,
+        "title": metadata.get("title") or "",
+        "artist": metadata.get("artist") or "",
+        "album": metadata.get("album") or "",
+        "imageUrl": metadata.get("imageUrl") or metadata.get("image_url") or "",
+        "durationMs": duration_ms,
+        "startedAtMs": metadata.get("startedAtMs"),
+        "trackId": metadata.get("trackId"),
+        "sequenceToken": metadata.get("sequenceToken"),
+        "sourceContextId": metadata.get("sourceContextId"),
+        "isXtra": True,
+    }
+
+
+def _xtra_track_identity(track: dict | None) -> tuple:
+    metadata = (track or {}).get("metadata") or {}
+    title = str(metadata.get("title") or "").strip().lower()
+    artist = str(metadata.get("artist") or "").strip().lower()
+    track_id = str(metadata.get("trackId") or metadata.get("sequenceToken") or (track or {}).get("path") or "").strip().lower()
+    duration = _xtra_duration_ms_for_track(track)
+    return (track_id, title, artist, duration)
+
+
+def _xtra_queue_snapshot(channel_id: str) -> dict:
+    import time
+
+    cached = _xtra_sessions.get(channel_id) or {}
+    tracks = list(cached.get("tracks") or [])
+    served = cached.get("served") or set()
+
+    if not tracks:
+        manual_start = _xtra_manual_start.get(channel_id) or {}
+        if manual_start.get("track"):
+            tracks = [manual_start.get("track")]
+
+    current_index = 0
+    elapsed_ms = None
+
+    # Do not use the served-segment set to decide Now/Previous. Browsers can
+    # buffer an entire XTRA item quickly, which made the Queue card advance
+    # to the next song while the audible player was still on the first song.
+    # Instead use elapsed wall-clock time since ArchiveXM created the stitched
+    # XTRA session. This matches the same duration model used by /metadata.
+    if tracks and cached.get("created"):
+        try:
+            elapsed_ms = max(0, int((time.time() - float(cached.get("created"))) * 1000))
+            offset = 0
+            for idx, track in enumerate(tracks):
+                duration_ms = max(1, _xtra_duration_ms_for_track(track))
+                next_offset = offset + duration_ms
+                if elapsed_ms < next_offset:
+                    current_index = idx
+                    break
+                current_index = idx
+                offset = next_offset
+        except Exception:
+            current_index = 0
+
+    current_track = tracks[current_index] if tracks else None
+    current_identity = _xtra_track_identity(current_track)
+
+    # Previous is only the one-track Back item we explicitly store for XTRA
+    # previous/back support. Do not infer Previous from served segments, because
+    # that causes duplicates and premature advancement in the UI.
+    manual_previous = _xtra_previous_tracks.get(channel_id)
+    previous_track = manual_previous if _xtra_track_identity(manual_previous) != current_identity else None
+
+    upcoming_tracks = []
+    seen = {current_identity}
+    if previous_track:
+        seen.add(_xtra_track_identity(previous_track))
+
+    for track in tracks[current_index + 1:]:
+        ident = _xtra_track_identity(track)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        upcoming_tracks.append(track)
+
+    return {
+        "ok": True,
+        "channelId": channel_id,
+        "hasActiveQueue": bool(cached or tracks),
+        "previous": _xtra_track_summary(previous_track, channel_id, "previous") if previous_track else None,
+        "current": _xtra_track_summary(current_track, channel_id, "current", current_index) if current_track else None,
+        "upcoming": [
+            item for item in (
+                _xtra_track_summary(track, channel_id, "upcoming", current_index + 1 + idx)
+                for idx, track in enumerate(upcoming_tracks[:6])
+            ) if item
+        ],
+        "tracksKnown": len(tracks),
+        "servedSegments": len(served) if served else 0,
+        "elapsedPositionMs": elapsed_ms,
+        "availableBackwardSkips": 1 if channel_id in _xtra_previous_tracks else 0,
+        "note": "XTRA upcoming is based on ArchiveXM's prefetched queue. More items appear after playback starts and the queue continues.",
+    }
+
+
+@router.get("/{channel_id}/xtra/queue")
+async def xtra_queue(channel_id: str, db: DBSession = Depends(get_db)):
+    """Return ArchiveXM's best-known XTRA previous/current/upcoming queue snapshot."""
+    from fastapi.responses import JSONResponse
+
+    requested_channel_id = channel_id
+    channel_id = resolve_channel_id(channel_id, db)
+
+    if get_channel_type(channel_id, db) != "channel-xtra":
+        raise HTTPException(status_code=400, detail="XTRA queue is only supported for XTRA channels")
+
+    payload = _xtra_queue_snapshot(channel_id)
+    payload["requestedChannelId"] = requested_channel_id
+    return JSONResponse(content=payload, headers={"Access-Control-Allow-Origin": "*"})
 
 @router.get("/{channel_id}/xtra/next")
 @router.post("/{channel_id}/xtra/next")

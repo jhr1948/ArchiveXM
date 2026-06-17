@@ -172,6 +172,12 @@ async def legacy_metadata(channel_id: str, positionMs: int | None = None, db: DB
     )
 
 
+
+@router.get("/xtra/{channel_id}/queue")
+async def legacy_xtra_queue(channel_id: str, db: DBSession = Depends(get_db)):
+    resolved_channel_id = _resolve_channel_id(channel_id, db)
+    return await streams.xtra_queue(resolved_channel_id, db)
+
 async def _legacy_next_response(channel_id: str, db: DBSession) -> JSONResponse:
     response = await streams.xtra_next(channel_id, db)
 

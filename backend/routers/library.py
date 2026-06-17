@@ -294,9 +294,87 @@ async def _resolve_capture_track(session_token: str, request: CaptureCurrentRequ
         except Exception as e:
             print(f"Capture current: server-side live metadata lookup failed: {e}")
 
-    # XTRA capture starts with the active/current metadata sent by M3You. If a
-    # later XTRA-specific downloader is added, this endpoint can keep the same
-    # contract and swap the backend implementation.
+    # XTRA capture: use ArchiveXM's active XTRA queue when available. Unlike
+    # live linear channels, XTRA tracks do not have station-history boundaries.
+    # ArchiveXM's XTRA proxy already fetched a FULL 256k media playlist for the
+    # currently playing XTRA item, so capture-current can download that exact
+    # playlist from the beginning and add it to the selected Jukebox playlist.
+    if channel_type in {"channel-xtra", "xtra"}:
+        try:
+            from routers import streams as streams_router
+
+            cached = getattr(streams_router, "_xtra_sessions", {}).get(request.channel_id)
+            xtra_track = None
+
+            if cached:
+                served = cached.get("served") or set()
+                tracks = cached.get("tracks") or []
+
+                # Pick the first queued XTRA item that has not been fully served.
+                # This maps to the item the listener is currently hearing, while
+                # still downloading its full playlist from the beginning.
+                for candidate in tracks:
+                    names = set(candidate.get("segment_names") or [])
+                    if not names or not names.issubset(served):
+                        xtra_track = candidate
+                        break
+
+                if not xtra_track and tracks:
+                    xtra_track = tracks[-1]
+
+            # If M3You calls + before ArchiveXM has an active proxy queue in this
+            # process, try to fetch the current XTRA FULL item directly.
+            if not xtra_track:
+                fetcher = getattr(streams_router, "_fetch_xtra_256k_track", None)
+                if fetcher:
+                    xtra_track = await fetcher(
+                        channel_id=request.channel_id,
+                        bearer=session_token,
+                        use_peek=True,
+                    )
+
+            if xtra_track:
+                metadata = xtra_track.get("metadata") or {}
+                duration_ms = metadata.get("durationMs")
+                if not duration_ms:
+                    try:
+                        duration_ms = int(float(xtra_track.get("duration") or 0) * 1000)
+                    except Exception:
+                        duration_ms = requested.get("duration_ms") or 0
+
+                timestamp_utc = _ms_to_iso_utc(metadata.get("startedAtMs"))
+                if not timestamp_utc:
+                    timestamp_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+                payload = {
+                    "artist": _first_text(metadata.get("artist"), requested.get("artist"), default="Unknown"),
+                    "title": _first_text(metadata.get("title"), requested.get("title"), default="Unknown"),
+                    "album": _first_text(metadata.get("album"), requested.get("album"), default=""),
+                    "duration_ms": int(duration_ms or requested.get("duration_ms") or 0),
+                    "timestamp_utc": timestamp_utc,
+                    "image_url": metadata.get("imageUrl") or requested.get("image_url"),
+                    "is_xtra_capture": True,
+                    "preserve_duration": True,
+                    "_xtra_track": {
+                        "playlist_text": xtra_track.get("playlist_text") or "",
+                        "base_url": xtra_track.get("base_url") or "",
+                        "path_dir": xtra_track.get("path_dir") or "",
+                        "duration": xtra_track.get("duration"),
+                        "path": xtra_track.get("path"),
+                        "bearer": session_token,
+                    },
+                }
+                print(
+                    "Capture current: using active XTRA item "
+                    f"{payload.get('artist')} - {payload.get('title')} "
+                    f"duration={payload.get('duration_ms')}ms"
+                )
+                return payload
+
+            print("Capture current: no active XTRA queue item found; using M3You metadata fallback")
+        except Exception as e:
+            print(f"Capture current: XTRA active item lookup failed: {e}")
+
     return requested
 
 
@@ -378,7 +456,10 @@ async def _download_capture_and_add_to_playlist(
             await _wait_until_capture_track_complete(track_payload)
 
         service = DownloadService(bearer_token)
-        ok = await service.download_track(download_id, channel_id, track_payload, download_path)
+        if track_payload.get("is_xtra_capture"):
+            ok = await service.download_xtra_track(download_id, channel_id, track_payload, download_path)
+        else:
+            ok = await service.download_track(download_id, channel_id, track_payload, download_path)
     except Exception as e:
         print(f"Capture current download task failed: {e}")
 
@@ -1074,16 +1155,25 @@ async def capture_current_to_playlist(
     db.commit()
     db.refresh(download)
 
-    # For external "capture current" requests, never save a clipped tail of a
-    # song. If the SiriusXM/HLS buffer no longer contains the real start boundary,
-    # the download service should fail the job instead of importing a partial file.
-    track_payload["require_full_window"] = True
+    is_xtra_capture = bool(track_payload.get("is_xtra_capture")) or (request.channel_type or "").strip().lower() in {"channel-xtra", "xtra"}
 
-    # Preserve the station-history/API duration for captures. Normal downloads
-    # can stop at the next raw metadata boundary to avoid DJ bleed, but capture
-    # bookmarks were losing the last few seconds because those boundaries can be
-    # early. The user's configured tail pad still applies to the audio segments.
-    track_payload["preserve_duration"] = True
+    if not is_xtra_capture:
+        # For external "capture current" requests, never save a clipped tail of a
+        # song. If the SiriusXM/HLS buffer no longer contains the real start boundary,
+        # the download service should fail the job instead of importing a partial file.
+        track_payload["require_full_window"] = True
+
+        # Preserve the station-history/API duration for captures. Normal downloads
+        # can stop at the next raw metadata boundary to avoid DJ bleed, but capture
+        # bookmarks were losing the last few seconds because those boundaries can be
+        # early. The user's configured tail pad still applies to the audio segments.
+        track_payload["preserve_duration"] = True
+    else:
+        # XTRA captures use the active FULL XTRA media playlist and do not have
+        # linear replay-window boundaries. Do not apply the live DVR full-window
+        # guard or wait-until-song-end logic.
+        track_payload["is_xtra_capture"] = True
+        track_payload["preserve_duration"] = True
 
     background_tasks.add_task(
         _download_capture_and_add_to_playlist,

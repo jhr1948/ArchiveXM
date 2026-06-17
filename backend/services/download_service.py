@@ -387,6 +387,195 @@ class DownloadService:
         finally:
             db.close()
     
+
+    async def _local_xtra_playlist_text(self, xtra_track: Dict, temp_dir: Path) -> str:
+        """Build a standalone XTRA playlist for ffmpeg without using live proxy routes.
+
+        The earlier proxy-based capture path could interfere with active XTRA
+        playback. This safer path keeps capture isolated: segment URLs remain
+        direct SiriusXM URLs, while decryption keys are fetched once by
+        ArchiveXM and written to temporary local key files for ffmpeg.
+        """
+        import base64
+        import json
+        import re
+        import httpx
+
+        playlist_text = xtra_track.get("playlist_text") or ""
+        base_url = xtra_track.get("base_url") or ""
+        path_dir = xtra_track.get("path_dir") or ""
+        bearer = xtra_track.get("bearer") or ""
+
+        def absolute_url(value: str) -> str:
+            value = str(value or "").strip()
+            if not value:
+                return value
+            if value.startswith(("http://", "https://")):
+                return value
+            return f"{base_url}{path_dir}{value}"
+
+        key_cache = {}
+
+        async def fetch_key_to_file(key_url: str) -> str:
+            if key_url in key_cache:
+                return key_cache[key_url]
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "*/*",
+            }
+            if bearer:
+                headers["Authorization"] = f"Bearer {bearer}"
+
+            async with httpx.AsyncClient() as client:
+                response = await client.get(key_url, headers=headers, timeout=20)
+
+            if response.status_code != 200:
+                raise Exception(f"XTRA key fetch failed status={response.status_code}")
+
+            content = response.content
+            content_type = response.headers.get("content-type", "")
+
+            # SiriusXM key endpoints commonly return JSON {"key":"base64..."};
+            # ffmpeg needs the raw 16-byte AES key.
+            if "json" in content_type.lower() or content.strip().startswith(b"{"):
+                try:
+                    data = json.loads(content.decode("utf-8"))
+                    if isinstance(data, dict) and data.get("key"):
+                        content = base64.b64decode(data["key"])
+                except Exception as e:
+                    raise Exception(f"XTRA key JSON decode failed: {e}")
+
+            if not content:
+                raise Exception("XTRA key fetch returned empty content")
+
+            key_path = temp_dir / f"xtra_key_{len(key_cache)}.bin"
+            key_path.write_bytes(content)
+            key_cache[key_url] = str(key_path)
+            return str(key_path)
+
+        out = []
+        for raw_line in playlist_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if line.startswith("#EXT-X-KEY"):
+                match = re.search(r'URI="([^"]+)"', line)
+                if match:
+                    key_url = absolute_url(match.group(1))
+                    local_key = await fetch_key_to_file(key_url)
+                    line = re.sub(r'URI="([^"]+)"', f'URI="{local_key}"', line)
+                out.append(line)
+                continue
+
+            if line.startswith("#"):
+                out.append(line)
+                continue
+
+            out.append(absolute_url(line))
+
+        if not any(line.strip() == "#EXT-X-ENDLIST" for line in out):
+            out.append("#EXT-X-ENDLIST")
+
+        return "\n".join(out) + "\n"
+
+    async def download_xtra_track(
+        self,
+        download_id: int,
+        channel_id: str,
+        track: Dict,
+        download_path: str,
+    ) -> bool:
+        """Download a full XTRA track from ArchiveXM's active XTRA FULL playlist.
+
+        XTRA items are not linear DVR history entries, so timestamp-based HLS
+        filtering is the wrong tool. The XTRA proxy already holds a FULL media
+        playlist for the active item; this method remuxes that item into an M4A,
+        tags it, and lets the capture-current background task import/add it.
+        """
+        from database import SessionLocal, Download, Channel
+
+        db = SessionLocal()
+        download_record = db.query(Download).filter(Download.id == download_id).first()
+
+        try:
+            print(f"📥 Starting XTRA capture: {track.get('artist', 'Unknown')} - {track.get('title', 'Unknown')}")
+            if download_record:
+                download_record.status = "downloading"
+                db.commit()
+
+            xtra_track = track.get("_xtra_track") or {}
+            playlist_text = xtra_track.get("playlist_text") or ""
+            if not playlist_text:
+                raise Exception("No active XTRA media playlist available for capture")
+
+            channel_record = db.query(Channel).filter(Channel.channel_id == channel_id).first()
+            station_name = self._sanitize_filename(channel_record.name if channel_record else "XTRA")
+
+            try:
+                ts = track.get("timestamp_utc") or datetime.utcnow().isoformat()
+                track_date = datetime.fromisoformat(str(ts).replace('Z', '+00:00'))
+                date_folder = track_date.strftime("%Y-%m-%d")
+            except Exception:
+                date_folder = datetime.utcnow().strftime("%Y-%m-%d")
+
+            safe_artist = self._sanitize_filename(track.get("artist") or "Unknown")
+            safe_title = self._sanitize_filename(track.get("title") or "Unknown")
+            output_dir = Path(download_path) / station_name / date_folder
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_file = output_dir / f"{safe_artist} - {safe_title}.m4a"
+
+            temp_dir = Path(tempfile.mkdtemp())
+            try:
+                m3u8_file = temp_dir / "xtra_capture.m3u8"
+                m3u8_file.write_text(await self._local_xtra_playlist_text(xtra_track, temp_dir))
+
+                # Do not pass -headers here. For encrypted HLS ffmpeg opens
+                # segments through the crypto protocol, and http-only header
+                # options can get forwarded to crypto and fail with
+                # "Option not found" after the local key is opened. The isolated
+                # playlist already contains direct media URLs and local key files.
+                ffmpeg_cmd = [
+                    "ffmpeg", "-y",
+                    "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+                    "-allowed_extensions", "ALL",
+                    "-i", str(m3u8_file),
+                    "-c:a", "aac",
+                    "-b:a", "256k",
+                    "-movflags", "+faststart",
+                    str(output_file),
+                ]
+                print(f"   FFmpeg XTRA: {' '.join(ffmpeg_cmd[-8:])}")
+                result = subprocess.run(ffmpeg_cmd, capture_output=True)
+                if result.returncode != 0 or not output_file.exists():
+                    err = result.stderr.decode(errors="ignore")[-1200:]
+                    raise Exception(f"ffmpeg XTRA capture failed: {err}")
+
+                await self._add_metadata(output_file, track, track.get("image_url"))
+
+                file_size = output_file.stat().st_size if output_file.exists() else 0
+                if download_record:
+                    download_record.file_path = str(output_file)
+                    download_record.file_size = file_size
+                    download_record.status = "completed"
+                    db.commit()
+
+                print(f"   ✅ XTRA downloaded: {output_file}")
+                return True
+            finally:
+                if temp_dir.exists():
+                    shutil.rmtree(temp_dir)
+
+        except Exception as e:
+            print(f"   ❌ XTRA download error: {e}")
+            if download_record:
+                download_record.status = f"failed: {str(e)[:100]}"
+                db.commit()
+            return False
+        finally:
+            db.close()
+
     async def download_bulk(
         self,
         download_ids: List[int],

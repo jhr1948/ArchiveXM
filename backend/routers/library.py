@@ -1176,15 +1176,30 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
         return response.json().get("recordings") or []
 
     recordings_by_id: Dict[str, Dict[str, Any]] = {}
+    lookup_errors: List[str] = []
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
         for query in query_attempts:
-            found = await run_query(client, query)
+            try:
+                found = await run_query(client, query)
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code if e.response is not None else "unknown"
+                lookup_errors.append(f"{status} for {query}")
+                print(f"Metadata lookup warning: MusicBrainz query failed status={status} query={query}")
+                continue
+            except httpx.HTTPError as e:
+                lookup_errors.append(str(e)[:160])
+                print(f"Metadata lookup warning: MusicBrainz query failed query={query}: {e}")
+                continue
+
             for recording in found:
                 rid = recording.get("id") or json.dumps(recording, sort_keys=True)[:80]
                 if rid not in recordings_by_id:
                     recordings_by_id[rid] = recording
             if len(recordings_by_id) >= 40:
                 break
+
+    if lookup_errors and not recordings_by_id:
+        print(f"Metadata lookup: all MusicBrainz attempts failed or returned no usable recordings; first error={lookup_errors[0]}")
 
     candidates: List[Dict[str, Any]] = []
     seen = set()
@@ -1297,6 +1312,56 @@ async def _save_track_cover_from_url(db: DBSession, track: LocalTrack, cover_url
     cover_path.write_bytes(response.content)
     track.cover_art_path = str(cover_path)
     return str(cover_path)
+
+
+async def _cover_art_archive_best_url(release_id: str | None) -> str | None:
+    """Return the best Cover Art Archive image URL for a MusicBrainz release.
+
+    The simple /front-250 alias is convenient for previews, but some releases
+    do not expose that alias even though the JSON endpoint has usable images.
+    This fallback prefers front images, then the first available thumbnail/image.
+    """
+    release_id = (release_id or "").strip()
+    if not release_id:
+        return None
+
+    url = f"https://coverartarchive.org/release/{release_id}"
+    headers = {
+        "User-Agent": "ArchiveXM/1.0 (cover art lookup; local user initiated)",
+        "Accept": "application/json,*/*",
+    }
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+        response = await client.get(url, headers=headers)
+
+    if response.status_code >= 400:
+        return None
+
+    try:
+        data = response.json()
+    except Exception:
+        return None
+
+    images = data.get("images") or []
+    if not isinstance(images, list) or not images:
+        return None
+
+    def pick_url(image: dict) -> str | None:
+        if not isinstance(image, dict):
+            return None
+        thumbs = image.get("thumbnails") or {}
+        for key in ("large", "500", "250", "small"):
+            value = thumbs.get(key) if isinstance(thumbs, dict) else None
+            if value:
+                return value
+        return image.get("image")
+
+    front_images = [img for img in images if isinstance(img, dict) and img.get("front")]
+    for image in front_images + images:
+        value = pick_url(image)
+        if value:
+            return value
+    return None
+
 
 # ============ Library Scanning ============
 
@@ -1590,9 +1655,28 @@ async def apply_track_metadata(
         track.album = str(request.album).strip() or None
 
     cover_error = None
+    cover_attempts = []
     if request.cover_url:
+        cover_attempts.append(request.cover_url)
+
+    # If the preview/front alias fails or was not present, fall back to Cover
+    # Art Archive's JSON endpoint for the selected MusicBrainz release. This
+    # often finds art even when /front-250 is unavailable.
+    fallback_cover = None
+    if request.release_id:
         try:
-            await _save_track_cover_from_url(db, track, request.cover_url)
+            fallback_cover = await _cover_art_archive_best_url(request.release_id)
+        except Exception as e:
+            print(f"Metadata apply: cover art archive fallback lookup failed for track {track.id}: {e}")
+    if fallback_cover and fallback_cover not in cover_attempts:
+        cover_attempts.append(fallback_cover)
+
+    for cover_url in cover_attempts:
+        try:
+            saved = await _save_track_cover_from_url(db, track, cover_url)
+            if saved:
+                cover_error = None
+                break
         except Exception as e:
             cover_error = str(e)
             print(f"Metadata apply: cover download failed for track {track.id}: {e}")

@@ -62,7 +62,7 @@ function ChannelDetailPage() {
     }
 
     loadXtraQueue()
-    const interval = setInterval(loadXtraQueue, 5000)
+    const interval = setInterval(loadXtraQueue, 3000)
     return () => {
       cancelled = true
       clearInterval(interval)
@@ -224,6 +224,12 @@ function ChannelDetailPage() {
     setNewPlaylistName('')
   }
 
+  const openAddXtraQueueToPlaylist = (track, label = 'XTRA') => {
+    if (!track) return
+    setPlaylistTarget({ type: 'xtraQueue', track, label })
+    setNewPlaylistName('')
+  }
+
   const closePlaylistModal = () => {
     if (playlistActionLoading) return
     setPlaylistTarget(null)
@@ -235,7 +241,35 @@ function ChannelDetailPage() {
 
     setPlaylistActionLoading(true)
     try {
-      if (playlistTarget.type === 'selected') {
+      if (playlistTarget.type === 'xtraQueue') {
+        let targetPlaylistId = playlistPayload?.playlist_id
+
+        if (!targetPlaylistId && playlistPayload?.playlist_name) {
+          const created = await libraryApi.createPlaylist(playlistPayload.playlist_name)
+          targetPlaylistId = created?.data?.id
+        }
+
+        if (!targetPlaylistId) {
+          throw new Error('Missing playlist id for XTRA queue capture')
+        }
+
+        const track = playlistTarget.track || {}
+        await libraryApi.captureCurrentToPlaylist(targetPlaylistId, {
+          channel_id: channelId,
+          channel_type: 'channel-xtra',
+          source: 'archivexm-xtra-queue',
+          track: {
+            artist: track.artist || '',
+            title: track.title || '',
+            album: track.album || '',
+            duration_ms: track.durationMs || track.duration_ms || 0,
+            started_at_ms: track.startedAtMs || track.started_at_ms || null,
+            image_url: track.imageUrl || track.image_url || null
+          }
+        })
+
+        alert(`Queued ${track.artist || 'Unknown'} - ${track.title || 'Unknown'} for playlist capture.`)
+      } else if (playlistTarget.type === 'selected') {
         const tracksToDownload = Array.from(selectedTracks).map(index => buildTrackPayload(schedule.tracks[index]))
         await downloadsApi.downloadBulk(channelId, tracksToDownload, playlistPayload)
         setSelectedTracks(new Set())
@@ -260,7 +294,7 @@ function ChannelDetailPage() {
       setNewPlaylistName('')
     } catch (error) {
       console.error('Download to playlist error:', error)
-      alert('Download + playlist failed. Please try again.')
+      alert(playlistTarget.type === 'xtraQueue' ? 'XTRA queue capture failed. Please try again.' : 'Download + playlist failed. Please try again.')
     } finally {
       setPlaylistActionLoading(false)
     }
@@ -301,7 +335,7 @@ function ChannelDetailPage() {
     return `${mins}:${secs.toString().padStart(2, '0')}`
   }
 
-  const XtraQueueRow = ({ label, track, muted = false }) => {
+  const XtraQueueRow = ({ label, track, muted = false, canAdd = false }) => {
     if (!track) return null
     return (
       <div className={`flex items-center gap-3 p-3 rounded-lg ${muted ? 'bg-sxm-darker/40' : 'bg-sxm-darker'}`}>
@@ -320,6 +354,18 @@ function ChannelDetailPage() {
           <p className="text-white font-medium truncate">{track.title || 'Unknown title'}</p>
           <p className="text-gray-400 text-sm truncate">{track.artist || 'Unknown artist'}{track.album ? ` • ${track.album}` : ''}</p>
         </div>
+        {canAdd && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              openAddXtraQueueToPlaylist(track, label)
+            }}
+            className="p-2 rounded-lg transition-colors hover:bg-sxm-accent/20 text-gray-400 hover:text-sxm-accent shrink-0"
+            title={`Add ${label.toLowerCase()} XTRA song to playlist`}
+          >
+            <ListPlus className="w-5 h-5" />
+          </button>
+        )}
       </div>
     )
   }
@@ -476,11 +522,11 @@ function ChannelDetailPage() {
           {xtraQueue?.hasActiveQueue && (
             <div className="space-y-3">
               {xtraQueue.previous && <XtraQueueRow label="Previous" track={xtraQueue.previous} muted />}
-              <XtraQueueRow label="Now" track={xtraQueue.current || currentTrack} />
+              <XtraQueueRow label="Now" track={xtraQueue.current || currentTrack} canAdd />
               {xtraQueue.upcoming?.length > 0 ? (
                 <div className="space-y-2">
                   {xtraQueue.upcoming.map((track, idx) => (
-                    <XtraQueueRow key={`${track.trackId || track.title}-${idx}`} label={idx === 0 ? 'Coming Up' : `Up Next ${idx + 1}`} track={track} muted />
+                    <XtraQueueRow key={`${track.trackId || track.title}-${idx}`} label={idx === 0 ? 'Coming Up' : `Up Next ${idx + 1}`} track={track} muted canAdd />
                   ))}
                 </div>
               ) : (
@@ -691,11 +737,13 @@ function ChannelDetailPage() {
           <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-md shadow-2xl">
             <div className="flex items-start justify-between gap-4 mb-4">
               <div>
-                <h3 className="text-xl font-bold text-white">Download + Add to Playlist</h3>
+                <h3 className="text-xl font-bold text-white">{playlistTarget.type === 'xtraQueue' ? 'Add XTRA Song to Playlist' : 'Download + Add to Playlist'}</h3>
                 <p className="text-gray-400 text-sm mt-1">
                   {playlistTarget.type === 'selected'
                     ? `${selectedTracks.size} selected track${selectedTracks.size === 1 ? '' : 's'}`
-                    : `${playlistTarget.track?.artist || 'Unknown'} - ${playlistTarget.track?.title || 'Unknown'}`}
+                    : playlistTarget.type === 'xtraQueue'
+                      ? `${playlistTarget.label || 'XTRA'}: ${playlistTarget.track?.artist || 'Unknown'} - ${playlistTarget.track?.title || 'Unknown'}`
+                      : `${playlistTarget.track?.artist || 'Unknown'} - ${playlistTarget.track?.title || 'Unknown'}`}
                 </p>
               </div>
               <button

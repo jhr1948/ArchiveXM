@@ -886,13 +886,15 @@ async def _ensure_xtra_queue(channel_id: str, session_info: dict, requested_path
     cached["last_access"] = now
 
     # Keep a small look-ahead queue so the XTRA Queue UI can show
-    # a few upcoming items without changing playback. This still appends
-    # lazily as the player accesses the proxy, so it should not hammer SXM.
+    # a deeper look-ahead buffer without changing playback. This still appends
+    # lazily as the player accesses the proxy/queue UI, so it should not hammer SXM.
+    # Keep several tracks ready because some HLS clients do not reliably reload
+    # the EVENT playlist exactly at every XTRA song boundary.
     total_segments = sum(len(track.get("segments") or []) for track in cached.get("tracks", []))
     served_count = len(cached.get("served", set()))
     remaining = total_segments - served_count
 
-    should_append = len(cached.get("tracks", [])) < 4 or remaining <= 8
+    should_append = len(cached.get("tracks", [])) < 8 or remaining <= 30
 
     if should_append and not cached.get("append_in_progress"):
         cached["append_in_progress"] = True
@@ -924,6 +926,55 @@ async def _ensure_xtra_queue(channel_id: str, session_info: dict, requested_path
             cached["append_in_progress"] = False
 
     return cached
+
+
+async def _refresh_xtra_lookahead(channel_id: str, session_info: dict | None = None):
+    """Refresh/prefetch the known XTRA queue without changing playback.
+
+    HLS players can buffer ahead and may not reload the media playlist often
+    enough after the first stitched playlist response. This helper lets segment
+    requests and the Queue UI keep the lookahead warm so playback can continue
+    beyond the first couple of XTRA items and the UI can show Coming Up.
+    """
+    cached = _xtra_sessions.get(channel_id)
+    if not cached:
+        return None
+
+    if session_info is None:
+        session_info = _stream_sessions.get(channel_id)
+    if not session_info:
+        return cached
+
+    active_path = cached.get("active_path")
+    tracks = cached.get("tracks") or []
+    initial_text = tracks[0].get("playlist_text") if tracks else None
+    if not active_path or not initial_text:
+        return cached
+
+    try:
+        return await _ensure_xtra_queue(
+            channel_id=channel_id,
+            session_info=session_info,
+            requested_path=active_path,
+            initial_playlist_text=initial_text,
+        )
+    except Exception as e:
+        print(f"⚠️ XTRA lookahead refresh failed channel={channel_id}: {e}")
+        return cached
+
+
+def _schedule_xtra_lookahead_refresh(channel_id: str, session_info: dict | None = None):
+    """Fire-and-forget lookahead refresh used by segment/resource proxy routes."""
+    cached = _xtra_sessions.get(channel_id)
+    if not cached or cached.get("append_in_progress"):
+        return
+
+    try:
+        import asyncio
+        asyncio.create_task(_refresh_xtra_lookahead(channel_id, session_info))
+    except RuntimeError:
+        # No running loop; ignore. Queue endpoint/manual refresh can still append.
+        return
 
 
 
@@ -1038,11 +1089,15 @@ def _xtra_queue_snapshot(channel_id: str) -> dict:
     current_track = tracks[current_index] if tracks else None
     current_identity = _xtra_track_identity(current_track)
 
-    # Previous is only the one-track Back item we explicitly store for XTRA
-    # previous/back support. Do not infer Previous from served segments, because
-    # that causes duplicates and premature advancement in the UI.
+    # Prefer the explicit one-track Back item stored by Next/Previous controls.
+    # During normal continuous playback, expose the naturally completed item
+    # immediately before Now so the Queue card keeps a useful Previous row.
     manual_previous = _xtra_previous_tracks.get(channel_id)
     previous_track = manual_previous if _xtra_track_identity(manual_previous) != current_identity else None
+    if not previous_track and current_index > 0 and current_index - 1 < len(tracks):
+        candidate_previous = tracks[current_index - 1]
+        if _xtra_track_identity(candidate_previous) != current_identity:
+            previous_track = candidate_previous
 
     upcoming_tracks = []
     seen = {current_identity}
@@ -1086,6 +1141,11 @@ async def xtra_queue(channel_id: str, db: DBSession = Depends(get_db)):
 
     if get_channel_type(channel_id, db) != "channel-xtra":
         raise HTTPException(status_code=400, detail="XTRA queue is only supported for XTRA channels")
+
+    # The Queue card polls this endpoint while an XTRA channel is playing. Use
+    # that poll to keep ArchiveXM's stitched XTRA lookahead warm so playback can
+    # continue past the currently buffered items and Coming Up stays populated.
+    await _refresh_xtra_lookahead(channel_id)
 
     payload = _xtra_queue_snapshot(channel_id)
     payload["requestedChannelId"] = requested_channel_id
@@ -1430,6 +1490,7 @@ async def hls_proxy(channel_id: str, path: str, db: DBSession = Depends(get_db))
                 if cached:
                     served = cached.setdefault("served", set())
                     served.add(_extract_xtra_segment_key(path))
+                    _schedule_xtra_lookahead_refresh(channel_id, stream_info)
 
             # If this is an XTRA FULL media playlist, serve an ongoing EVENT
             # playlist instead of the finite playlist ending in EXT-X-ENDLIST.
@@ -1536,6 +1597,7 @@ async def hls_xtra_resource_proxy(channel_id: str, encoded_url: str, db: DBSessi
     if cached and _is_audio_segment_path(absolute_url):
         served = cached.setdefault("served", set())
         served.add(_extract_xtra_segment_key(absolute_url))
+        _schedule_xtra_lookahead_refresh(channel_id)
 
     try:
         headers = {

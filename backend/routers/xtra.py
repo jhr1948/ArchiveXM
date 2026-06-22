@@ -8,6 +8,7 @@ Register in backend/main.py with:
 Routes:
     GET      /listen/{channel_id}
     GET/POST /xtra/{channel_id}/next
+    GET/POST /xtra/{channel_id}/resume
     GET/POST /xtra/{channel_id}/previous
     GET/POST /xtra/{channel_id}/back
     GET      /metadata/{channel_id}
@@ -213,6 +214,44 @@ async def _legacy_next_response(channel_id: str, db: DBSession) -> JSONResponse:
 @router.post("/xtra/{channel_id}/next")
 async def legacy_xtra_next(channel_id: str, db: DBSession = Depends(get_db)):
     return await _legacy_next_response(channel_id, db)
+
+
+
+async def _legacy_resume_response(channel_id: str, db: DBSession) -> JSONResponse:
+    response = await streams.xtra_resume(channel_id, db)
+
+    try:
+        payload = json.loads(response.body.decode("utf-8"))
+    except Exception:
+        payload = {
+            "ok": False,
+            "action": "error",
+            "direction": "resume",
+            "channelId": channel_id,
+            "message": "Unable to resume XTRA queue item.",
+        }
+
+    resolved_channel_id = payload.get("channelId") or channel_id
+    stream_url = payload.get("streamUrl") or f"/api/streams/{resolved_channel_id}/proxy-stream"
+    listen_url = f"/listen/{resolved_channel_id}"
+
+    payload["listenUrl"] = listen_url
+    payload["streamUrl"] = stream_url
+    payload["metadataUrl"] = f"/metadata/{resolved_channel_id}"
+    payload["legacyRoute"] = True
+
+    return JSONResponse(
+        content=payload,
+        status_code=response.status_code,
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
+@router.get("/xtra/{channel_id}/resume")
+@router.post("/xtra/{channel_id}/resume")
+async def legacy_xtra_resume(channel_id: str, db: DBSession = Depends(get_db)):
+    return await _legacy_resume_response(channel_id, db)
+
 
 
 async def _legacy_previous_response(channel_id: str, db: DBSession) -> JSONResponse:

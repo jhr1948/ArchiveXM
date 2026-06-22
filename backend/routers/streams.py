@@ -837,16 +837,21 @@ async def _ensure_xtra_queue(channel_id: str, session_info: dict, requested_path
             return None
 
         # Manual Next requests prefetch a fresh XTRA item and place it here.
-        # The next player reload consumes it exactly once so playback starts
-        # with the skipped-to item instead of the normal tuneSource result.
+        # Natural resume can also pass the remaining already-prefetched queue.
+        # The next player reload consumes this exactly once so playback starts
+        # with the intended item without throwing away the original Coming Up list.
         manual_start = _xtra_manual_start.pop(channel_id, None)
-        first_track = manual_start.get("track") if manual_start else None
-
+        manual_tracks = []
         if manual_start:
+            manual_tracks = [track for track in (manual_start.get("tracks") or []) if track and track.get("segments")]
+            if not manual_tracks and manual_start.get("track"):
+                manual_tracks = [manual_start.get("track")]
             if manual_start.get("source_context_id"):
                 session_info["source_context_id"] = manual_start.get("source_context_id")
             if manual_start.get("sequence_token"):
                 session_info["sequence_token"] = manual_start.get("sequence_token")
+
+        first_track = manual_tracks[0] if manual_tracks else None
 
         # Initial tuneSource can represent the current/resumed XTRA item and
         # may be near its end. Use its continuity context to start the local
@@ -863,14 +868,20 @@ async def _ensure_xtra_queue(channel_id: str, session_info: dict, requested_path
         if not first_track:
             first_track = _track_from_playlist(requested_path, initial_playlist_text, session_info.get("base_url", ""))
 
-        if first_track.get("source_context_id"):
-            session_info["source_context_id"] = first_track.get("source_context_id")
-        if first_track.get("sequence_token"):
-            session_info["sequence_token"] = first_track.get("sequence_token")
+        start_tracks = manual_tracks if manual_tracks else [first_track]
+
+        # Continue SiriusXM lookahead from the last preserved queued item, not
+        # from the first resumed item. Otherwise a resume at song 3 can replace
+        # the original song 4/5 list with a new branch immediately.
+        continuity_track = start_tracks[-1]
+        if continuity_track.get("source_context_id"):
+            session_info["source_context_id"] = continuity_track.get("source_context_id")
+        if continuity_track.get("sequence_token"):
+            session_info["sequence_token"] = continuity_track.get("sequence_token")
 
         cached = {
             "active_path": requested_path,
-            "tracks": [first_track],
+            "tracks": start_tracks,
             "served": set(),
             "created": now,
             "last_access": now,
@@ -880,21 +891,41 @@ async def _ensure_xtra_queue(channel_id: str, session_info: dict, requested_path
         print(
             f"🎧 XTRA queue started channel={channel_id} "
             f"method={first_track.get('method', 'initial')} "
-            f"segments={len(first_track['segments'])}"
+            f"tracks={len(start_tracks)} "
+            f"segments={sum(len(track.get('segments') or []) for track in start_tracks)}"
         )
 
     cached["last_access"] = now
 
     # Keep a small look-ahead queue so the XTRA Queue UI can show
-    # a deeper look-ahead buffer without changing playback. This still appends
-    # lazily as the player accesses the proxy/queue UI, so it should not hammer SXM.
-    # Keep several tracks ready because some HLS clients do not reliably reload
-    # the EVENT playlist exactly at every XTRA song boundary.
-    total_segments = sum(len(track.get("segments") or []) for track in cached.get("tracks", []))
+    # a few upcoming items without changing playback. This still appends
+    # lazily as the player accesses the proxy, so it should not hammer SXM.
+    tracks = cached.get("tracks", [])
+    total_segments = sum(len(track.get("segments") or []) for track in tracks)
     served_count = len(cached.get("served", set()))
     remaining = total_segments - served_count
 
-    should_append = len(cached.get("tracks", [])) < 8 or remaining <= 30
+    # Keep the stitched queue warm well before it reaches the last item.
+    # Waiting until only a handful of segments remain causes the UI to show
+    # "one song left" and risks a player stall before the next SXM lookahead
+    # branch is available. Use wall-clock progress, matching /metadata and
+    # /xtra/queue, to estimate how many prefetched items are still ahead.
+    current_index_for_append = 0
+    try:
+        elapsed_ms = max(0, int((now - float(cached.get("created") or now)) * 1000))
+        offset_ms = 0
+        for idx, track in enumerate(tracks):
+            duration_ms = max(1, _xtra_duration_ms_for_track(track))
+            if elapsed_ms < offset_ms + duration_ms:
+                current_index_for_append = idx
+                break
+            current_index_for_append = idx
+            offset_ms += duration_ms
+    except Exception:
+        current_index_for_append = 0
+
+    upcoming_count = max(0, len(tracks) - current_index_for_append - 1)
+    should_append = len(tracks) < 7 or upcoming_count <= 3 or remaining <= 40
 
     if should_append and not cached.get("append_in_progress"):
         cached["append_in_progress"] = True
@@ -1089,15 +1120,20 @@ def _xtra_queue_snapshot(channel_id: str) -> dict:
     current_track = tracks[current_index] if tracks else None
     current_identity = _xtra_track_identity(current_track)
 
-    # Prefer the explicit one-track Back item stored by Next/Previous controls.
-    # During normal continuous playback, expose the naturally completed item
-    # immediately before Now so the Queue card keeps a useful Previous row.
-    manual_previous = _xtra_previous_tracks.get(channel_id)
-    previous_track = manual_previous if _xtra_track_identity(manual_previous) != current_identity else None
-    if not previous_track and current_index > 0 and current_index - 1 < len(tracks):
+    # During normal continuous playback, prefer the naturally completed item
+    # immediately before Now. The explicit one-track Back item is only a
+    # fallback for fresh resume/manual-skip queues where the prior song is not
+    # part of the preserved tail. Otherwise Previous could get stuck on the
+    # resume-time item while Now advances through later queued songs.
+    previous_track = None
+    if current_index > 0 and current_index - 1 < len(tracks):
         candidate_previous = tracks[current_index - 1]
         if _xtra_track_identity(candidate_previous) != current_identity:
             previous_track = candidate_previous
+
+    manual_previous = _xtra_previous_tracks.get(channel_id)
+    if not previous_track and _xtra_track_identity(manual_previous) != current_identity:
+        previous_track = manual_previous
 
     upcoming_tracks = []
     seen = {current_identity}
@@ -1198,6 +1234,84 @@ async def xtra_next(channel_id: str, db: DBSession = Depends(get_db)):
         # Keep bearer current in case the session was created before a token refresh.
         stream_info["bearer"] = session.bearer_token
 
+    # Prefer the already-built ArchiveXM queue for manual Next. Calling SiriusXM
+    # tuneSource/peek here creates a fresh branch, so the UI appears to jump to a
+    # new queue instead of the displayed Coming Up song. If the current Queue card
+    # already has a next item, consume that queued item and preserve its tail.
+    try:
+        await _refresh_xtra_lookahead(channel_id, stream_info)
+    except Exception as e:
+        print(f"⚠️ XTRA manual next queue refresh failed channel={channel_id}: {e}")
+
+    cached = _xtra_sessions.get(channel_id)
+    queued_tracks = cached.get("tracks") if cached else None
+    if queued_tracks:
+        current_index = None
+        try:
+            snapshot = _xtra_queue_snapshot(channel_id)
+            current = snapshot.get("current") or {}
+            idx = current.get("index")
+            if idx is not None:
+                current_index = int(idx)
+        except Exception:
+            current_index = None
+
+        if current_index is None:
+            try:
+                current_index = _xtra_first_unserved_track_index(cached)
+            except Exception:
+                current_index = None
+
+        if current_index is None:
+            current_index = 0
+
+        queued_next_index = current_index + 1
+        if 0 <= queued_next_index < len(queued_tracks):
+            previous_track = queued_tracks[current_index] if current_index < len(queued_tracks) else None
+            next_track = queued_tracks[queued_next_index]
+            if previous_track and previous_track.get("segments"):
+                _xtra_previous_tracks[channel_id] = previous_track
+
+            preserved_tracks = [track for track in queued_tracks[queued_next_index:] if track and track.get("segments")]
+            if not preserved_tracks:
+                preserved_tracks = [next_track]
+            tail_context = preserved_tracks[-1]
+
+            if tail_context.get("source_context_id"):
+                stream_info["source_context_id"] = tail_context.get("source_context_id")
+            if tail_context.get("sequence_token"):
+                stream_info["sequence_token"] = tail_context.get("sequence_token")
+
+            _xtra_sessions.pop(channel_id, None)
+            _xtra_manual_start[channel_id] = {
+                "track": next_track,
+                "tracks": preserved_tracks,
+                "source_context_id": tail_context.get("source_context_id") or next_track.get("source_context_id"),
+                "sequence_token": tail_context.get("sequence_token") or next_track.get("sequence_token"),
+            }
+
+            print(
+                f"⏭️ XTRA manual next used queued item channel={channel_id} "
+                f"from_index={current_index} to_index={queued_next_index} "
+                f"preserved_tracks={len(preserved_tracks)}"
+            )
+
+            stream_url = f"/api/streams/{channel_id}/proxy-stream"
+            return JSONResponse(
+                content={
+                    "ok": True,
+                    "action": "reload",
+                    "direction": "next",
+                    "channelId": channel_id,
+                    "requestedChannelId": requested_channel_id,
+                    "streamUrl": stream_url,
+                    "metadata": _public_xtra_metadata_from_track(next_track, channel_id),
+                    "availableBackwardSkips": 1,
+                    "message": "Advanced to the next queued XTRA item.",
+                },
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
     previous_track = _get_current_xtra_track_for_previous(channel_id)
 
     next_track = await _fetch_xtra_256k_track(
@@ -1243,6 +1357,158 @@ async def xtra_next(channel_id: str, db: DBSession = Depends(get_db)):
             "metadata": _public_xtra_metadata_from_track(next_track, channel_id),
             "availableBackwardSkips": 1 if channel_id in _xtra_previous_tracks else 0,
             "message": "Stop/flush the current player buffer, then reload streamUrl.",
+        },
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
+
+
+def _xtra_first_unserved_track_index(cached: dict) -> int | None:
+    """Return the first queued XTRA track that the player has not fully consumed.
+
+    The browser sometimes reaches the end of the originally loaded HLS EVENT
+    playlist even though ArchiveXM has already appended more tracks server-side.
+    When that happens, resume should restart playback from the first queued item
+    whose segments have not all been requested yet, instead of calling SiriusXM
+    Next and accidentally skipping over it.
+    """
+    tracks = cached.get("tracks") or []
+    served = cached.get("served") or set()
+
+    for index, track in enumerate(tracks):
+        segment_names = track.get("segment_names") or []
+        if not segment_names:
+            continue
+
+        remaining = [name for name in segment_names if name not in served]
+        if remaining:
+            return index
+
+    return None
+
+
+@router.get("/{channel_id}/xtra/resume")
+@router.post("/{channel_id}/xtra/resume")
+async def xtra_resume(channel_id: str, db: DBSession = Depends(get_db)):
+    """Resume XTRA playback from the already queued next item after natural HLS end.
+
+    This is different from manual Next. It does not ask SiriusXM for a new skip.
+    It consumes the next unserved item from ArchiveXM's stitched queue, which
+    avoids the double-advance behavior seen when the frontend called /next at
+    natural song boundaries.
+    """
+    from fastapi.responses import JSONResponse
+
+    requested_channel_id = channel_id
+    channel_id = resolve_channel_id(channel_id, db)
+
+    if get_channel_type(channel_id, db) != "channel-xtra":
+        raise HTTPException(status_code=400, detail="Resume is only supported for XTRA channels")
+
+    cached = _xtra_sessions.get(channel_id)
+    if not cached or not cached.get("tracks"):
+        return JSONResponse(
+            status_code=404,
+            content={
+                "ok": False,
+                "action": "unavailable",
+                "direction": "resume",
+                "channelId": channel_id,
+                "requestedChannelId": requested_channel_id,
+                "message": "No active XTRA queue is available to resume.",
+            },
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+    tracks = cached.get("tracks") or []
+
+    # Do NOT use the served-segment set as the primary resume cursor. hls.js may
+    # prefetch large chunks of the next queued item before the listener actually
+    # hears it, which made resume treat the audible next song as already consumed
+    # and jump ahead again. The Queue/metadata model is based on wall-clock
+    # position in ArchiveXM's stitched queue, so use the same current index here.
+    resume_index = None
+    try:
+        snapshot = _xtra_queue_snapshot(channel_id)
+        current = snapshot.get("current") or {}
+        idx = current.get("index")
+        if idx is not None:
+            resume_index = int(idx)
+    except Exception:
+        resume_index = None
+
+    if resume_index is None or resume_index < 0 or resume_index >= len(tracks):
+        resume_index = _xtra_first_unserved_track_index(cached)
+
+    if resume_index is None or resume_index >= len(tracks):
+        return JSONResponse(
+            status_code=404,
+            content={
+                "ok": False,
+                "action": "unavailable",
+                "direction": "resume",
+                "channelId": channel_id,
+                "requestedChannelId": requested_channel_id,
+                "message": "No unplayed XTRA queue item is available to resume.",
+            },
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+    resume_track = tracks[resume_index]
+    previous_track = tracks[resume_index - 1] if resume_index > 0 else None
+
+    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+    if not session:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    stream_info = _stream_sessions.get(channel_id) or {}
+    stream_info["bearer"] = session.bearer_token
+    if resume_track.get("source_context_id"):
+        stream_info["source_context_id"] = resume_track.get("source_context_id")
+    if resume_track.get("sequence_token"):
+        stream_info["sequence_token"] = resume_track.get("sequence_token")
+    _stream_sessions[channel_id] = stream_info
+
+    if previous_track:
+        _xtra_previous_tracks[channel_id] = previous_track
+
+    # Force the next proxy-stream load to begin with the queued resume item,
+    # while preserving the already-prefetched tail of the queue. The prior
+    # version only kept resume_track, so song 3 started correctly but ArchiveXM
+    # immediately generated a new song 4+ branch instead of keeping the original
+    # Coming Up items.
+    resume_tracks = [track for track in tracks[resume_index:] if track and track.get("segments")]
+    if not resume_tracks:
+        resume_tracks = [resume_track]
+
+    _xtra_sessions.pop(channel_id, None)
+    tail_context = resume_tracks[-1]
+    _xtra_manual_start[channel_id] = {
+        "track": resume_track,
+        "tracks": resume_tracks,
+        "source_context_id": tail_context.get("source_context_id") or resume_track.get("source_context_id"),
+        "sequence_token": tail_context.get("sequence_token") or resume_track.get("sequence_token"),
+    }
+
+    print(
+        f"▶️ XTRA resume prepared channel={channel_id} "
+        f"index={resume_index} preserved_tracks={len(resume_tracks)} "
+        f"segments={sum(len(track.get('segments') or []) for track in resume_tracks)}"
+    )
+
+    stream_url = f"/api/streams/{channel_id}/proxy-stream"
+    return JSONResponse(
+        content={
+            "ok": True,
+            "action": "reload",
+            "direction": "resume",
+            "channelId": channel_id,
+            "requestedChannelId": requested_channel_id,
+            "streamUrl": stream_url,
+            "metadata": _public_xtra_metadata_from_track(resume_track, channel_id),
+            "availableBackwardSkips": 1 if channel_id in _xtra_previous_tracks else 0,
+            "message": "Reload streamUrl to continue from the next queued XTRA item.",
         },
         headers={"Access-Control-Allow-Origin": "*"},
     )

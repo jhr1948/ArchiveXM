@@ -20,6 +20,7 @@ function UnifiedPlayerBar() {
   const [captureLiveOpen, setCaptureLiveOpen] = useState(false)
   const [captureLoading, setCaptureLoading] = useState(false)
   const [captureNewPlaylistName, setCaptureNewPlaylistName] = useState('')
+  const [xtraProgressTick, setXtraProgressTick] = useState(0)
 
   const loadPlaylists = async () => {
     try {
@@ -33,6 +34,29 @@ function UnifiedPlayerBar() {
   useEffect(() => {
     loadPlaylists()
   }, [])
+
+  // Lightweight XTRA progress ticker. This only affects the display bar and
+  // does not touch the HLS player or playback context, so a missing metadata
+  // field cannot crash or interrupt playback.
+  useEffect(() => {
+    if (!livePlayer.isXtra || !livePlayer.currentTrack) return
+
+    const interval = setInterval(() => {
+      setXtraProgressTick(value => value + 1)
+    }, 1000)
+
+    return () => clearInterval(interval)
+  }, [
+    livePlayer.isXtra,
+    livePlayer.currentTrack?.title,
+    livePlayer.currentTrack?.artist,
+    livePlayer.currentTrack?.duration_ms,
+    livePlayer.currentTrack?.durationMs,
+    livePlayer.currentTrack?.started_at_ms,
+    livePlayer.currentTrack?.startedAtMs,
+    livePlayer.currentTrack?.position_ms,
+    livePlayer.currentTrack?.positionMs
+  ])
 
   const createPlaylist = async () => {
     if (!newPlaylistName.trim()) return
@@ -54,10 +78,14 @@ function UnifiedPlayerBar() {
     if (!trackToAdd) return
 
     try {
-      await libraryApi.addToPlaylist(playlistId, [trackToAdd.id])
+      const addRes = await libraryApi.addToPlaylist(playlistId, [trackToAdd.id])
+      const addData = addRes?.data || {}
       setTrackToAdd(null)
       setNewPlaylistName('')
       await loadPlaylists()
+      if (addData.already_in_playlist || (addData.duplicate_count || 0) > 0) {
+        window.alert(addData.message || 'That song is already in this playlist.')
+      }
     } catch (error) {
       console.error('Error adding track to playlist:', error)
     }
@@ -107,11 +135,14 @@ function UnifiedPlayerBar() {
     try {
       setCaptureLoading(true)
       const res = await libraryApi.captureCurrentToPlaylist(playlistId, buildLiveCapturePayload())
-      const captured = res?.data?.track
+      const data = res?.data || {}
+      const captured = data.track
       setCaptureLiveOpen(false)
       setCaptureNewPlaylistName('')
       await loadPlaylists()
-      if (captured?.artist || captured?.title) {
+      if (data.message) {
+        window.alert(data.message)
+      } else if (captured?.artist || captured?.title) {
         window.alert(`Queued ${captured.artist || 'Unknown'} - ${captured.title || 'Unknown'} for playlist capture.`)
       }
     } catch (error) {
@@ -128,13 +159,15 @@ function UnifiedPlayerBar() {
     try {
       setCaptureLoading(true)
       const created = await libraryApi.createPlaylist(name)
+      let captureData = null
       if (created?.data?.id) {
-        await libraryApi.captureCurrentToPlaylist(created.data.id, buildLiveCapturePayload())
+        const res = await libraryApi.captureCurrentToPlaylist(created.data.id, buildLiveCapturePayload())
+        captureData = res?.data || null
       }
       setCaptureLiveOpen(false)
       setCaptureNewPlaylistName('')
       await loadPlaylists()
-      window.alert(`Queued current track for playlist capture: ${name}`)
+      window.alert(captureData?.message || `Queued current track for playlist capture: ${name}`)
     } catch (error) {
       console.error('Error creating playlist and capturing current track:', error)
       window.alert(error.response?.data?.detail || 'Failed to queue current track for playlist capture.')
@@ -181,6 +214,40 @@ function UnifiedPlayerBar() {
     const secs = Math.floor(seconds % 60)
     return `${mins}:${secs.toString().padStart(2, '0')}`
   }
+
+  const getXtraProgress = () => {
+    if (!livePlayer.isXtra || !livePlayer.currentTrack) return null
+
+    const track = livePlayer.currentTrack || {}
+    const durationMsRaw = track.duration_ms ?? track.durationMs
+    const durationMs = Number(durationMsRaw || 0)
+    if (!Number.isFinite(durationMs) || durationMs <= 0) return null
+
+    // Keep xtraProgressTick as a dependency so this recalculates once a second.
+    // eslint-disable-next-line no-unused-expressions
+    xtraProgressTick
+
+    const startedAtRaw = track.started_at_ms ?? track.startedAtMs
+    const startedAtMs = Number(startedAtRaw || 0)
+    let positionMs = Number(track.position_ms ?? track.positionMs ?? 0)
+
+    // startedAtMs is an epoch timestamp from the XTRA metadata endpoint when
+    // available. Prefer it so the display moves smoothly between metadata polls.
+    if (Number.isFinite(startedAtMs) && startedAtMs > 1000000000000) {
+      positionMs = Date.now() - startedAtMs
+    }
+
+    if (!Number.isFinite(positionMs) || positionMs < 0) positionMs = 0
+    if (positionMs > durationMs) positionMs = durationMs
+
+    return {
+      positionSeconds: positionMs / 1000,
+      durationSeconds: durationMs / 1000,
+      percent: Math.max(0, Math.min(100, (positionMs / durationMs) * 100))
+    }
+  }
+
+  const xtraProgress = getXtraProgress()
 
   const stopJukebox = () => {
     // clearQueue(false) forces the queue/current track to clear instead of preserving the current item.
@@ -390,7 +457,8 @@ function UnifiedPlayerBar() {
             </div>
 
             {/* Center: Controls */}
-            <div className="flex items-center gap-4">
+            <div className="flex flex-col items-center gap-2 flex-[1.2] min-w-[360px]">
+              <div className="flex items-center gap-4">
               <button
                 onClick={livePlayer.togglePlay}
                 disabled={livePlayer.isLoading}
@@ -434,6 +502,24 @@ function UnifiedPlayerBar() {
                     )}
                   </button>
                 </>
+              )}
+              </div>
+
+              {livePlayer.isXtra && xtraProgress && (
+                <div className="flex items-center gap-3 w-full max-w-xl">
+                  <span className="text-xs text-gray-500 w-10 text-right">
+                    {formatTime(xtraProgress.positionSeconds)}
+                  </span>
+                  <div className="flex-1 h-2 bg-gray-700 rounded-full overflow-hidden" title="XTRA song progress">
+                    <div
+                      className="h-full bg-white/90 rounded-full transition-all duration-500"
+                      style={{ width: `${xtraProgress.percent}%` }}
+                    />
+                  </div>
+                  <span className="text-xs text-gray-500 w-10">
+                    {formatTime(xtraProgress.durationSeconds)}
+                  </span>
+                </div>
               )}
             </div>
 

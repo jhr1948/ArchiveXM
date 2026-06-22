@@ -4,12 +4,14 @@ Downloads Router - Download tracks from DVR buffer
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from pydantic import BaseModel
 from sqlalchemy.orm import Session as DBSession
+from sqlalchemy import func
 from typing import List, Optional
 from datetime import datetime
 import os
 
-from database import get_db, Channel, Download, Session as AuthSession, Config
+from database import get_db, Channel, Download, Session as AuthSession, Config, LocalTrack, Playlist, PlaylistTrack
 from services.download_service import DownloadService
+from routers.library import _find_existing_jukebox_track
 
 router = APIRouter()
 
@@ -38,6 +40,65 @@ class DownloadResponse(BaseModel):
     message: str
     download_id: int | None = None
     file_path: str | None = None
+    already_in_jukebox: bool = False
+    already_in_playlist: bool = False
+    added_to_playlist: bool = False
+    local_track_id: int | None = None
+    playlist_id: int | None = None
+    playlist_name: str | None = None
+
+
+def _resolve_playlist_for_download(db: DBSession, playlist_id: int | None = None, playlist_name: str | None = None) -> Playlist | None:
+    playlist = None
+    if playlist_id:
+        playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+
+    target_name = (playlist_name or "").strip()
+    if not playlist and target_name:
+        playlist = db.query(Playlist).filter(Playlist.name == target_name).first()
+        if not playlist:
+            playlist = Playlist(name=target_name, description="Created from download")
+            db.add(playlist)
+            db.flush()
+
+    return playlist
+
+
+def _add_existing_track_to_playlist(db: DBSession, playlist: Playlist | None, track: LocalTrack) -> dict:
+    if not playlist:
+        return {
+            "added_to_playlist": False,
+            "already_in_playlist": False,
+            "playlist_id": None,
+            "playlist_name": None,
+        }
+
+    existing = db.query(PlaylistTrack).filter(
+        PlaylistTrack.playlist_id == playlist.id,
+        PlaylistTrack.track_id == track.id,
+    ).first()
+
+    added = False
+    if not existing:
+        max_pos = db.query(func.max(PlaylistTrack.position)).filter(
+            PlaylistTrack.playlist_id == playlist.id
+        ).scalar() or 0
+        db.add(PlaylistTrack(
+            playlist_id=playlist.id,
+            track_id=track.id,
+            position=max_pos + 1,
+        ))
+        added = True
+
+    playlist.track_count = db.query(PlaylistTrack).filter(
+        PlaylistTrack.playlist_id == playlist.id
+    ).count()
+    return {
+        "added_to_playlist": added,
+        "already_in_playlist": bool(existing),
+        "playlist_id": playlist.id,
+        "playlist_name": playlist.name,
+    }
 
 
 class DownloadHistoryItem(BaseModel):
@@ -75,6 +136,36 @@ async def download_track(
     download_path = config.value if config else os.getenv("DOWNLOAD_PATH", "/downloads")
     
     try:
+        existing_library_track = _find_existing_jukebox_track(
+            db,
+            request.artist,
+            request.title,
+            request.duration_ms,
+        )
+        if existing_library_track:
+            playlist = _resolve_playlist_for_download(db, request.playlist_id, request.playlist_name)
+            playlist_result = _add_existing_track_to_playlist(db, playlist, existing_library_track)
+            db.commit()
+
+            if playlist_result["already_in_playlist"]:
+                message = f"Already in Jukebox and already in {playlist_result['playlist_name']}."
+            elif playlist_result["added_to_playlist"]:
+                message = f"Already in Jukebox; added to {playlist_result['playlist_name']}."
+            else:
+                message = "Already in Jukebox; download skipped."
+
+            return DownloadResponse(
+                success=True,
+                message=message,
+                download_id=None,
+                already_in_jukebox=True,
+                already_in_playlist=playlist_result["already_in_playlist"],
+                added_to_playlist=playlist_result["added_to_playlist"],
+                local_track_id=existing_library_track.id,
+                playlist_id=playlist_result["playlist_id"],
+                playlist_name=playlist_result["playlist_name"],
+            )
+
         # Create download record
         download = Download(
             channel_id=request.channel_id,

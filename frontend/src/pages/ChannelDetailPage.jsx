@@ -62,7 +62,7 @@ function ChannelDetailPage() {
     }
 
     loadXtraQueue()
-    const interval = setInterval(loadXtraQueue, 3000)
+    const interval = setInterval(loadXtraQueue, 5000)
     return () => {
       cancelled = true
       clearInterval(interval)
@@ -176,7 +176,7 @@ function ChannelDetailPage() {
     setDownloadingTracks(prev => new Set([...prev, index]))
     
     try {
-      await downloadsApi.downloadTrack({
+      const res = await downloadsApi.downloadTrack({
         channel_id: channelId,
         artist: track.artist,
         title: track.title,
@@ -185,6 +185,10 @@ function ChannelDetailPage() {
         duration_ms: track.duration_ms,
         image_url: track.image_url
       })
+      const data = res?.data || {}
+      if (data.already_in_jukebox) {
+        window.alert(data.message || 'Already in Jukebox; download skipped.')
+      }
       // Keep in downloading state briefly to show feedback
       setTimeout(() => {
         setDownloadingTracks(prev => {
@@ -254,7 +258,7 @@ function ChannelDetailPage() {
         }
 
         const track = playlistTarget.track || {}
-        await libraryApi.captureCurrentToPlaylist(targetPlaylistId, {
+        const res = await libraryApi.captureCurrentToPlaylist(targetPlaylistId, {
           channel_id: channelId,
           channel_type: 'channel-xtra',
           source: 'archivexm-xtra-queue',
@@ -268,7 +272,12 @@ function ChannelDetailPage() {
           }
         })
 
-        alert(`Queued ${track.artist || 'Unknown'} - ${track.title || 'Unknown'} for playlist capture.`)
+        const data = res?.data || {}
+        if (data.already_in_jukebox || data.already_in_playlist) {
+          alert(data.message || 'Already in Jukebox or playlist.')
+        } else {
+          alert(data.message || `Queued ${track.artist || 'Unknown'} - ${track.title || 'Unknown'} for playlist capture.`)
+        }
       } else if (playlistTarget.type === 'selected') {
         const tracksToDownload = Array.from(selectedTracks).map(index => buildTrackPayload(schedule.tracks[index]))
         await downloadsApi.downloadBulk(channelId, tracksToDownload, playlistPayload)
@@ -277,7 +286,11 @@ function ChannelDetailPage() {
       } else {
         const { track, index } = playlistTarget
         setDownloadingTracks(prev => new Set([...prev, index]))
-        await downloadsApi.downloadTrackToPlaylist(buildTrackPayload(track), playlistPayload)
+        const res = await downloadsApi.downloadTrackToPlaylist(buildTrackPayload(track), playlistPayload)
+        const data = res?.data || {}
+        if (data.already_in_jukebox || data.already_in_playlist) {
+          window.alert(data.message || 'Already in Jukebox.')
+        }
         setTimeout(() => {
           setDownloadingTracks(prev => {
             const next = new Set(prev)

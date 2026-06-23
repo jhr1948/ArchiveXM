@@ -64,9 +64,6 @@ export const streamsApi = {
   
   getStreamUrl: (channelId) => 
     api.get(`/api/streams/${channelId}/stream-url`),
-
-  getXtraQueue: (channelId) =>
-    api.get(`/api/streams/${channelId}/xtra/queue`),
   
   // Get proxy stream URL for HLS playback (bypasses CORS)
   getProxyStreamUrl: (channelId) => 
@@ -88,13 +85,7 @@ export const downloadsApi = {
     api.get('/api/downloads/history', { params: { limit, offset } }),
   
   getStatus: (downloadId) => 
-    api.get(`/api/downloads/${downloadId}/status`),
-
-  cancel: (downloadId) =>
-    api.post(`/api/downloads/${downloadId}/cancel`),
-
-  clearHistory: () =>
-    api.post('/api/downloads/clear-history')
+    api.get(`/api/downloads/${downloadId}/status`)
 }
 
 // Library API (Jukebox)
@@ -193,10 +184,7 @@ export const libraryApi = {
     api.post(`/api/library/playlists/${playlistId}/tracks/bulk-remove`, { track_ids: trackIds }),
   
   reorderPlaylist: (playlistId, trackIds) => 
-    api.put(`/api/library/playlists/${playlistId}/reorder`, trackIds),
-
-  captureCurrentToPlaylist: (playlistId, payload) =>
-    api.post(`/api/library/playlists/${playlistId}/capture-current`, payload)
+    api.put(`/api/library/playlists/${playlistId}/reorder`, trackIds)
 }
 
 export default api

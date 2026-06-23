@@ -13,6 +13,8 @@ import os
 import mimetypes
 import re
 import asyncio
+import httpx
+import json
 import difflib
 
 from database import get_db, LocalTrack, Playlist, PlaylistTrack, Config, Channel, Download, Session as AuthSession
@@ -105,6 +107,17 @@ class RemoveCurrentPlaylistRequest(BaseModel):
     remove_all: bool = False
     track: Optional[Dict[str, Any]] = None
 
+
+
+class MetadataApplyRequest(BaseModel):
+    artist: Optional[str] = None
+    title: Optional[str] = None
+    album: Optional[str] = None
+    year: Optional[str] = None
+    cover_url: Optional[str] = None
+    provider: Optional[str] = None
+    recording_id: Optional[str] = None
+    release_id: Optional[str] = None
 
 
 def _first_text(*values, default: str = "") -> str:
@@ -330,65 +343,14 @@ async def _resolve_capture_track(session_token: str, request: CaptureCurrentRequ
                 served = cached.get("served") or set()
                 tracks = cached.get("tracks") or []
 
-                # Frontend XTRA queue rows send the requested artist/title/duration.
-                # Prefer an exact queued item match so clicking + on Coming Up 2/3/4
-                # downloads that queued song, not just the currently playing/next item.
-                requested_title_keys = _song_lookup_keys(requested.get("title"))
-                requested_artist_keys = _artist_lookup_keys(requested.get("artist"))
-                try:
-                    requested_duration_ms = int(requested.get("duration_ms") or 0)
-                except Exception:
-                    requested_duration_ms = 0
-
-                if requested_title_keys:
-                    for candidate in tracks:
-                        metadata = candidate.get("metadata") or {}
-                        candidate_title = _first_text(metadata.get("title"), candidate.get("title"), default="")
-                        candidate_artist = _first_text(metadata.get("artist"), candidate.get("artist"), default="")
-
-                        if not _lookup_keys_match(requested_title_keys, _song_lookup_keys(candidate_title), fuzzy=True):
-                            continue
-
-                        if requested_artist_keys and not _lookup_keys_match(
-                            requested_artist_keys,
-                            _artist_lookup_keys(candidate_artist),
-                            fuzzy=True,
-                        ):
-                            continue
-
-                        if requested_duration_ms > 0:
-                            candidate_duration_ms = metadata.get("durationMs")
-                            if not candidate_duration_ms:
-                                try:
-                                    candidate_duration_ms = int(float(candidate.get("duration") or 0) * 1000)
-                                except Exception:
-                                    candidate_duration_ms = 0
-                            try:
-                                candidate_duration_ms = int(candidate_duration_ms or 0)
-                            except Exception:
-                                candidate_duration_ms = 0
-                            if candidate_duration_ms > 0:
-                                tolerance = max(15000, min(45000, int(requested_duration_ms * 0.15)))
-                                if abs(candidate_duration_ms - requested_duration_ms) > tolerance:
-                                    continue
-
+                # Pick the first queued XTRA item that has not been fully served.
+                # This maps to the item the listener is currently hearing, while
+                # still downloading its full playlist from the beginning.
+                for candidate in tracks:
+                    names = set(candidate.get("segment_names") or [])
+                    if not names or not names.issubset(served):
                         xtra_track = candidate
-                        print(
-                            "Capture current: matched requested XTRA queue item "
-                            f"{candidate_artist or requested.get('artist') or 'Unknown'} - "
-                            f"{candidate_title or requested.get('title') or 'Unknown'}"
-                        )
                         break
-
-                if not xtra_track:
-                    # Pick the first queued XTRA item that has not been fully served.
-                    # This maps to the item the listener is currently hearing, while
-                    # still downloading its full playlist from the beginning.
-                    for candidate in tracks:
-                        names = set(candidate.get("segment_names") or [])
-                        if not names or not names.issubset(served):
-                            xtra_track = candidate
-                            break
 
                 if not xtra_track and tracks:
                     xtra_track = tracks[-1]
@@ -562,29 +524,6 @@ async def _download_capture_and_add_to_playlist(
             print(f"Capture current: could not add to playlist local_track={bool(local_track)} playlist={bool(playlist)}")
             return
 
-        duplicate_track = _find_existing_jukebox_track(
-            db,
-            local_track.artist or track_payload.get("artist"),
-            local_track.title or track_payload.get("title"),
-            int(float(local_track.duration_seconds or 0) * 1000) if local_track.duration_seconds else track_payload.get("duration_ms"),
-            exclude_track_id=local_track.id,
-        )
-        if duplicate_track:
-            print(
-                f"🎵 Capture current matched existing library track {duplicate_track.id}; "
-                f"skipping duplicate track {local_track.id}"
-            )
-            duplicate_file_path = Path(local_track.file_path or "")
-            db.query(PlaylistTrack).filter(PlaylistTrack.track_id == local_track.id).delete(synchronize_session=False)
-            db.delete(local_track)
-            db.flush()
-            try:
-                if duplicate_file_path.exists() and duplicate_file_path.is_file():
-                    duplicate_file_path.unlink()
-            except Exception as e:
-                print(f"Capture current: could not remove duplicate file {duplicate_file_path}: {e}")
-            local_track = duplicate_track
-
         existing = db.query(PlaylistTrack).filter(
             PlaylistTrack.playlist_id == playlist_id,
             PlaylistTrack.track_id == local_track.id,
@@ -608,8 +547,6 @@ async def _download_capture_and_add_to_playlist(
         print(f"Capture current add-to-playlist failed: {e}")
     finally:
         db.close()
-
-
 
 
 def _normalize_song_lookup_text(value: str | None, *, keep_parenthetical: bool = True, drop_join_words: bool = True) -> str:
@@ -762,36 +699,6 @@ def _find_existing_jukebox_track(
     return matches[0]
 
 
-def _add_track_to_playlist_if_needed(db: DBSession, playlist: Playlist, track: LocalTrack) -> Dict[str, Any]:
-    existing = db.query(PlaylistTrack).filter(
-        PlaylistTrack.playlist_id == playlist.id,
-        PlaylistTrack.track_id == track.id,
-    ).first()
-
-    added = False
-    if not existing:
-        max_pos = db.query(func.max(PlaylistTrack.position)).filter(
-            PlaylistTrack.playlist_id == playlist.id
-        ).scalar() or 0
-        db.add(PlaylistTrack(
-            playlist_id=playlist.id,
-            track_id=track.id,
-            position=max_pos + 1,
-        ))
-        added = True
-
-    db.flush()
-    playlist.track_count = db.query(PlaylistTrack).filter(
-        PlaylistTrack.playlist_id == playlist.id
-    ).count()
-
-    return {
-        "added": added,
-        "already_in_playlist": bool(existing),
-        "track_id": track.id,
-    }
-
-
 def _get_config_value(db: DBSession, key: str, default=None):
     item = db.query(Config).filter(Config.key == key).first()
     if item is None or item.value in (None, ""):
@@ -865,6 +772,757 @@ def _track_play_url(db: DBSession, track: LocalTrack) -> str:
 def _download_path(db: DBSession) -> Path:
     path = _get_config_value(db, "download_path", os.getenv("DOWNLOAD_PATH", "/downloads")) or "/downloads"
     return Path(str(path))
+
+
+
+
+def _musicbrainz_artist_credit(recording: Dict[str, Any]) -> str:
+    parts = []
+    for credit in recording.get("artist-credit") or []:
+        if isinstance(credit, dict):
+            name = credit.get("name") or (credit.get("artist") or {}).get("name")
+            if name:
+                parts.append(str(name))
+        elif isinstance(credit, str):
+            parts.append(credit)
+    return "".join(parts).strip()
+
+
+def _metadata_clean_text(value: str) -> str:
+    text = str(value or "").lower()
+    text = text.replace("&", " and ")
+    text = re.sub(r"\bfeat(?:uring)?\.?\b", " ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _metadata_words(value: str) -> List[str]:
+    stop = {"the", "a", "an", "and", "or"}
+    return [w for w in _metadata_clean_text(value).split() if len(w) > 1 and w not in stop]
+
+
+def _metadata_word_set(value: str) -> set:
+    return set(_metadata_words(value))
+
+
+def _metadata_similarity(a: str, b: str) -> float:
+    aw = _metadata_word_set(a)
+    bw = _metadata_word_set(b)
+    if not aw or not bw:
+        return 0.0
+    inter = len(aw & bw)
+    union = len(aw | bw)
+    if union <= 0:
+        return 0.0
+    # Blend Jaccard with containment so titles with extra parenthetical wording
+    # like "(You Gotta) Fight for Your Right (to Party!)" still score high
+    # against SXM's simplified display title.
+    containment = inter / max(1, min(len(aw), len(bw)))
+    return (inter / union * 0.55) + (containment * 0.45)
+
+
+def _metadata_artist_variants(artist: str) -> List[str]:
+    """Return search-friendly artist variants.
+
+    MusicBrainz commonly stores punk/new-wave artists without a leading
+    article, e.g. SXM/Jukebox may show "The Ramones" while MusicBrainz uses
+    "Ramones". Search both forms so strict artist+title queries do not return
+    zero candidates.
+    """
+    raw = re.sub(r"\s+", " ", str(artist or "").strip())
+    if not raw:
+        return []
+
+    variants = []
+
+    def add(value: str):
+        value = re.sub(r"\s+", " ", str(value or "").strip())
+        if value and value.lower() not in {v.lower() for v in variants}:
+            variants.append(value)
+
+    add(raw)
+    no_article = re.sub(r"^(the|a|an)\s+", "", raw, flags=re.I).strip()
+    add(no_article)
+    if no_article and no_article.lower() == raw.lower():
+        add(f"The {raw}")
+
+    return variants
+
+
+def _metadata_artist_similarity(a: str, b: str) -> float:
+    variants_a = _metadata_artist_variants(a) or [a]
+    variants_b = _metadata_artist_variants(b) or [b]
+
+    best = 0.0
+    for va in variants_a:
+        for vb in variants_b:
+            ac = _metadata_clean_text(va)
+            bc = _metadata_clean_text(vb)
+            if not ac or not bc:
+                continue
+            if ac == bc:
+                best = max(best, 1.0)
+            elif ac in bc or bc in ac:
+                best = max(best, 0.90)
+            else:
+                best = max(best, _metadata_similarity(ac, bc))
+    return best
+
+
+def _musicbrainz_release_artist(release: Dict[str, Any], fallback: str = "") -> str:
+    parts = []
+    for credit in release.get("artist-credit") or []:
+        if isinstance(credit, dict):
+            name = credit.get("name") or (credit.get("artist") or {}).get("name")
+            if name:
+                parts.append(str(name))
+        elif isinstance(credit, str):
+            parts.append(credit)
+    return "".join(parts).strip() or fallback
+
+
+def _candidate_key(candidate: Dict[str, Any]) -> tuple:
+    return (
+        str(candidate.get("artist") or "").lower(),
+        str(candidate.get("title") or "").lower(),
+        str(candidate.get("album") or "").lower(),
+        str(candidate.get("year") or ""),
+        str(candidate.get("release_id") or ""),
+    )
+
+
+def _metadata_title_variants(title: str) -> List[str]:
+    """Return search-friendly variants for SXM/XTRA titles.
+
+    SXM often appends the release year in parentheses, e.g.
+    "Push It (88)". MusicBrainz generally stores the canonical title without
+    that suffix, so search both the displayed title and cleaned variants.
+    """
+    raw = (title or "").strip()
+    if not raw:
+        return []
+
+    variants = []
+
+    def add(value: str):
+        value = re.sub(r"\s+", " ", str(value or "").strip())
+        if value and value.lower() not in {v.lower() for v in variants}:
+            variants.append(value)
+
+    add(raw)
+
+    # Remove SXM year suffixes like (87), (1987), [87], or [1987].
+    cleaned = re.sub(r"\s*[\(\[]\s*(?:19|20)?\d{2}\s*[\)\]]\s*$", "", raw).strip()
+    add(cleaned)
+
+    # Drop common mix/remaster/radio edit suffixes only as fallback variants.
+    cleaned2 = re.sub(
+        r"\s*[\(\[]\s*(?:remaster(?:ed)?|radio edit|single version|album version|extended(?: mix)?|mono|stereo)\s*[\)\]]\s*$",
+        "",
+        cleaned,
+        flags=re.I,
+    ).strip()
+    add(cleaned2)
+
+    # A loose punctuation-normalized fallback helps titles like
+    # "You Gotta Fight For Your Right To Party" match MusicBrainz's
+    # "(You Gotta) Fight for Your Right (To Party!)".
+    loose = re.sub(r"[^A-Za-z0-9]+", " ", cleaned2).strip()
+    add(loose)
+
+    # Common MusicBrainz/SXM wording variants. Covers and older titles often
+    # differ by colloquial spelling: "Wanna" vs "Want to", "Gonna" vs
+    # "Going to". Keep both so tracks like "Do You Wanna Dance?" can find
+    # canonical entries stored as "Do You Want to Dance".
+    swaps = [
+        (r"\bwanna\b", "want to"),
+        (r"\bwant to\b", "wanna"),
+        (r"\bgonna\b", "going to"),
+        (r"\bgoing to\b", "gonna"),
+        (r"\bgotta\b", "got to"),
+        (r"\bgot to\b", "gotta"),
+        (r"\byou gotta\b", "you got to"),
+    ]
+    for source in list(variants):
+        lower = source.lower()
+        for pattern, replacement in swaps:
+            swapped = re.sub(pattern, replacement, lower, flags=re.I)
+            if swapped != lower:
+                add(swapped.title())
+
+    # Extra useful variants for common SXM display titles that include leading
+    # informal wording. These are still searched with the artist, so they do not
+    # become dangerously broad, but they help canonical titles rank correctly.
+    words = _metadata_words(cleaned2)
+    if len(words) >= 5:
+        for marker in ("fight", "love", "dance", "walk", "shake", "dream", "want", "need"):
+            if marker in words and words.index(marker) > 0:
+                add(" ".join(words[words.index(marker):]))
+                break
+
+    return variants
+
+
+def _metadata_query_word_clause(value: str, field: str) -> str:
+    words = [w for w in re.findall(r"[A-Za-z0-9]+", value or "") if len(w) > 1]
+    # Keep enough words to be useful without over-constraining long titles.
+    words = words[:8]
+    if not words:
+        return ""
+    return " AND ".join(f'{field}:{word}' for word in words)
+
+
+def _metadata_release_flags(release: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    rg = (release or {}).get("release-group") or {}
+    primary = str(rg.get("primary-type") or "").strip().lower()
+    secondary = {str(t).strip().lower() for t in (rg.get("secondary-types") or []) if str(t).strip()}
+    bad_secondary = {"compilation", "soundtrack", "live", "remix", "dj-mix", "mixtape/street", "demo"}
+    return {
+        "primary": primary,
+        "secondary": secondary,
+        "is_album": primary == "album",
+        "is_single": primary == "single",
+        "is_bad_secondary": bool(secondary & bad_secondary),
+        "is_compilation": "compilation" in secondary,
+        "is_live": "live" in secondary,
+    }
+
+
+def _metadata_release_year(release: Optional[Dict[str, Any]]) -> int | None:
+    date = str((release or {}).get("date") or "")
+    try:
+        year = int(date[:4])
+        if 1900 <= year <= 2035:
+            return year
+    except Exception:
+        pass
+    return None
+
+
+def _metadata_title_mentions_live(title: str) -> bool:
+    text = f" {_metadata_clean_text(title)} "
+    return any(marker in text for marker in (
+        " live ",
+        " in concert ",
+        " concert version ",
+        " live at ",
+        " live from ",
+        " live in ",
+    ))
+
+
+def _metadata_release_type_rank(release_type: str, requested_title: str = "") -> int:
+    """Human-friendly release ordering for metadata search results.
+
+    Prefer the canonical studio album first, then singles, then compilations.
+    Live albums are useful only for explicitly live track searches; otherwise
+    they are pushed below normal metadata cleanup candidates.
+    """
+    reltype = str(release_type or "").lower().strip()
+    is_live_query = _metadata_title_mentions_live(requested_title)
+
+    is_album = reltype.startswith("album")
+    is_single = reltype.startswith("single")
+    is_compilation = "compilation" in reltype
+    is_live = "live" in reltype
+    is_bad_album = any(bad in reltype for bad in ("soundtrack", "remix", "dj-mix", "mixtape/street", "demo"))
+
+    if is_album and not is_compilation and not is_live and not is_bad_album:
+        return 0
+    if is_single:
+        return 1
+    if is_album and is_compilation and not is_live:
+        return 2
+    if is_album and is_live:
+        return 3 if is_live_query else 9
+    if is_album:
+        return 4
+    if reltype == "recording":
+        return 8
+    return 7
+
+
+def _metadata_release_score(
+    recording_score: int,
+    requested_artist: str,
+    requested_title: str,
+    rec_artist: str,
+    rec_title: str,
+    release: Optional[Dict[str, Any]],
+) -> float:
+    """Score MusicBrainz release candidates for a human-friendly picker.
+
+    The MusicBrainz search score is only one ingredient. For Jukebox cleanup we
+    usually want the original/studio album before singles, compilations, live
+    releases, and soundtracks.
+    """
+    score = max(0.0, min(1.0, (recording_score or 0) / 100.0)) * 0.30
+    score += _metadata_artist_similarity(requested_artist, rec_artist) * 0.27
+    score += _metadata_similarity(requested_title, rec_title) * 0.20
+
+    if not release:
+        return max(0.0, min(1.0, score))
+
+    release_artist = _musicbrainz_release_artist(release, rec_artist)
+    score += _metadata_artist_similarity(requested_artist, release_artist) * 0.10
+
+    status = str(release.get("status") or "").lower()
+    if status == "official":
+        score += 0.04
+
+    flags = _metadata_release_flags(release)
+    release_artist_clean = _metadata_clean_text(release_artist)
+
+    # Strongly prefer a clean studio album. This is the common desired answer
+    # for cleanup, e.g. Rebel Yell should show the Rebel Yell album before the
+    # 1985 single or later compilation/live releases.
+    if flags["is_album"] and not flags["is_bad_secondary"]:
+        score += 0.28
+    elif flags["is_album"]:
+        score += 0.08
+    elif flags["is_single"]:
+        score += 0.02
+    elif flags["primary"]:
+        score += 0.01
+
+    is_live_query = _metadata_title_mentions_live(requested_title)
+    if flags["is_compilation"]:
+        score -= 0.28
+    if flags["is_live"]:
+        score += 0.03 if is_live_query else -0.42
+    if flags["is_bad_secondary"] and not (flags["is_compilation"] or flags["is_live"]):
+        score -= 0.18
+
+    if release_artist_clean in {"various artists", "various"}:
+        score -= 0.30
+
+    # Prefer older/original releases over later reissues when all else is close,
+    # but do not let a random early compilation beat a later official album.
+    year = _metadata_release_year(release)
+    if year:
+        if flags["is_album"] and not flags["is_bad_secondary"]:
+            score += max(0.0, min(0.06, (2035 - year) / 1200.0))
+        else:
+            score += max(0.0, min(0.02, (2035 - year) / 3000.0))
+
+    return max(0.0, min(1.0, score))
+
+
+async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """Find likely album/cover candidates using MusicBrainz + Cover Art Archive.
+
+    This is deliberately user-triggered. Music metadata is not always unique,
+    especially for singles, remasters, compilations, and live versions, so the
+    frontend presents candidates and lets the user choose.
+    """
+    artist = (artist or "").strip()
+    title = (title or "").strip()
+    if not title:
+        return []
+
+    headers = {
+        "User-Agent": "ArchiveXM/1.0 (metadata lookup; local user initiated)",
+        "Accept": "application/json",
+    }
+
+    query_attempts = []
+    seen_queries = set()
+
+    def add_query(query: str):
+        query = re.sub(r"\s+", " ", str(query or "").strip())
+        if query and query.lower() not in seen_queries:
+            seen_queries.add(query.lower())
+            query_attempts.append(query)
+
+    title_variants = _metadata_title_variants(title)
+    artist_variants = _metadata_artist_variants(artist)
+    artist_known = bool(artist_variants) and artist.lower() != "unknown"
+
+    for variant in title_variants:
+        quoted_title = variant.replace('"', '\\"')
+        if artist_known:
+            for artist_variant in artist_variants:
+                quoted_artist = artist_variant.replace('"', '\\"')
+                add_query(f'artist:"{quoted_artist}" AND recording:"{quoted_title}"')
+                add_query(f'artistname:"{quoted_artist}" AND recording:"{quoted_title}"')
+        else:
+            add_query(f'recording:"{quoted_title}"')
+
+    # Fallback to word-based recording clauses. This catches SXM display titles
+    # that differ from canonical MusicBrainz titles, especially XTRA tracks with
+    # extra year suffixes or missing punctuation.
+    for variant in title_variants:
+        word_clause = _metadata_query_word_clause(variant, "recording")
+        if not word_clause:
+            continue
+        if artist_known:
+            for artist_variant in artist_variants:
+                quoted_artist = artist_variant.replace('"', '\\"')
+                add_query(f'artist:"{quoted_artist}" AND {word_clause}')
+                add_query(f'artistname:"{quoted_artist}" AND {word_clause}')
+        else:
+            add_query(word_clause)
+
+    # Last-resort title-only search. Results are still ranked by artist
+    # similarity, so the requested artist rises above covers by other artists.
+    # This helps cover songs or artist-name variants that MusicBrainz stores
+    # differently than SXM.
+    for variant in title_variants[:4]:
+        quoted_title = variant.replace('"', '\\"')
+        add_query(f'recording:"{quoted_title}"')
+
+    async def run_query(client: httpx.AsyncClient, query: str) -> List[Dict[str, Any]]:
+        params = {
+            "query": query,
+            "fmt": "json",
+            "limit": "25",
+            # Keep this include list conservative. MusicBrainz can reject the
+            # entire request with HTTP 400 when unsupported includes are used
+            # for the recording endpoint, which made the lookup modal fail
+            # instantly instead of trying the next query variant.
+            "inc": "artist-credits+releases",
+        }
+        response = await client.get("https://musicbrainz.org/ws/2/recording/", params=params, headers=headers)
+        response.raise_for_status()
+        return response.json().get("recordings") or []
+
+    async def hydrate_recording(client: httpx.AsyncClient, recording_id: str) -> Dict[str, Any] | None:
+        if not recording_id:
+            return None
+        params = {
+            "fmt": "json",
+            # The search response can return only a shallow/short release list.
+            # Fetching the recording directly gives a better chance of seeing
+            # the original studio album before we rank candidates.
+            "inc": "artist-credits+releases+release-groups",
+        }
+        response = await client.get(f"https://musicbrainz.org/ws/2/recording/{recording_id}", params=params, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else None
+
+    async def run_release_query(client: httpx.AsyncClient, query: str) -> List[Dict[str, Any]]:
+        params = {
+            "query": query,
+            "fmt": "json",
+            "limit": "10",
+            "inc": "artist-credits+release-groups",
+        }
+        response = await client.get("https://musicbrainz.org/ws/2/release/", params=params, headers=headers)
+        response.raise_for_status()
+        return response.json().get("releases") or []
+
+    async def hydrate_release(client: httpx.AsyncClient, release_id: str) -> Dict[str, Any] | None:
+        if not release_id:
+            return None
+        params = {
+            "fmt": "json",
+            "inc": "artist-credits+release-groups+media+recordings",
+        }
+        response = await client.get(f"https://musicbrainz.org/ws/2/release/{release_id}", params=params, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else None
+
+    recordings_by_id: Dict[str, Dict[str, Any]] = {}
+    extra_releases_by_id: Dict[str, Dict[str, Any]] = {}
+    query_errors: List[str] = []
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        for query in query_attempts:
+            try:
+                found = await run_query(client, query)
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code if e.response is not None else "unknown"
+                msg = f"status={status} query={query[:140]}"
+                query_errors.append(msg)
+                print(f"Metadata lookup query skipped: {msg}")
+                continue
+            except httpx.HTTPError as e:
+                msg = f"{type(e).__name__}: {str(e)[:180]} query={query[:140]}"
+                query_errors.append(msg)
+                print(f"Metadata lookup query skipped: {msg}")
+                continue
+            except Exception as e:
+                msg = f"{type(e).__name__}: {str(e)[:180]} query={query[:140]}"
+                query_errors.append(msg)
+                print(f"Metadata lookup query skipped: {msg}")
+                continue
+
+            for recording in found:
+                rid = recording.get("id") or json.dumps(recording, sort_keys=True)[:80]
+                if rid not in recordings_by_id:
+                    recordings_by_id[rid] = recording
+            if len(recordings_by_id) >= 40:
+                break
+
+        # Hydrate the best recordings so their full release lists are available
+        # for ranking. Keep this small to stay friendly to MusicBrainz.
+        for rid in list(recordings_by_id.keys())[:12]:
+            try:
+                hydrated = await hydrate_recording(client, rid)
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code if e.response is not None else "unknown"
+                print(f"Metadata lookup hydrate skipped: status={status} recording={rid}")
+                continue
+            except Exception as e:
+                print(f"Metadata lookup hydrate skipped: {type(e).__name__}: {str(e)[:160]} recording={rid}")
+                continue
+            if hydrated:
+                base = recordings_by_id.get(rid) or {}
+                # Preserve MusicBrainz search relevance score; direct lookup does
+                # not include the search score.
+                if "score" not in hydrated and "score" in base:
+                    hydrated["score"] = base.get("score")
+                recordings_by_id[rid] = hydrated
+
+        # Recording searches can still miss the canonical studio album,
+        # especially when MusicBrainz has several similarly named recordings or
+        # a long list of singles/compilations. Add a small targeted release
+        # search for same-named official albums, then verify that the release
+        # contains a matching recording before presenting it as a candidate.
+        release_queries: List[str] = []
+        def add_release_query(query: str):
+            if query and query not in release_queries:
+                release_queries.append(query)
+
+        for variant in title_variants[:4]:
+            quoted_title = variant.replace('"', '\"')
+            if artist_known:
+                for artist_variant in artist_variants[:4]:
+                    quoted_artist = artist_variant.replace('"', '\"')
+                    add_release_query(f'artist:"{quoted_artist}" AND release:"{quoted_title}" AND type:album AND status:official')
+                    add_release_query(f'artistname:"{quoted_artist}" AND release:"{quoted_title}" AND type:album')
+            else:
+                add_release_query(f'release:"{quoted_title}" AND type:album AND status:official')
+
+        for query in release_queries[:10]:
+            try:
+                found_releases = await run_release_query(client, query)
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code if e.response is not None else "unknown"
+                print(f"Metadata release lookup skipped: status={status} query={query[:140]}")
+                continue
+            except Exception as e:
+                print(f"Metadata release lookup skipped: {type(e).__name__}: {str(e)[:160]} query={query[:140]}")
+                continue
+
+            for release in found_releases[:6]:
+                rid = release.get("id")
+                if not rid or rid in extra_releases_by_id:
+                    continue
+                flags = _metadata_release_flags(release)
+                if not (flags["is_album"] and not flags["is_bad_secondary"]):
+                    continue
+                release_artist = _musicbrainz_release_artist(release, artist)
+                if artist_known and _metadata_artist_similarity(artist, release_artist) < 0.72:
+                    continue
+                if _metadata_similarity(title, release.get("title") or "") < 0.72:
+                    continue
+                try:
+                    hydrated_release = await hydrate_release(client, rid)
+                except Exception as e:
+                    print(f"Metadata release hydrate skipped: {type(e).__name__}: {str(e)[:160]} release={rid}")
+                    continue
+                if hydrated_release:
+                    hydrated_release.setdefault("score", release.get("score") or 100)
+                    extra_releases_by_id[rid] = hydrated_release
+            if len(extra_releases_by_id) >= 8:
+                break
+
+    if not recordings_by_id and query_errors:
+        print(f"Metadata lookup found no usable MusicBrainz responses; skipped {len(query_errors)} failed queries")
+
+    candidates: List[Dict[str, Any]] = []
+    seen = set()
+
+    for recording in recordings_by_id.values():
+        rec_title = recording.get("title") or title
+        rec_artist = _musicbrainz_artist_credit(recording) or artist or "Unknown"
+        try:
+            mb_score = int(recording.get("score") or 0)
+        except Exception:
+            mb_score = 0
+
+        releases = recording.get("releases") or []
+        if not releases:
+            confidence = _metadata_release_score(mb_score, artist, title, rec_artist, rec_title, None)
+            candidate = {
+                "provider": "musicbrainz",
+                "recording_id": recording.get("id"),
+                "release_id": None,
+                "artist": rec_artist,
+                "title": rec_title,
+                "album": "",
+                "year": "",
+                "cover_url": None,
+                "confidence": round(confidence, 3),
+                "release_type": "Recording",
+                "label": f"{rec_artist} - {rec_title}",
+            }
+            key = _candidate_key(candidate)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(candidate)
+            continue
+
+        for release in releases[:20]:
+            release_id = release.get("id")
+            album = release.get("title") or ""
+            date = str(release.get("date") or "")
+            year = date[:4] if date else ""
+            rg = release.get("release-group") or {}
+            primary_type = rg.get("primary-type") or ""
+            secondary_types = rg.get("secondary-types") or []
+            release_type_parts = []
+            if primary_type:
+                release_type_parts.append(primary_type)
+            release_type_parts.extend([str(t) for t in secondary_types if t])
+            release_type = ", ".join(release_type_parts) or "Release"
+            confidence = _metadata_release_score(mb_score, artist, title, rec_artist, rec_title, release)
+
+            candidate = {
+                "provider": "musicbrainz",
+                "recording_id": recording.get("id"),
+                "release_id": release_id,
+                "artist": rec_artist,
+                "title": rec_title,
+                "album": album,
+                "year": year,
+                "cover_url": f"https://coverartarchive.org/release/{release_id}/front-250" if release_id else None,
+                "confidence": round(confidence, 3),
+                "release_type": release_type,
+                "label": f"{album or rec_title}" + (f" ({year})" if year else "") + (f" · {release_type}" if release_type else ""),
+            }
+            key = _candidate_key(candidate)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(candidate)
+
+    for release in extra_releases_by_id.values():
+        release_id = release.get("id")
+        album = release.get("title") or ""
+        date = str(release.get("date") or "")
+        year = date[:4] if date else ""
+        release_artist = _musicbrainz_release_artist(release, artist or "Unknown")
+        matched_recording = None
+        for medium in release.get("media") or []:
+            for track_item in medium.get("tracks") or []:
+                rec = track_item.get("recording") or {}
+                rec_title = rec.get("title") or track_item.get("title") or ""
+                if _metadata_similarity(title, rec_title) >= 0.72:
+                    matched_recording = rec
+                    break
+            if matched_recording:
+                break
+        if not matched_recording:
+            continue
+
+        rg = release.get("release-group") or {}
+        primary_type = rg.get("primary-type") or ""
+        secondary_types = rg.get("secondary-types") or []
+        release_type_parts = []
+        if primary_type:
+            release_type_parts.append(primary_type)
+        release_type_parts.extend([str(t) for t in secondary_types if t])
+        release_type = ", ".join(release_type_parts) or "Release"
+        confidence = _metadata_release_score(
+            int(release.get("score") or 100),
+            artist,
+            title,
+            _musicbrainz_artist_credit(matched_recording) or release_artist,
+            matched_recording.get("title") or title,
+            release,
+        )
+        # Same-named verified studio albums are usually the canonical result;
+        # give them enough confidence to appear in the first page without
+        # bypassing the normal release-type ordering.
+        confidence = max(confidence, 0.96)
+        candidate = {
+            "provider": "musicbrainz",
+            "recording_id": matched_recording.get("id"),
+            "release_id": release_id,
+            "artist": release_artist,
+            "title": matched_recording.get("title") or title,
+            "album": album,
+            "year": year,
+            "cover_url": f"https://coverartarchive.org/release/{release_id}/front-250" if release_id else None,
+            "confidence": round(confidence, 3),
+            "release_type": release_type,
+            "label": f"{album or title}" + (f" ({year})" if year else "") + (f" · {release_type}" if release_type else ""),
+        }
+        key = _candidate_key(candidate)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(candidate)
+
+    def sort_key(c: Dict[str, Any]):
+        album = str(c.get("album") or "")
+        reltype = str(c.get("release_type") or "")
+        has_album = 0 if album else 1
+        year = 9999
+        try:
+            y = int(str(c.get("year") or "")[:4])
+            if 1900 <= y <= 2035:
+                year = y
+        except Exception:
+            pass
+        # Explicit user-facing order:
+        # Album, Single, Album/Compilation, then Album/Live only for live
+        # track queries. Confidence is still used inside each bucket.
+        return (
+            _metadata_release_type_rank(reltype, title),
+            has_album,
+            -float(c.get("confidence") or 0),
+            year,
+            str(c.get("album") or "").lower(),
+        )
+
+    candidates.sort(key=sort_key)
+    return candidates[:limit]
+
+async def _save_track_cover_from_url(db: DBSession, track: LocalTrack, cover_url: str | None) -> str | None:
+    cover_url = (cover_url or "").strip()
+    if not cover_url:
+        return None
+    if not cover_url.lower().startswith(("http://", "https://")):
+        return None
+
+    headers = {
+        "User-Agent": "ArchiveXM/1.0 (cover art lookup; local user initiated)",
+        "Accept": "image/*,*/*",
+    }
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+        response = await client.get(cover_url, headers=headers)
+    if response.status_code >= 400 or not response.content:
+        raise Exception(f"Cover fetch failed status={response.status_code}")
+
+    content_type = (response.headers.get("content-type") or "").lower()
+    suffix = ".jpg"
+    if "png" in content_type:
+        suffix = ".png"
+    elif "webp" in content_type:
+        suffix = ".webp"
+    elif "jpeg" in content_type or "jpg" in content_type:
+        suffix = ".jpg"
+    else:
+        path_suffix = Path(str(response.url).split("?", 1)[0]).suffix.lower()
+        if path_suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+            suffix = path_suffix
+
+    cover_dir = _download_path(db) / ".archivexm" / "covers"
+    cover_dir.mkdir(parents=True, exist_ok=True)
+    cover_path = cover_dir / _safe_cover_filename(track.id, suffix)
+    cover_path.write_bytes(response.content)
+    track.cover_art_path = str(cover_path)
+    return str(cover_path)
+
+
+def _safe_cover_filename(track_id: int, suffix: str) -> str:
+    suffix = (suffix or ".jpg").lower()
+    if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+        suffix = ".jpg"
+    return f"track_{int(track_id)}{suffix}"
 
 
 def _is_url(value: str | None) -> bool:
@@ -1224,6 +1882,116 @@ async def bulk_delete_tracks(
     }
 
 
+@router.get("/metadata/search")
+async def search_metadata_candidates(
+    artist: Optional[str] = None,
+    title: Optional[str] = None,
+):
+    """
+    Search external metadata candidates directly by artist/title.
+
+    This helper is mostly for diagnostics and frontend recovery paths; the
+    Jukebox UI usually calls the track-specific endpoint below.
+    """
+    search_artist = _first_text(artist, default="")
+    search_title = _first_text(title, default="")
+    if not search_title:
+        raise HTTPException(status_code=400, detail="Track title is required for metadata search")
+
+    try:
+        candidates = await _search_musicbrainz_candidates(search_artist, search_title)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"MusicBrainz lookup failed: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Metadata lookup failed: {e}")
+
+    return {
+        "query": {"artist": search_artist, "title": search_title},
+        "candidates": candidates,
+    }
+
+
+@router.get("/tracks/{track_id}/metadata/search")
+async def search_track_metadata(
+    track_id: int,
+    artist: Optional[str] = None,
+    title: Optional[str] = None,
+    db: DBSession = Depends(get_db),
+):
+    """
+    Search external metadata candidates for a local Jukebox track.
+
+    Uses MusicBrainz for release/album candidates and Cover Art Archive URLs for
+    cover previews. This is user-triggered so ambiguous matches can be reviewed
+    before applying.
+    """
+    track = db.query(LocalTrack).filter(LocalTrack.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+
+    search_artist = _first_text(artist, track.artist, default="")
+    search_title = _first_text(title, track.title, track.filename, default="")
+    if not search_title:
+        raise HTTPException(status_code=400, detail="Track title is required for metadata search")
+
+    try:
+        candidates = await _search_musicbrainz_candidates(search_artist, search_title)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"MusicBrainz lookup failed: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Metadata lookup failed: {e}")
+
+    return {
+        "track_id": track.id,
+        "query": {"artist": search_artist, "title": search_title},
+        "candidates": candidates,
+    }
+
+
+@router.post("/tracks/{track_id}/metadata/apply")
+async def apply_track_metadata(
+    track_id: int,
+    request: MetadataApplyRequest,
+    db: DBSession = Depends(get_db),
+):
+    """
+    Apply user-selected metadata to a local Jukebox track.
+    """
+    track = db.query(LocalTrack).filter(LocalTrack.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+
+    if request.artist is not None and str(request.artist).strip():
+        track.artist = str(request.artist).strip()
+    if request.title is not None and str(request.title).strip():
+        track.title = str(request.title).strip()
+    if request.album is not None:
+        track.album = str(request.album).strip() or None
+
+    cover_error = None
+    if request.cover_url:
+        try:
+            await _save_track_cover_from_url(db, track, request.cover_url)
+        except Exception as e:
+            cover_error = str(e)
+            print(f"Metadata apply: cover download failed for track {track.id}: {e}")
+
+    db.commit()
+    db.refresh(track)
+
+    return {
+        "success": True,
+        "track": TrackResponse.from_orm(track),
+        "cover_error": cover_error,
+        "metadata": {
+            "provider": request.provider,
+            "recording_id": request.recording_id,
+            "release_id": request.release_id,
+            "year": request.year,
+        },
+    }
+
+
 @router.get("/tracks/{track_id}")
 async def get_track(track_id: int, db: DBSession = Depends(get_db)):
     """
@@ -1485,43 +2253,6 @@ async def capture_current_to_playlist(
         # A conservative fallback. The downloader will still try to refine live
         # duration from the next timed schedule item when possible.
         track_payload["duration_ms"] = 240000
-
-    existing_library_track = _find_existing_jukebox_track(
-        db,
-        track_payload.get("artist"),
-        track_payload.get("title"),
-        track_payload.get("duration_ms"),
-    )
-    if existing_library_track:
-        result = _add_track_to_playlist_if_needed(db, playlist, existing_library_track)
-        db.commit()
-
-        if result["already_in_playlist"]:
-            message = f"Already in Jukebox and already in {playlist.name}."
-        else:
-            message = f"Already in Jukebox; added to {playlist.name}."
-
-        return {
-            "success": True,
-            "message": message,
-            "already_in_jukebox": True,
-            "already_in_playlist": result["already_in_playlist"],
-            "added_to_playlist": result["added"],
-            "playlist_id": playlist_id,
-            "playlist_name": playlist.name,
-            "download_id": None,
-            "local_track_id": existing_library_track.id,
-            "channel_id": request.channel_id,
-            "channel_type": request.channel_type,
-            "track": {
-                "artist": existing_library_track.artist or track_payload.get("artist"),
-                "title": existing_library_track.title or track_payload.get("title"),
-                "album": existing_library_track.album or track_payload.get("album"),
-                "duration_ms": int(float(existing_library_track.duration_seconds or 0) * 1000) if existing_library_track.duration_seconds else track_payload.get("duration_ms"),
-                "timestamp_utc": track_payload.get("timestamp_utc"),
-                "image_url": track_payload.get("image_url"),
-            },
-        }
 
     config = db.query(Config).filter(Config.key == "download_path").first()
     download_path = config.value if config else os.getenv("DOWNLOAD_PATH", "/downloads")
@@ -1852,61 +2583,49 @@ async def add_tracks_to_playlist(
     db: DBSession = Depends(get_db)
 ):
     """
-    Add tracks to a playlist. Report duplicate playlist adds so the frontend can
-    tell the user when the song is already present instead of silently closing.
+    Add tracks to a playlist
     """
     playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
-
+    
+    # Get current max position
+    max_pos = db.query(func.max(PlaylistTrack.position)).filter(
+        PlaylistTrack.playlist_id == playlist_id
+    ).scalar() or 0
+    
     added = 0
-    already_in_playlist = []
-    missing = []
-    seen = set()
-
     for track_id in request.track_ids:
-        try:
-            track_id = int(track_id)
-        except Exception:
-            continue
-        if track_id in seen:
-            continue
-        seen.add(track_id)
-
+        # Check if track exists
         track = db.query(LocalTrack).filter(LocalTrack.id == track_id).first()
         if not track:
-            missing.append(track_id)
             continue
-
-        result = _add_track_to_playlist_if_needed(db, playlist, track)
-        if result["added"]:
+        
+        # Check if already in playlist
+        existing = db.query(PlaylistTrack).filter(
+            PlaylistTrack.playlist_id == playlist_id,
+            PlaylistTrack.track_id == track_id
+        ).first()
+        
+        if not existing:
+            max_pos += 1
+            pt = PlaylistTrack(
+                playlist_id=playlist_id,
+                track_id=track_id,
+                position=max_pos
+            )
+            db.add(pt)
             added += 1
-        else:
-            already_in_playlist.append({
-                "track_id": track.id,
-                "artist": track.artist,
-                "title": track.title,
-            })
-
+    
+    db.flush()
+    # Update track count
+    playlist.track_count = db.query(PlaylistTrack).filter(
+        PlaylistTrack.playlist_id == playlist_id
+    ).count()
+    
     db.commit()
-
-    duplicate_count = len(already_in_playlist)
-    if added and duplicate_count:
-        message = f"Added {added} track(s); {duplicate_count} already in {playlist.name}."
-    elif duplicate_count:
-        message = "Song is already in this playlist." if duplicate_count == 1 else f"{duplicate_count} songs are already in this playlist."
-    else:
-        message = f"Added {added} track(s) to {playlist.name}."
-
-    return {
-        "success": True,
-        "added": added,
-        "duplicate_count": duplicate_count,
-        "already_in_playlist": duplicate_count > 0,
-        "duplicates": already_in_playlist,
-        "missing": missing,
-        "message": message,
-    }
+    
+    return {"success": True, "added": added}
 
 
 

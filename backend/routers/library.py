@@ -802,6 +802,18 @@ def _metadata_words(value: str) -> List[str]:
     return [w for w in _metadata_clean_text(value).split() if len(w) > 1 and w not in stop]
 
 
+def _metadata_compact_key(value: str) -> str:
+    """Lowercase alphanumeric key used for acronym/short-name matching."""
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _metadata_is_short_artist(value: str) -> bool:
+    key = _metadata_compact_key(value)
+    # Short artist names and acronyms are dangerous in title-only searches:
+    # EMF, INXS, ABC, XTC, U2, M, etc. should not be treated as loose text.
+    return bool(key) and len(key) <= 4
+
+
 def _metadata_word_set(value: str) -> set:
     return set(_metadata_words(value))
 
@@ -809,17 +821,42 @@ def _metadata_word_set(value: str) -> set:
 def _metadata_similarity(a: str, b: str) -> float:
     aw = _metadata_word_set(a)
     bw = _metadata_word_set(b)
-    if not aw or not bw:
+    ac = _metadata_clean_text(a)
+    bc = _metadata_clean_text(b)
+    compact_a = _metadata_compact_key(a)
+    compact_b = _metadata_compact_key(b)
+
+    if not ac or not bc:
         return 0.0
-    inter = len(aw & bw)
-    union = len(aw | bw)
-    if union <= 0:
-        return 0.0
-    # Blend Jaccard with containment so titles with extra parenthetical wording
-    # like "(You Gotta) Fight for Your Right (to Party!)" still score high
-    # against SXM's simplified display title.
-    containment = inter / max(1, min(len(aw), len(bw)))
-    return (inter / union * 0.55) + (containment * 0.45)
+
+    # Exact normalized/compact matches should always score perfectly. The
+    # compact path is important for punctuated acronyms and titles that differ
+    # only by symbols.
+    if ac == bc or (compact_a and compact_a == compact_b):
+        return 1.0
+
+    word_score = 0.0
+    if aw and bw:
+        inter = len(aw & bw)
+        union = len(aw | bw)
+        if union > 0:
+            # Blend Jaccard with containment so titles with extra parenthetical
+            # wording like "(You Gotta) Fight for Your Right (to Party!)" still
+            # score high against SXM's simplified display title.
+            containment = inter / max(1, min(len(aw), len(bw)))
+            word_score = (inter / union * 0.55) + (containment * 0.45)
+
+    # SXM/library tags occasionally contain a one-letter typo, e.g.
+    # "Unbelieveable" vs MusicBrainz's "Unbelievable". A bounded character
+    # similarity fallback lets the canonical artist album be found without
+    # making unrelated multi-word titles look equivalent.
+    char_score = difflib.SequenceMatcher(None, compact_a, compact_b).ratio() if compact_a and compact_b else 0.0
+    if char_score >= 0.92 and min(len(compact_a), len(compact_b)) >= 6:
+        word_score = max(word_score, char_score * 0.96)
+    elif char_score >= 0.86 and min(len(compact_a), len(compact_b)) >= 9:
+        word_score = max(word_score, char_score * 0.88)
+
+    return max(0.0, min(1.0, word_score))
 
 
 def _metadata_artist_variants(artist: str) -> List[str]:
@@ -828,7 +865,8 @@ def _metadata_artist_variants(artist: str) -> List[str]:
     MusicBrainz commonly stores punk/new-wave artists without a leading
     article, e.g. SXM/Jukebox may show "The Ramones" while MusicBrainz uses
     "Ramones". Search both forms so strict artist+title queries do not return
-    zero candidates.
+    zero candidates. Short/acronym artists also get punctuated/spaced variants
+    so EMF can match E.M.F. style data when it appears.
     """
     raw = re.sub(r"\s+", " ", str(artist or "").strip())
     if not raw:
@@ -847,6 +885,13 @@ def _metadata_artist_variants(artist: str) -> List[str]:
     if no_article and no_article.lower() == raw.lower():
         add(f"The {raw}")
 
+    compact = _metadata_compact_key(no_article or raw)
+    if 2 <= len(compact) <= 4 and compact.isalnum():
+        upper = compact.upper()
+        add(upper)
+        add(".".join(upper) + ".")
+        add(" ".join(upper))
+
     return variants
 
 
@@ -855,15 +900,24 @@ def _metadata_artist_similarity(a: str, b: str) -> float:
     variants_b = _metadata_artist_variants(b) or [b]
 
     best = 0.0
+    short_requested = _metadata_is_short_artist(a)
     for va in variants_a:
         for vb in variants_b:
+            compact_a = _metadata_compact_key(va)
+            compact_b = _metadata_compact_key(vb)
+            if compact_a and compact_b and compact_a == compact_b:
+                best = max(best, 1.0)
+                continue
+
             ac = _metadata_clean_text(va)
             bc = _metadata_clean_text(vb)
             if not ac or not bc:
                 continue
             if ac == bc:
                 best = max(best, 1.0)
-            elif ac in bc or bc in ac:
+            elif not short_requested and (ac in bc or bc in ac):
+                # Substring matching is helpful for long artist names but too
+                # risky for acronyms like EMF, ABC, or M.
                 best = max(best, 0.90)
             else:
                 best = max(best, _metadata_similarity(ac, bc))
@@ -935,6 +989,16 @@ def _metadata_title_variants(title: str) -> List[str]:
     # differ by colloquial spelling: "Wanna" vs "Want to", "Gonna" vs
     # "Going to". Keep both so tracks like "Do You Wanna Dance?" can find
     # canonical entries stored as "Do You Want to Dance".
+    #
+    # Also cover a common typo in captured/display metadata: words ending in
+    # "eable" are often intended to be "able" (for example EMF's
+    # "Unbelieveable" should search MusicBrainz as "Unbelievable").  The
+    # similarity scorer can tolerate this after candidates are found, but the
+    # search query itself needs the corrected spelling to get those candidates.
+    spelling_fixed = re.sub(r"eable\b", "able", cleaned2, flags=re.I)
+    if spelling_fixed.lower() != cleaned2.lower():
+        add(spelling_fixed)
+
     swaps = [
         (r"\bwanna\b", "want to"),
         (r"\bwant to\b", "wanna"),
@@ -1138,6 +1202,7 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
     title_variants = _metadata_title_variants(title)
     artist_variants = _metadata_artist_variants(artist)
     artist_known = bool(artist_variants) and artist.lower() != "unknown"
+    artist_similarity_threshold = 0.92 if artist_known and _metadata_is_short_artist(artist) else 0.72
 
     for variant in title_variants:
         quoted_title = variant.replace('"', '\\"')
@@ -1176,7 +1241,7 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
         params = {
             "query": query,
             "fmt": "json",
-            "limit": "25",
+            "limit": "50",
             # Keep this include list conservative. MusicBrainz can reject the
             # entire request with HTTP 400 when unsupported includes are used
             # for the recording endpoint, which made the lookup modal fail
@@ -1225,6 +1290,48 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
         data = response.json()
         return data if isinstance(data, dict) else None
 
+    async def run_release_group_query(client: httpx.AsyncClient, query: str) -> List[Dict[str, Any]]:
+        params = {
+            "query": query,
+            "fmt": "json",
+            "limit": "15",
+            "inc": "artist-credits",
+        }
+        response = await client.get("https://musicbrainz.org/ws/2/release-group/", params=params, headers=headers)
+        response.raise_for_status()
+        return response.json().get("release-groups") or []
+
+    async def hydrate_release_group(client: httpx.AsyncClient, release_group_id: str) -> Dict[str, Any] | None:
+        if not release_group_id:
+            return None
+        params = {
+            "fmt": "json",
+            "inc": "artist-credits+releases",
+        }
+        response = await client.get(f"https://musicbrainz.org/ws/2/release-group/{release_group_id}", params=params, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else None
+
+    def release_contains_requested_track(release: Dict[str, Any]) -> Dict[str, Any] | None:
+        for medium in release.get("media") or []:
+            for track_item in medium.get("tracks") or []:
+                rec = track_item.get("recording") or {}
+                rec_title = rec.get("title") or track_item.get("title") or ""
+                if _metadata_similarity(title, rec_title) >= 0.72:
+                    return rec or {"title": rec_title}
+        return None
+
+    def release_group_flags(release_group: Dict[str, Any]) -> Dict[str, Any]:
+        primary = str(release_group.get("primary-type") or "").strip().lower()
+        secondary = {str(t).strip().lower() for t in (release_group.get("secondary-types") or []) if str(t).strip()}
+        bad_secondary = {"compilation", "soundtrack", "live", "remix", "dj-mix", "mixtape/street", "demo"}
+        return {
+            "primary": primary,
+            "secondary": secondary,
+            "is_clean_album": primary == "album" and not bool(secondary & bad_secondary),
+        }
+
     recordings_by_id: Dict[str, Dict[str, Any]] = {}
     extra_releases_by_id: Dict[str, Dict[str, Any]] = {}
     query_errors: List[str] = []
@@ -1253,12 +1360,13 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
                 rid = recording.get("id") or json.dumps(recording, sort_keys=True)[:80]
                 if rid not in recordings_by_id:
                     recordings_by_id[rid] = recording
-            if len(recordings_by_id) >= 40:
+            if len(recordings_by_id) >= 80:
                 break
 
         # Hydrate the best recordings so their full release lists are available
-        # for ranking. Keep this small to stay friendly to MusicBrainz.
-        for rid in list(recordings_by_id.keys())[:12]:
+        # for ranking. Keep this bounded but deep enough to find canonical
+        # studio albums that may not be attached to the first shallow result.
+        for rid in list(recordings_by_id.keys())[:20]:
             try:
                 hydrated = await hydrate_recording(client, rid)
             except httpx.HTTPStatusError as e:
@@ -1278,9 +1386,10 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
 
         # Recording searches can still miss the canonical studio album,
         # especially when MusicBrainz has several similarly named recordings or
-        # a long list of singles/compilations. Add a small targeted release
-        # search for same-named official albums, then verify that the release
-        # contains a matching recording before presenting it as a candidate.
+        # a long list of singles/compilations. First try a small targeted
+        # release search for same-named official albums, then verify that the
+        # release contains a matching recording before presenting it as a
+        # candidate.
         release_queries: List[str] = []
         def add_release_query(query: str):
             if query and query not in release_queries:
@@ -1295,6 +1404,20 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
                     add_release_query(f'artistname:"{quoted_artist}" AND release:"{quoted_title}" AND type:album')
             else:
                 add_release_query(f'release:"{quoted_title}" AND type:album AND status:official')
+
+        def recording_results_have_clean_album() -> bool:
+            for recording in recordings_by_id.values():
+                rec_artist = _musicbrainz_artist_credit(recording) or artist
+                if artist_known and _metadata_artist_similarity(artist, rec_artist) < artist_similarity_threshold:
+                    continue
+                rec_title = recording.get("title") or title
+                if _metadata_similarity(title, rec_title) < 0.72:
+                    continue
+                for release in (recording.get("releases") or [])[:50]:
+                    flags = _metadata_release_flags(release)
+                    if flags["is_album"] and not flags["is_bad_secondary"]:
+                        return True
+            return False
 
         for query in release_queries[:10]:
             try:
@@ -1315,7 +1438,7 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
                 if not (flags["is_album"] and not flags["is_bad_secondary"]):
                     continue
                 release_artist = _musicbrainz_release_artist(release, artist)
-                if artist_known and _metadata_artist_similarity(artist, release_artist) < 0.72:
+                if artist_known and _metadata_artist_similarity(artist, release_artist) < artist_similarity_threshold:
                     continue
                 if _metadata_similarity(title, release.get("title") or "") < 0.72:
                     continue
@@ -1330,15 +1453,125 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
             if len(extra_releases_by_id) >= 8:
                 break
 
+        # Some hits live on albums that are not named after the song, e.g.
+        # Cyndi Lauper - Girls Just Want to Have Fun belongs on She's So
+        # Unusual. A recording search may still surface only singles,
+        # compilations, and DJ/live releases. As a final canonical-album pass,
+        # search the artist's official album release groups, hydrate a few of
+        # the oldest clean albums, and keep only releases that actually contain
+        # the requested track.
+        if artist_known and len(extra_releases_by_id) < 8 and not recording_results_have_clean_album():
+            release_group_queries: List[str] = []
+            for artist_variant in artist_variants[:4]:
+                quoted_artist = artist_variant.replace('"', '\"')
+                release_group_queries.append(f'artist:"{quoted_artist}" AND type:album')
+                release_group_queries.append(f'artistname:"{quoted_artist}" AND type:album')
+
+            release_groups_by_id: Dict[str, Dict[str, Any]] = {}
+            for query in release_group_queries[:8]:
+                try:
+                    found_groups = await run_release_group_query(client, query)
+                except httpx.HTTPStatusError as e:
+                    status = e.response.status_code if e.response is not None else "unknown"
+                    print(f"Metadata album-group lookup skipped: status={status} query={query[:140]}")
+                    continue
+                except Exception as e:
+                    print(f"Metadata album-group lookup skipped: {type(e).__name__}: {str(e)[:160]} query={query[:140]}")
+                    continue
+
+                for group in found_groups[:12]:
+                    gid = group.get("id")
+                    if not gid or gid in release_groups_by_id:
+                        continue
+                    if not release_group_flags(group)["is_clean_album"]:
+                        continue
+                    group_artist = _musicbrainz_release_artist(group, artist)
+                    if _metadata_artist_similarity(artist, group_artist) < artist_similarity_threshold:
+                        continue
+                    release_groups_by_id[gid] = group
+                if len(release_groups_by_id) >= 18:
+                    break
+
+            def group_sort_key(group: Dict[str, Any]):
+                date = str(group.get("first-release-date") or "9999")
+                year = 9999
+                try:
+                    year = int(date[:4])
+                except Exception:
+                    pass
+                try:
+                    score = int(group.get("score") or 0)
+                except Exception:
+                    score = 0
+                return (year, -score, str(group.get("title") or "").lower())
+
+            for group in sorted(release_groups_by_id.values(), key=group_sort_key)[:10]:
+                gid = group.get("id")
+                try:
+                    hydrated_group = await hydrate_release_group(client, gid)
+                except Exception as e:
+                    print(f"Metadata album-group hydrate skipped: {type(e).__name__}: {str(e)[:160]} group={gid}")
+                    continue
+                if not hydrated_group:
+                    continue
+
+                releases = hydrated_group.get("releases") or []
+                def group_release_sort_key(release: Dict[str, Any]):
+                    status_rank = 0 if str(release.get("status") or "").lower() == "official" else 1
+                    date = str(release.get("date") or "9999")
+                    year = 9999
+                    try:
+                        year = int(date[:4])
+                    except Exception:
+                        pass
+                    return (status_rank, year, str(release.get("country") or ""), str(release.get("title") or "").lower())
+
+                hydrated_count = 0
+                for release_stub in sorted(releases, key=group_release_sort_key)[:4]:
+                    rid = release_stub.get("id")
+                    if not rid or rid in extra_releases_by_id:
+                        continue
+                    try:
+                        hydrated_release = await hydrate_release(client, rid)
+                    except Exception as e:
+                        print(f"Metadata album-release hydrate skipped: {type(e).__name__}: {str(e)[:160]} release={rid}")
+                        continue
+                    hydrated_count += 1
+                    if not hydrated_release:
+                        continue
+                    flags = _metadata_release_flags(hydrated_release)
+                    if not (flags["is_album"] and not flags["is_bad_secondary"]):
+                        continue
+                    release_artist = _musicbrainz_release_artist(hydrated_release, artist)
+                    if _metadata_artist_similarity(artist, release_artist) < artist_similarity_threshold:
+                        continue
+                    if release_contains_requested_track(hydrated_release):
+                        hydrated_release.setdefault("score", max(int(group.get("score") or 0), 96))
+                        extra_releases_by_id[rid] = hydrated_release
+                        break
+                    if hydrated_count >= 3:
+                        break
+                if len(extra_releases_by_id) >= 8:
+                    break
+
     if not recordings_by_id and query_errors:
         print(f"Metadata lookup found no usable MusicBrainz responses; skipped {len(query_errors)} failed queries")
 
     candidates: List[Dict[str, Any]] = []
     seen = set()
+    strict_artist_match = artist_known and _metadata_is_short_artist(artist)
+
+    def artist_match_threshold() -> float:
+        return artist_similarity_threshold
 
     for recording in recordings_by_id.values():
         rec_title = recording.get("title") or title
         rec_artist = _musicbrainz_artist_credit(recording) or artist or "Unknown"
+        if artist_known and _metadata_artist_similarity(artist, rec_artist) < artist_match_threshold():
+            # For short/acronym artists, title-only fallback can pull many
+            # unrelated songs with the same name. Do not show those as
+            # candidates unless the artist also matches strongly.
+            continue
         try:
             mb_score = int(recording.get("score") or 0)
         except Exception:
@@ -1366,7 +1599,7 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
                 candidates.append(candidate)
             continue
 
-        for release in releases[:20]:
+        for release in releases[:50]:
             release_id = release.get("id")
             album = release.get("title") or ""
             date = str(release.get("date") or "")
@@ -1405,16 +1638,9 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
         date = str(release.get("date") or "")
         year = date[:4] if date else ""
         release_artist = _musicbrainz_release_artist(release, artist or "Unknown")
-        matched_recording = None
-        for medium in release.get("media") or []:
-            for track_item in medium.get("tracks") or []:
-                rec = track_item.get("recording") or {}
-                rec_title = rec.get("title") or track_item.get("title") or ""
-                if _metadata_similarity(title, rec_title) >= 0.72:
-                    matched_recording = rec
-                    break
-            if matched_recording:
-                break
+        if artist_known and _metadata_artist_similarity(artist, release_artist) < artist_match_threshold():
+            continue
+        matched_recording = release_contains_requested_track(release)
         if not matched_recording:
             continue
 

@@ -26,7 +26,7 @@ This fork builds on the original ArchiveXM project with usability and metadata i
 * **Jukebox and Library UI Improvements** - Additional frontend refinements improve the Jukebox and music library workflow.
 * **M3U Playlist Generation** - This fork can generate M3U playlist output for use with external IPTV/player apps.
 * **Reverse Proxy URL Support for M3U Links** - M3U stream URLs can be generated using a configured public/reverse-proxy base URL instead of only local Docker/internal addresses, making playlists usable outside the host network.
-* * 📺 **M3U Playlist Generation** - Generate playlist output for external IPTV/player apps, with reverse-proxy-friendly stream URLs
+* 📺 **M3U Playlist Generation** - Generate playlist output for external IPTV/player apps, with reverse-proxy-friendly stream URLs
 
 ### Metadata Ranking Notes
 

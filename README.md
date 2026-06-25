@@ -24,6 +24,9 @@ This fork builds on the original ArchiveXM project with usability and metadata i
 * **Typo-Tolerant Metadata Lookup** - Common title spelling issues are handled more gracefully during metadata search, helping tracks still resolve when local filenames or SiriusXM metadata contain minor spelling differences.
 * **Better Metadata Result Ranking** - Search results are ranked more intentionally to prefer studio albums, then singles, then compilations, while avoiding live albums unless the searched track appears to be a live version.
 * **Jukebox and Library UI Improvements** - Additional frontend refinements improve the Jukebox and music library workflow.
+* **M3U Playlist Generation** - This fork can generate M3U playlist output for use with external IPTV/player apps.
+* **Reverse Proxy URL Support for M3U Links** - M3U stream URLs can be generated using a configured public/reverse-proxy base URL instead of only local Docker/internal addresses, making playlists usable outside the host network.
+* * 📺 **M3U Playlist Generation** - Generate playlist output for external IPTV/player apps, with reverse-proxy-friendly stream URLs
 
 ### Metadata Ranking Notes
 
@@ -87,6 +90,19 @@ Edit `.env` file or environment variables:
 | `FRONTEND_PORT` | 8743        | Web UI port              |
 | `BACKEND_PORT`  | 8742        | API port                 |
 | `DOWNLOAD_PATH` | ./downloads | Local download directory |
+
+### Reverse Proxy / M3U Playlist URLs
+
+This fork adds M3U playlist generation support. When using ArchiveXM behind a reverse proxy, configure the public-facing base URL so generated M3U entries point to the correct externally reachable address.
+
+This is useful when importing the generated M3U playlist into external players or IPTV clients that need to access ArchiveXM through a reverse proxy, custom domain, or HTTPS endpoint.
+
+Example use cases:
+
+* Accessing generated M3U playlists from another device on your network
+* Using ArchiveXM behind Nginx Proxy Manager, Traefik, SWAG, Caddy, or another reverse proxy
+* Generating playlist URLs that use a public hostname instead of a local container or LAN address
+* Supporting external players that need fully qualified stream URLs
 
 ### Ports
 

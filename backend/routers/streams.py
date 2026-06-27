@@ -434,6 +434,15 @@ def _proxied_segment_line(channel_id: str, base_url: str, path_dir: str, segment
     return f"/api/streams/{channel_id}/hls-xtra-resource/{encoded_url}"
 
 
+def _track_from_absolute_playlist_url(absolute_url: str, playlist_text: str) -> dict:
+    """Build an XTRA queue item from a fully-qualified SiriusXM media playlist URL."""
+    playlist_base_url = absolute_url.rsplit("/", 1)[0] + "/"
+    track = _track_from_playlist("", playlist_text, playlist_base_url)
+    track["path"] = absolute_url
+    track["path_dir"] = ""
+    return track
+
+
 def _track_from_playlist(path: str, playlist_text: str, base_url: str) -> dict:
     path_dir = path.rsplit("/", 1)[0] + "/" if "/" in path else ""
     segments = _extract_segments_with_durations(playlist_text)
@@ -866,7 +875,10 @@ async def _ensure_xtra_queue(channel_id: str, session_info: dict, requested_path
             )
 
         if not first_track:
-            first_track = _track_from_playlist(requested_path, initial_playlist_text, session_info.get("base_url", ""))
+            if str(requested_path).startswith(("https://", "http://")):
+                first_track = _track_from_absolute_playlist_url(requested_path, initial_playlist_text)
+            else:
+                first_track = _track_from_playlist(requested_path, initial_playlist_text, session_info.get("base_url", ""))
 
         start_tracks = manual_tracks if manual_tracks else [first_track]
 
@@ -1669,7 +1681,13 @@ async def proxy_stream(channel_id: str, db: DBSession = Depends(get_db)):
             for line in source_lines:
                 line = line.strip()
                 if line and not line.startswith('#'):
-                    rewritten_lines.append(f"/api/streams/{channel_id}/hls-proxy/{line}")
+                    if channel_type == "channel-xtra":
+                        # Preserve the absolute SiriusXM URL for XTRA child playlists.
+                        # Normal hls-proxy is relative to the mutable active base_url,
+                        # which can make HLS.js retry stale *_full_v3.m3u8 paths as 404.
+                        rewritten_lines.append(_proxied_segment_line(channel_id, base_url, "", line))
+                    else:
+                        rewritten_lines.append(f"/api/streams/{channel_id}/hls-proxy/{line}")
                 else:
                     rewritten_lines.append(line)
 
@@ -1745,6 +1763,22 @@ async def hls_proxy(channel_id: str, path: str, db: DBSession = Depends(get_db))
             response = await client.get(full_url, headers=headers, timeout=30)
 
             if response.status_code != 200:
+                # XTRA media-playlist reloads can arrive through an older hls-proxy
+                # path after the active SiriusXM base URL has changed. Do not let
+                # the player get stuck in a 404 retry loop; return the current
+                # stitched EVENT playlist if we still have one.
+                if channel_type == "channel-xtra" and _is_xtra_media_playlist_path(path):
+                    cached = _xtra_sessions.get(channel_id)
+                    if cached:
+                        print(f"⚠️ XTRA hls-proxy stale media playlist path channel={channel_id} path={path}; serving active EVENT playlist")
+                        return Response(
+                            content=_build_xtra_event_playlist(channel_id, cached).encode('utf-8'),
+                            media_type='application/vnd.apple.mpegurl',
+                            headers={
+                                "Access-Control-Allow-Origin": "*",
+                                "Cache-Control": "no-cache"
+                            }
+                        )
                 raise HTTPException(status_code=response.status_code, detail="Proxy fetch failed")
 
             content = response.content
@@ -1810,7 +1844,12 @@ async def hls_proxy(channel_id: str, path: str, db: DBSession = Depends(get_db))
                         else:
                             path_dir = ''
 
-                        if line.startswith('http'):
+                        if channel_type == "channel-xtra":
+                            # XTRA resources may live under different SiriusXM base URLs.
+                            # Route both child playlists and segments through the absolute
+                            # resource proxy instead of rebuilding them from path_dir.
+                            line = _proxied_segment_line(channel_id, base_url, path_dir, line)
+                        elif line.startswith('http'):
                             # Absolute URL - extract path and proxy it
                             line = f"/api/streams/{channel_id}/hls-proxy/{path_dir}{line.split('/')[-1]}"
                         else:
@@ -1877,14 +1916,58 @@ async def hls_xtra_resource_proxy(channel_id: str, encoded_url: str, db: DBSessi
                 print(f"⚠️ XTRA resource fetch failed status={response.status_code} url={absolute_url}")
                 raise HTTPException(status_code=response.status_code, detail="XTRA resource fetch failed")
 
+            content = response.content
             content_type = response.headers.get('content-type', 'application/octet-stream')
 
+            # XTRA child playlists are requested through this absolute-resource
+            # proxy so they do not depend on the mutable hls-proxy base_url. If
+            # this is the FULL media playlist, return ArchiveXM's stitched EVENT
+            # playlist; otherwise rewrite any nested resources back through this
+            # same absolute-resource proxy.
+            if absolute_url.endswith('.m3u8') or 'mpegurl' in content_type.lower():
+                playlist_text = content.decode('utf-8')
+
+                if _is_xtra_media_playlist_path(absolute_url):
+                    session_info = _stream_sessions.get(channel_id) or {}
+                    cached = await _ensure_xtra_queue(
+                        channel_id=channel_id,
+                        session_info=session_info,
+                        requested_path=absolute_url,
+                        initial_playlist_text=playlist_text,
+                    )
+                    if cached:
+                        return Response(
+                            content=_build_xtra_event_playlist(channel_id, cached).encode('utf-8'),
+                            media_type='application/vnd.apple.mpegurl',
+                            headers={
+                                "Access-Control-Allow-Origin": "*",
+                                "Cache-Control": "no-cache"
+                            }
+                        )
+
+                playlist_base = absolute_url.rsplit('/', 1)[0] + '/'
+                rewritten_lines = []
+
+                for raw_line in playlist_text.split('\n'):
+                    line = raw_line.strip()
+
+                    if line.startswith('#EXT-X-KEY:') and 'URI="' in line:
+                        line = _rewrite_key_line_for_proxy(channel_id, line)
+                        rewritten_lines.append(line)
+                    elif line and not line.startswith('#'):
+                        rewritten_lines.append(_proxied_segment_line(channel_id, playlist_base, '', line))
+                    else:
+                        rewritten_lines.append(line)
+
+                content = '\n'.join(rewritten_lines).encode('utf-8')
+                content_type = 'application/vnd.apple.mpegurl'
+
             return Response(
-                content=response.content,
+                content=content,
                 media_type=content_type,
                 headers={
                     "Access-Control-Allow-Origin": "*",
-                    "Cache-Control": "max-age=3600"
+                    "Cache-Control": "no-cache" if absolute_url.endswith('.m3u8') else "max-age=3600"
                 }
             )
 

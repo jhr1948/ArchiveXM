@@ -64,6 +64,18 @@ export const streamsApi = {
   
   getStreamUrl: (channelId) => 
     api.get(`/api/streams/${channelId}/stream-url`),
+
+  getXtraQueue: (channelId) =>
+    api.get(`/api/streams/${channelId}/xtra/queue`),
+
+  xtraNext: (channelId) =>
+    api.post(`/api/streams/${channelId}/xtra/next`),
+
+  xtraPrevious: (channelId) =>
+    api.post(`/api/streams/${channelId}/xtra/previous`),
+
+  xtraResume: (channelId) =>
+    api.post(`/api/streams/${channelId}/xtra/resume`),
   
   // Get proxy stream URL for HLS playback (bypasses CORS)
   getProxyStreamUrl: (channelId) => 
@@ -144,6 +156,9 @@ export const libraryApi = {
 
   getExternalMetadataUrl: (trackId) =>
     `${API_URL}/api/library/files/${trackId}/metadata`,
+
+  captureCurrentToPlaylist: (playlistId, payload = {}) =>
+    api.post(`/api/library/playlists/${playlistId}/capture-current`, payload),
   
   deleteTrack: (trackId, deleteFile = false) => 
     api.delete(`/api/library/tracks/${trackId}`, { params: { delete_file: deleteFile } }),

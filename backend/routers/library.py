@@ -2480,6 +2480,62 @@ async def capture_current_to_playlist(
         # duration from the next timed schedule item when possible.
         track_payload["duration_ms"] = 240000
 
+    existing_library_track = _find_existing_jukebox_track(
+        db,
+        track_payload.get("artist"),
+        track_payload.get("title"),
+        track_payload.get("duration_ms"),
+    )
+    if existing_library_track:
+        existing_playlist_track = db.query(PlaylistTrack).filter(
+            PlaylistTrack.playlist_id == playlist_id,
+            PlaylistTrack.track_id == existing_library_track.id,
+        ).first()
+
+        added_to_playlist = False
+        if not existing_playlist_track:
+            max_pos = db.query(func.max(PlaylistTrack.position)).filter(
+                PlaylistTrack.playlist_id == playlist_id
+            ).scalar() or 0
+            db.add(PlaylistTrack(
+                playlist_id=playlist_id,
+                track_id=existing_library_track.id,
+                position=max_pos + 1,
+            ))
+            added_to_playlist = True
+
+        playlist.track_count = db.query(PlaylistTrack).filter(PlaylistTrack.playlist_id == playlist_id).count()
+        db.commit()
+
+        if existing_playlist_track:
+            message = f"Already in Jukebox and already in {playlist.name}."
+        elif added_to_playlist:
+            message = f"Already in Jukebox; added to {playlist.name}."
+        else:
+            message = "Already in Jukebox; download skipped."
+
+        return {
+            "success": True,
+            "message": message,
+            "playlist_id": playlist_id,
+            "playlist_name": playlist.name,
+            "download_id": None,
+            "channel_id": request.channel_id,
+            "channel_type": request.channel_type,
+            "already_in_jukebox": True,
+            "already_in_playlist": bool(existing_playlist_track),
+            "added_to_playlist": added_to_playlist,
+            "local_track_id": existing_library_track.id,
+            "track": {
+                "artist": existing_library_track.artist or track_payload.get("artist"),
+                "title": existing_library_track.title or track_payload.get("title"),
+                "album": existing_library_track.album or track_payload.get("album"),
+                "duration_ms": int((existing_library_track.duration_seconds or 0) * 1000) if existing_library_track.duration_seconds else track_payload.get("duration_ms"),
+                "timestamp_utc": track_payload.get("timestamp_utc"),
+                "image_url": track_payload.get("image_url"),
+            },
+        }
+
     config = db.query(Config).filter(Config.key == "download_path").first()
     download_path = config.value if config else os.getenv("DOWNLOAD_PATH", "/downloads")
 

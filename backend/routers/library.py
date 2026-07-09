@@ -113,11 +113,15 @@ class MetadataApplyRequest(BaseModel):
     artist: Optional[str] = None
     title: Optional[str] = None
     album: Optional[str] = None
+    genre: Optional[str] = None
     year: Optional[str] = None
     cover_url: Optional[str] = None
     provider: Optional[str] = None
     recording_id: Optional[str] = None
     release_id: Optional[str] = None
+    # Optional per-field controls from the manual metadata apply dialog.
+    # When omitted, preserve the old behavior and apply all available fields.
+    apply_fields: Optional[Dict[str, bool]] = None
 
 
 def _first_text(*values, default: str = "") -> str:
@@ -2187,17 +2191,35 @@ async def apply_track_metadata(
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
 
-    if request.artist is not None and str(request.artist).strip():
+    apply_fields = request.apply_fields
+
+    def should_apply(*names: str) -> bool:
+        # Backward compatible: old frontend sent only the candidate payload,
+        # which should still apply all available metadata.
+        if apply_fields is None:
+            return True
+        return any(bool(apply_fields.get(name)) for name in names)
+
+    applied_fields: List[str] = []
+
+    if should_apply("artist") and request.artist is not None and str(request.artist).strip():
         track.artist = str(request.artist).strip()
-    if request.title is not None and str(request.title).strip():
+        applied_fields.append("artist")
+    if should_apply("title", "track_title") and request.title is not None and str(request.title).strip():
         track.title = str(request.title).strip()
-    if request.album is not None:
+        applied_fields.append("title")
+    if should_apply("album", "album_title") and request.album is not None:
         track.album = str(request.album).strip() or None
+        applied_fields.append("album")
+    if should_apply("genre") and request.genre is not None:
+        track.genre = str(request.genre).strip() or None
+        applied_fields.append("genre")
 
     cover_error = None
-    if request.cover_url:
+    if should_apply("cover_art", "cover", "artwork") and request.cover_url:
         try:
             await _save_track_cover_from_url(db, track, request.cover_url)
+            applied_fields.append("cover_art")
         except Exception as e:
             cover_error = str(e)
             print(f"Metadata apply: cover download failed for track {track.id}: {e}")
@@ -2214,6 +2236,7 @@ async def apply_track_metadata(
             "recording_id": request.recording_id,
             "release_id": request.release_id,
             "year": request.year,
+            "applied_fields": applied_fields,
         },
     }
 

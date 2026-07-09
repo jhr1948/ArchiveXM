@@ -79,6 +79,7 @@ function JukeboxPage() {
   const [coverUrlInput, setCoverUrlInput] = useState('')
   const [coverUploadFile, setCoverUploadFile] = useState(null)
   const [coverRefreshKey, setCoverRefreshKey] = useState(0)
+  const [trackCoverRefreshKey, setTrackCoverRefreshKey] = useState(0)
   
   // Context menu for track actions
   const [contextMenu, setContextMenu] = useState({ show: false, x: 0, y: 0, track: null, index: -1 })
@@ -92,6 +93,14 @@ function JukeboxPage() {
   const [metadataLoading, setMetadataLoading] = useState(false)
   const [metadataApplying, setMetadataApplying] = useState(false)
   const [metadataError, setMetadataError] = useState('')
+  const [metadataApplyCandidate, setMetadataApplyCandidate] = useState(null)
+  const [metadataApplyFields, setMetadataApplyFields] = useState({
+    cover_art: true,
+    title: true,
+    artist: true,
+    album: true,
+    genre: true
+  })
 
   useEffect(() => {
     loadLibrary()
@@ -178,6 +187,12 @@ function JukeboxPage() {
   const playlistCoverSrc = (playlist) => {
     if (!playlist?.id) return null
     return `${libraryApi.getPlaylistCoverUrl(playlist.id)}?v=${coverRefreshKey}`
+  }
+
+  const trackCoverSrc = (trackOrId) => {
+    const trackId = typeof trackOrId === 'object' ? trackOrId?.id : trackOrId
+    if (!trackId) return ''
+    return `${libraryApi.getCoverUrl(trackId)}?v=${trackCoverRefreshKey}`
   }
 
   const openCoverEditor = (playlist) => {
@@ -437,8 +452,59 @@ This removes it from all playlists and deletes the local audio file.`
     }
   }
 
+  const metadataFieldDefinitions = (candidate) => [
+    {
+      key: 'cover_art',
+      label: 'Cover art',
+      current: metadataTarget?.cover_art_path ? 'Existing cover art' : 'No saved cover art',
+      next: candidate?.cover_url ? 'Matched cover art' : 'No cover art from match',
+      hasNew: Boolean(candidate?.cover_url),
+      isCover: true
+    },
+    {
+      key: 'title',
+      label: 'Song title',
+      current: metadataTarget?.title || metadataTarget?.filename || '',
+      next: candidate?.title || '',
+      hasNew: Boolean(candidate?.title)
+    },
+    {
+      key: 'artist',
+      label: 'Artist',
+      current: metadataTarget?.artist || '',
+      next: candidate?.artist || '',
+      hasNew: Boolean(candidate?.artist)
+    },
+    {
+      key: 'album',
+      label: 'Album title',
+      current: metadataTarget?.album || '',
+      next: candidate?.album || '',
+      hasNew: Boolean(candidate?.album)
+    },
+    {
+      key: 'genre',
+      label: 'Genre',
+      current: metadataTarget?.genre || '',
+      next: candidate?.genre || '',
+      hasNew: Boolean(candidate?.genre)
+    }
+  ]
+
+  const defaultMetadataApplyFields = (candidate) => {
+    const next = {}
+    metadataFieldDefinitions(candidate).forEach((field) => {
+      next[field.key] = field.hasNew
+    })
+    return next
+  }
+
   const refreshTrackAfterMetadataApply = async (trackId) => {
     try {
+      // Force browsers to request fresh cover images after artwork replacement.
+      // Chrome can otherwise keep showing the old cached /api/library/tracks/:id/cover image.
+      setTrackCoverRefreshKey(prev => prev + 1)
+
       const [tracksRes, playlistsRes, statsRes] = await Promise.all([
         libraryApi.getTracks({ limit: 500 }),
         libraryApi.getPlaylists(),
@@ -482,16 +548,44 @@ This removes it from all playlists and deletes the local audio file.`
     if (metadataApplying) return
     setMetadataTarget(null)
     setMetadataCandidates([])
+    setMetadataApplyCandidate(null)
     setMetadataError('')
   }
 
-  const applyMetadataCandidate = async (candidate) => {
-    if (!metadataTarget || !candidate) return
+  const beginMetadataApply = (candidate) => {
+    if (!candidate) return
+    setMetadataApplyCandidate(candidate)
+    setMetadataApplyFields(defaultMetadataApplyFields(candidate))
+    setMetadataError('')
+  }
+
+  const toggleMetadataApplyField = (fieldKey) => {
+    setMetadataApplyFields(prev => ({
+      ...prev,
+      [fieldKey]: !prev[fieldKey]
+    }))
+  }
+
+  const selectOnlyMissingMetadataFields = () => {
+    if (!metadataApplyCandidate) return
+    const next = {}
+    metadataFieldDefinitions(metadataApplyCandidate).forEach((field) => {
+      const currentValue = String(field.current || '').trim()
+      next[field.key] = field.hasNew && (!currentValue || currentValue === 'No saved cover art')
+    })
+    setMetadataApplyFields(next)
+  }
+
+  const applyMetadataCandidate = async () => {
+    if (!metadataTarget || !metadataApplyCandidate) return
     setMetadataApplying(true)
     setMetadataError('')
 
     try {
-      await libraryApi.applyTrackMetadata(metadataTarget.id, candidate)
+      await libraryApi.applyTrackMetadata(metadataTarget.id, {
+        ...metadataApplyCandidate,
+        apply_fields: metadataApplyFields
+      })
       await refreshTrackAfterMetadataApply(metadataTarget.id)
       closeMetadataLookup()
     } catch (error) {
@@ -778,7 +872,7 @@ This removes it from all playlists and deletes the local audio file.`
                 <div className="w-12 h-12 bg-gray-800 rounded flex items-center justify-center flex-shrink-0 overflow-hidden">
                   {currentTrack.cover_art_path ? (
                     <img 
-                      src={libraryApi.getCoverUrl(currentTrack.id)} 
+                      src={trackCoverSrc(currentTrack)} 
                       alt="" 
                       className="w-full h-full object-cover"
                     />
@@ -1006,7 +1100,7 @@ This removes it from all playlists and deletes the local audio file.`
                           <div className="w-8 h-8 sm:w-10 sm:h-10 bg-gray-800 rounded flex items-center justify-center flex-shrink-0 overflow-hidden">
                             {track.cover_art_path ? (
                               <img 
-                                src={libraryApi.getCoverUrl(track.id)} 
+                                src={trackCoverSrc(track)} 
                                 alt="" 
                                 className="w-full h-full object-cover"
                                 onError={(e) => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex' }}
@@ -1188,7 +1282,7 @@ This removes it from all playlists and deletes the local audio file.`
                               <div className="w-10 h-10 bg-gray-800 rounded flex items-center justify-center flex-shrink-0 overflow-hidden">
                                 {pt.track.cover_art_path ? (
                                   <img 
-                                    src={libraryApi.getCoverUrl(pt.track.id)} 
+                                    src={trackCoverSrc(pt.track)} 
                                     alt="" 
                                     className="w-full h-full object-cover"
                                   />
@@ -1474,7 +1568,7 @@ This removes it from all playlists and deletes the local audio file.`
               <>
                 <div className="w-14 h-14 bg-gray-800 rounded-xl flex items-center justify-center flex-shrink-0 overflow-hidden">
                   {currentTrack.cover_art_path ? (
-                    <img src={libraryApi.getCoverUrl(currentTrack.id)} alt="" className="w-full h-full object-cover" />
+                    <img src={trackCoverSrc(currentTrack)} alt="" className="w-full h-full object-cover" />
                   ) : (
                     <Music className="w-7 h-7 text-gray-600" />
                   )}
@@ -1560,7 +1654,7 @@ This removes it from all playlists and deletes the local audio file.`
                 <div className="w-20 h-20 bg-gray-800 rounded-xl flex items-center justify-center flex-shrink-0 overflow-hidden">
                   {currentTrack.cover_art_path ? (
                     <img
-                      src={libraryApi.getCoverUrl(currentTrack.id)}
+                      src={trackCoverSrc(currentTrack)}
                       alt=""
                       className="w-full h-full object-cover"
                     />
@@ -1827,49 +1921,153 @@ This removes it from all playlists and deletes the local audio file.`
                   </div>
                 )}
 
-                <div className="space-y-3 max-h-96 overflow-y-auto">
-                  {metadataCandidates.map((candidate, index) => (
-                    <div
-                      key={`${candidate.release_id || candidate.recording_id || index}-${index}`}
-                      className="flex items-center gap-4 rounded-lg bg-gray-800/80 border border-gray-700 p-3"
-                    >
-                      <div className="w-16 h-16 rounded bg-gray-950 flex items-center justify-center overflow-hidden shrink-0">
-                        {candidate.cover_url ? (
-                          <img
-                            src={candidate.cover_url}
-                            alt=""
-                            className="w-full h-full object-cover"
-                            onError={(e) => { e.currentTarget.style.display = 'none' }}
-                          />
-                        ) : (
-                          <Album className="w-7 h-7 text-gray-600" />
-                        )}
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-white font-medium truncate">{candidate.album || candidate.title || 'Unknown release'}</p>
-                        <p className="text-gray-300 text-sm truncate">{candidate.artist || 'Unknown'} - {candidate.title || metadataTarget.title}</p>
-                        <p className="text-gray-500 text-xs truncate">
-                          {candidate.year || 'No year'} • {candidate.release_type || 'Release'} • Confidence {Math.round((candidate.confidence || 0) * 100)}%
-                        </p>
-                      </div>
-                      <button
-                        onClick={() => applyMetadataCandidate(candidate)}
-                        disabled={metadataApplying}
-                        className="px-4 py-2 bg-primary hover:bg-primary/80 text-white rounded-lg disabled:opacity-50 flex items-center gap-2"
-                      >
-                        {metadataApplying ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-                        Apply
-                      </button>
+                {metadataApplyCandidate ? (
+                  <div className="space-y-4">
+                    <div className="rounded-lg border border-primary/30 bg-primary/10 px-4 py-3">
+                      <p className="text-white font-semibold">Apply metadata from selected match?</p>
+                      <p className="text-gray-300 text-sm mt-1">
+                        Choose exactly which fields to replace. Only checked fields will be updated.
+                      </p>
                     </div>
-                  ))}
 
-                  {!metadataCandidates.length && !metadataError && (
-                    <div className="py-10 text-center text-gray-500">
-                      <Search className="w-10 h-10 mx-auto mb-3 opacity-60" />
-                      <p>No candidates found.</p>
+                    <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
+                      {metadataFieldDefinitions(metadataApplyCandidate).map((field) => (
+                        <label
+                          key={field.key}
+                          className={`block rounded-lg border p-3 ${field.hasNew ? 'border-gray-700 bg-gray-800/80' : 'border-gray-800 bg-gray-900/70 opacity-60'}`}
+                        >
+                          <div className="flex items-start gap-3">
+                            <input
+                              type="checkbox"
+                              checked={Boolean(metadataApplyFields[field.key])}
+                              disabled={!field.hasNew || metadataApplying}
+                              onChange={() => toggleMetadataApplyField(field.key)}
+                              className="mt-1 h-4 w-4 accent-primary"
+                            />
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center justify-between gap-3">
+                                <span className="text-white font-medium">{field.label}</span>
+                                {!field.hasNew && <span className="text-xs text-gray-500">No value from match</span>}
+                              </div>
+                              {field.isCover ? (
+                                <div className="mt-3 grid grid-cols-2 gap-3">
+                                  <div>
+                                    <p className="text-xs text-gray-500 mb-1">Current</p>
+                                    <div className="h-20 rounded bg-gray-950 border border-gray-700 flex items-center justify-center overflow-hidden">
+                                      {metadataTarget?.cover_art_path ? (
+                                        <img src={trackCoverSrc(metadataTarget)} alt="Current cover" className="h-full w-full object-cover" />
+                                      ) : (
+                                        <span className="text-xs text-gray-500">No cover</span>
+                                      )}
+                                    </div>
+                                  </div>
+                                  <div>
+                                    <p className="text-xs text-gray-500 mb-1">New</p>
+                                    <div className="h-20 rounded bg-gray-950 border border-gray-700 flex items-center justify-center overflow-hidden">
+                                      {metadataApplyCandidate.cover_url ? (
+                                        <img src={metadataApplyCandidate.cover_url} alt="Matched cover" className="h-full w-full object-cover" />
+                                      ) : (
+                                        <span className="text-xs text-gray-500">No cover</span>
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                                  <div>
+                                    <p className="text-xs text-gray-500">Current</p>
+                                    <p className="text-gray-300 truncate">{field.current || 'Blank'}</p>
+                                  </div>
+                                  <div>
+                                    <p className="text-xs text-gray-500">New</p>
+                                    <p className="text-gray-100 truncate">{field.next || 'Blank'}</p>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </label>
+                      ))}
                     </div>
-                  )}
-                </div>
+
+                    {metadataApplyCandidate.year && (
+                      <p className="text-xs text-gray-500">
+                        Release year from match: {metadataApplyCandidate.year}. ArchiveXM does not currently store release year as a separate Jukebox field.
+                      </p>
+                    )}
+
+                    <div className="flex flex-wrap justify-between gap-3 pt-2">
+                      <button
+                        onClick={() => setMetadataApplyCandidate(null)}
+                        disabled={metadataApplying}
+                        className="px-4 py-2 rounded-lg border border-gray-700 text-gray-300 hover:text-white hover:border-gray-500 disabled:opacity-50"
+                      >
+                        Back to matches
+                      </button>
+                      <div className="flex flex-wrap gap-3">
+                        <button
+                          onClick={selectOnlyMissingMetadataFields}
+                          disabled={metadataApplying}
+                          className="px-4 py-2 rounded-lg border border-gray-700 text-gray-300 hover:text-white hover:border-gray-500 disabled:opacity-50"
+                        >
+                          Apply only missing fields
+                        </button>
+                        <button
+                          onClick={applyMetadataCandidate}
+                          disabled={metadataApplying || !Object.values(metadataApplyFields).some(Boolean)}
+                          className="px-4 py-2 bg-primary hover:bg-primary/80 text-white rounded-lg disabled:opacity-50 flex items-center gap-2"
+                        >
+                          {metadataApplying ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                          Apply selected fields
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-3 max-h-96 overflow-y-auto">
+                    {metadataCandidates.map((candidate, index) => (
+                      <div
+                        key={`${candidate.release_id || candidate.recording_id || index}-${index}`}
+                        className="flex items-center gap-4 rounded-lg bg-gray-800/80 border border-gray-700 p-3"
+                      >
+                        <div className="w-16 h-16 rounded bg-gray-950 flex items-center justify-center overflow-hidden shrink-0">
+                          {candidate.cover_url ? (
+                            <img
+                              src={candidate.cover_url}
+                              alt=""
+                              className="w-full h-full object-cover"
+                              onError={(e) => { e.currentTarget.style.display = 'none' }}
+                            />
+                          ) : (
+                            <Album className="w-7 h-7 text-gray-600" />
+                          )}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-white font-medium truncate">{candidate.album || candidate.title || 'Unknown release'}</p>
+                          <p className="text-gray-300 text-sm truncate">{candidate.artist || 'Unknown'} - {candidate.title || metadataTarget.title}</p>
+                          <p className="text-gray-500 text-xs truncate">
+                            {candidate.year || 'No year'} • {candidate.release_type || 'Release'} • Confidence {Math.round((candidate.confidence || 0) * 100)}%
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => beginMetadataApply(candidate)}
+                          disabled={metadataApplying}
+                          className="px-4 py-2 bg-primary hover:bg-primary/80 text-white rounded-lg disabled:opacity-50 flex items-center gap-2"
+                        >
+                          {metadataApplying ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                          Apply
+                        </button>
+                      </div>
+                    ))}
+
+                    {!metadataCandidates.length && !metadataError && (
+                      <div className="py-10 text-center text-gray-500">
+                        <Search className="w-10 h-10 mx-auto mb-3 opacity-60" />
+                        <p>No candidates found.</p>
+                      </div>
+                    )}
+                  </div>
+                )}
               </>
             )}
           </div>

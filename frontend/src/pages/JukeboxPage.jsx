@@ -4,7 +4,7 @@ import {
   Music, Play, Pause, SkipBack, SkipForward, Volume2, VolumeX,
   Shuffle, Repeat, List, Plus, Search, RefreshCw, Disc3,
   MoreVertical, Trash2, ListPlus, X, ChevronLeft, ChevronRight,
-  Clock, Library, User, Album, Loader2, Radio, Home, Circle, Square, Copy, Image, Upload, CheckSquare
+  Clock, Library, User, Album, Loader2, Radio, Home, Circle, Square, Copy, Image, Upload, CheckSquare, Pencil
 } from 'lucide-react'
 import { libraryApi } from '../services/api'
 import { useJukebox } from '../context/JukeboxContext'
@@ -98,9 +98,30 @@ function JukeboxPage() {
     cover_art: true,
     title: true,
     artist: true,
+    album_artist: true,
     album: true,
-    genre: true
+    year: true,
+    genre: true,
+    track_number: true,
+    disc_number: true
   })
+  const [metadataSearchForm, setMetadataSearchForm] = useState({ artist: '', title: '', album: '' })
+
+  // Manual metadata editor
+  const [metadataEditTarget, setMetadataEditTarget] = useState(null)
+  const [metadataEditForm, setMetadataEditForm] = useState({
+    title: '',
+    artist: '',
+    album_artist: '',
+    album: '',
+    year: '',
+    genre: '',
+    track_number: '',
+    disc_number: '',
+    cover_url: ''
+  })
+  const [metadataEditSaving, setMetadataEditSaving] = useState(false)
+  const [metadataEditError, setMetadataEditError] = useState('')
 
   useEffect(() => {
     loadLibrary()
@@ -476,6 +497,13 @@ This removes it from all playlists and deletes the local audio file.`
       hasNew: Boolean(candidate?.artist)
     },
     {
+      key: 'album_artist',
+      label: 'Album artist',
+      current: metadataTarget?.album_artist || '',
+      next: candidate?.album_artist || candidate?.artist || '',
+      hasNew: Boolean(candidate?.album_artist || candidate?.artist)
+    },
+    {
       key: 'album',
       label: 'Album title',
       current: metadataTarget?.album || '',
@@ -483,11 +511,32 @@ This removes it from all playlists and deletes the local audio file.`
       hasNew: Boolean(candidate?.album)
     },
     {
+      key: 'year',
+      label: 'Release year',
+      current: metadataTarget?.year || '',
+      next: candidate?.year || '',
+      hasNew: Boolean(candidate?.year)
+    },
+    {
       key: 'genre',
       label: 'Genre',
       current: metadataTarget?.genre || '',
       next: candidate?.genre || '',
       hasNew: Boolean(candidate?.genre)
+    },
+    {
+      key: 'track_number',
+      label: 'Track number',
+      current: metadataTarget?.track_number || '',
+      next: candidate?.track_number || '',
+      hasNew: Boolean(candidate?.track_number)
+    },
+    {
+      key: 'disc_number',
+      label: 'Disc number',
+      current: metadataTarget?.disc_number || '',
+      next: candidate?.disc_number || '',
+      hasNew: Boolean(candidate?.disc_number)
     }
   ]
 
@@ -523,18 +572,25 @@ This removes it from all playlists and deletes the local audio file.`
     }
   }
 
-  const openMetadataLookup = async (track) => {
+  const runMetadataSearch = async (track = metadataTarget, form = metadataSearchForm) => {
     if (!track) return
-    setMetadataTarget(track)
+
+    const params = {
+      artist: form.artist || '',
+      title: form.title || '',
+      album: form.album || ''
+    }
+
     setMetadataCandidates([])
+    setMetadataApplyCandidate(null)
     setMetadataError('')
     setMetadataLoading(true)
 
     try {
-      const response = await libraryApi.searchTrackMetadata(track.id)
+      const response = await libraryApi.searchTrackMetadata(track.id, params)
       setMetadataCandidates(response.data?.candidates || [])
       if (!response.data?.candidates?.length) {
-        setMetadataError('No metadata matches found. Try editing artist/title manually later or search again after correcting the track name.')
+        setMetadataError('No metadata matches found. Try changing the Artist / Title / Album search fields and search again.')
       }
     } catch (error) {
       console.error('Error searching metadata:', error)
@@ -544,12 +600,38 @@ This removes it from all playlists and deletes the local audio file.`
     }
   }
 
+  const openMetadataLookup = (track) => {
+    if (!track) return
+    const form = {
+      artist: track.artist || '',
+      title: track.title || track.filename || '',
+      album: track.album || ''
+    }
+    setMetadataTarget(track)
+    setMetadataSearchForm(form)
+    setMetadataCandidates([])
+    setMetadataApplyCandidate(null)
+    setMetadataError('')
+    setMetadataLoading(false)
+  }
+
   const closeMetadataLookup = () => {
     if (metadataApplying) return
     setMetadataTarget(null)
     setMetadataCandidates([])
     setMetadataApplyCandidate(null)
+    setMetadataSearchForm({ artist: '', title: '', album: '' })
     setMetadataError('')
+  }
+
+  const resetMetadataSearchForm = () => {
+    if (!metadataTarget) return
+    const form = {
+      artist: metadataTarget.artist || '',
+      title: metadataTarget.title || metadataTarget.filename || '',
+      album: metadataTarget.album || ''
+    }
+    setMetadataSearchForm(form)
   }
 
   const beginMetadataApply = (candidate) => {
@@ -593,6 +675,45 @@ This removes it from all playlists and deletes the local audio file.`
       setMetadataError(error.response?.data?.detail || 'Failed to apply metadata')
     } finally {
       setMetadataApplying(false)
+    }
+  }
+
+  const openMetadataEditor = (track) => {
+    if (!track) return
+    setMetadataEditTarget(track)
+    setMetadataEditForm({
+      title: track.title || '',
+      artist: track.artist || '',
+      album_artist: track.album_artist || '',
+      album: track.album || '',
+      year: track.year || '',
+      genre: track.genre || '',
+      track_number: track.track_number || '',
+      disc_number: track.disc_number || '',
+      cover_url: ''
+    })
+    setMetadataEditError('')
+  }
+
+  const closeMetadataEditor = () => {
+    if (metadataEditSaving) return
+    setMetadataEditTarget(null)
+    setMetadataEditError('')
+  }
+
+  const saveMetadataEditor = async () => {
+    if (!metadataEditTarget) return
+    setMetadataEditSaving(true)
+    setMetadataEditError('')
+    try {
+      await libraryApi.updateTrackMetadata(metadataEditTarget.id, metadataEditForm)
+      await refreshTrackAfterMetadataApply(metadataEditTarget.id)
+      closeMetadataEditor()
+    } catch (error) {
+      console.error('Error saving manual metadata:', error)
+      setMetadataEditError(error.response?.data?.detail || 'Failed to save metadata')
+    } finally {
+      setMetadataEditSaving(false)
     }
   }
 
@@ -1137,6 +1258,13 @@ This removes it from all playlists and deletes the local audio file.`
                             title="Find missing metadata"
                           >
                             <Search className="w-4 h-4" />
+                          </button>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); openMetadataEditor(track) }}
+                            className="hidden sm:block p-1 text-gray-500 hover:text-primary"
+                            title="Edit metadata manually"
+                          >
+                            <Pencil className="w-4 h-4" />
                           </button>
                           <button
                             onClick={(e) => { e.stopPropagation(); setTrackToAdd(track) }}
@@ -1753,6 +1881,13 @@ This removes it from all playlists and deletes the local audio file.`
                   <Search className="w-6 h-6" />
                 </button>
                 <button
+                  onClick={() => openMetadataEditor(currentTrack)}
+                  className="text-gray-400 hover:text-primary transition-colors"
+                  title="Edit metadata manually"
+                >
+                  <Pencil className="w-6 h-6" />
+                </button>
+                <button
                   onClick={() => deleteTrackEverywhere(currentTrack)}
                   className="text-gray-400 hover:text-red-400 transition-colors"
                   title="Delete song from Jukebox"
@@ -1908,6 +2043,60 @@ This removes it from all playlists and deletes the local audio file.`
               </button>
             </div>
 
+            {!metadataApplyCandidate && (
+              <div className="mb-4 rounded-lg border border-gray-700 bg-gray-800/70 p-4">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <label className="block">
+                    <span className="text-xs text-gray-400">Search artist</span>
+                    <input
+                      type="text"
+                      value={metadataSearchForm.artist}
+                      onChange={(e) => setMetadataSearchForm(prev => ({ ...prev, artist: e.target.value }))}
+                      className="mt-1 w-full px-3 py-2 bg-gray-950 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-primary"
+                      placeholder="Try OMD or Orchestral Manoeuvres..."
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="text-xs text-gray-400">Search title</span>
+                    <input
+                      type="text"
+                      value={metadataSearchForm.title}
+                      onChange={(e) => setMetadataSearchForm(prev => ({ ...prev, title: e.target.value }))}
+                      className="mt-1 w-full px-3 py-2 bg-gray-950 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-primary"
+                      placeholder="Song title"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="text-xs text-gray-400">Album hint</span>
+                    <input
+                      type="text"
+                      value={metadataSearchForm.album}
+                      onChange={(e) => setMetadataSearchForm(prev => ({ ...prev, album: e.target.value }))}
+                      className="mt-1 w-full px-3 py-2 bg-gray-950 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-primary"
+                      placeholder="Optional"
+                    />
+                  </label>
+                </div>
+                <div className="mt-3 flex flex-wrap justify-end gap-2">
+                  <button
+                    onClick={resetMetadataSearchForm}
+                    disabled={metadataLoading}
+                    className="px-3 py-2 rounded-lg border border-gray-700 text-gray-300 hover:text-white hover:border-gray-500 disabled:opacity-50"
+                  >
+                    Reset to track tags
+                  </button>
+                  <button
+                    onClick={() => runMetadataSearch()}
+                    disabled={metadataLoading || !metadataSearchForm.title.trim()}
+                    className="px-4 py-2 bg-primary hover:bg-primary/80 text-white rounded-lg disabled:opacity-50 flex items-center gap-2"
+                  >
+                    {metadataLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+                    Search
+                  </button>
+                </div>
+              </div>
+            )}
+
             {metadataLoading ? (
               <div className="flex items-center justify-center gap-3 py-10 text-gray-300">
                 <Loader2 className="w-6 h-6 animate-spin text-primary" />
@@ -1992,7 +2181,7 @@ This removes it from all playlists and deletes the local audio file.`
 
                     {metadataApplyCandidate.year && (
                       <p className="text-xs text-gray-500">
-                        Release year from match: {metadataApplyCandidate.year}. ArchiveXM does not currently store release year as a separate Jukebox field.
+                        Release year from match: {metadataApplyCandidate.year}. Check “Release year” above to store it on this Jukebox track.
                       </p>
                     )}
 
@@ -2063,7 +2252,7 @@ This removes it from all playlists and deletes the local audio file.`
                     {!metadataCandidates.length && !metadataError && (
                       <div className="py-10 text-center text-gray-500">
                         <Search className="w-10 h-10 mx-auto mb-3 opacity-60" />
-                        <p>No candidates found.</p>
+                        <p>Adjust the search fields above, then click Search.</p>
                       </div>
                     )}
                   </div>
@@ -2220,6 +2409,87 @@ This removes it from all playlists and deletes the local audio file.`
         </div>
       )}
 
+      {/* Manual Metadata Editor Modal */}
+      {metadataEditTarget && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-2xl shadow-2xl">
+            <div className="flex items-start justify-between gap-4 mb-4">
+              <div>
+                <h3 className="text-xl font-bold text-white">Edit Metadata</h3>
+                <p className="text-gray-400 text-sm mt-1 truncate">
+                  {metadataEditTarget.artist || 'Unknown'} - {metadataEditTarget.title || metadataEditTarget.filename}
+                </p>
+              </div>
+              <button
+                onClick={closeMetadataEditor}
+                className="text-gray-400 hover:text-white"
+                title="Close"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {metadataEditError && (
+              <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300">
+                {metadataEditError}
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {[
+                ['title', 'Song title'],
+                ['artist', 'Artist'],
+                ['album_artist', 'Album artist'],
+                ['album', 'Album title'],
+                ['year', 'Release year'],
+                ['genre', 'Genre'],
+                ['track_number', 'Track number'],
+                ['disc_number', 'Disc number']
+              ].map(([key, label]) => (
+                <label key={key} className="block">
+                  <span className="text-xs text-gray-400">{label}</span>
+                  <input
+                    type="text"
+                    value={metadataEditForm[key] || ''}
+                    onChange={(e) => setMetadataEditForm(prev => ({ ...prev, [key]: e.target.value }))}
+                    className="mt-1 w-full px-3 py-2 bg-gray-950 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-primary"
+                  />
+                </label>
+              ))}
+            </div>
+
+            <label className="block mt-4">
+              <span className="text-xs text-gray-400">Replace cover art from URL</span>
+              <input
+                type="text"
+                value={metadataEditForm.cover_url || ''}
+                onChange={(e) => setMetadataEditForm(prev => ({ ...prev, cover_url: e.target.value }))}
+                className="mt-1 w-full px-3 py-2 bg-gray-950 border border-gray-700 rounded-lg text-white focus:outline-none focus:border-primary"
+                placeholder="https://...jpg or leave blank to keep current cover"
+              />
+            </label>
+
+            <div className="mt-6 flex flex-wrap justify-end gap-3">
+              <button
+                onClick={closeMetadataEditor}
+                disabled={metadataEditSaving}
+                className="px-4 py-2 rounded-lg border border-gray-700 text-gray-300 hover:text-white hover:border-gray-500 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={saveMetadataEditor}
+                disabled={metadataEditSaving}
+                className="px-4 py-2 bg-primary hover:bg-primary/80 text-white rounded-lg disabled:opacity-50 flex items-center gap-2"
+              >
+                {metadataEditSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                Save metadata
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Context Menu */}
       {contextMenu.show && (
         <div 
@@ -2255,6 +2525,13 @@ This removes it from all playlists and deletes the local audio file.`
           >
             <Search className="w-4 h-4" />
             <span>Find Metadata</span>
+          </button>
+          <button
+            onClick={() => { openMetadataEditor(contextMenu.track); closeContextMenu() }}
+            className="w-full flex items-center gap-3 px-4 py-2 text-left text-white hover:bg-gray-700 transition-colors"
+          >
+            <Pencil className="w-4 h-4" />
+            <span>Edit Metadata</span>
           </button>
           <button
             onClick={() => { setTrackToAdd(contextMenu.track); closeContextMenu() }}

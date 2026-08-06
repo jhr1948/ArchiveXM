@@ -35,6 +35,40 @@ class AuthService:
         
         return key
     
+
+    def _find_lineup_id(self, value):
+        """Best-effort extraction of SiriusXM lineup id from nested API responses."""
+        preferred_keys = {
+            'channelLineupId', 'channel_lineup_id', 'lineupId', 'lineup_id',
+            'channelLineupID', 'channelLineup', 'lineup'
+        }
+
+        def looks_like_lineup_key(key: str) -> bool:
+            key_l = str(key or '').lower()
+            return 'lineup' in key_l and ('id' in key_l or key_l.endswith('lineup'))
+
+        def walk(node):
+            if isinstance(node, dict):
+                for key, item in node.items():
+                    if (key in preferred_keys or looks_like_lineup_key(key)) and item not in (None, ''):
+                        if isinstance(item, (str, int)):
+                            return str(item)
+                        if isinstance(item, dict):
+                            for id_key in ('id', 'lineupId', 'channelLineupId', 'uuid'):
+                                if item.get(id_key):
+                                    return str(item[id_key])
+                    found = walk(item)
+                    if found:
+                        return found
+            elif isinstance(node, list):
+                for item in node:
+                    found = walk(item)
+                    if found:
+                        return found
+            return None
+
+        return walk(value)
+
     def encrypt_password(self, password: str) -> str:
         """Encrypt password for storage"""
         return self.fernet.encrypt(password.encode()).decode()
@@ -187,6 +221,12 @@ class AuthService:
                 if not expires_at:
                     expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
                 
+                lineup_id = self._find_lineup_id(data)
+                if lineup_id:
+                    print(f"📻 Channel lineup id: {lineup_id}")
+                else:
+                    print("⚠️ No channel lineup id found in authenticated session response")
+
                 print(f"✅ Authentication successful!")
                 print(f"🎫 Bearer token: {bearer_token[:20]}...")
                 print(f"⏰ Token expires: {expires_at}")
@@ -195,7 +235,8 @@ class AuthService:
                     "success": True,
                     "bearer_token": bearer_token,
                     "cookies": {},  # No cookies needed with API auth
-                    "expires_at": expires_at
+                    "expires_at": expires_at,
+                    "lineup_id": lineup_id
                 }
                 
         except httpx.TimeoutException:

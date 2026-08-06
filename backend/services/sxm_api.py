@@ -35,9 +35,10 @@ class SiriusXMAPI:
     # authenticated metadata disagree with reality.
     CHANNEL_TYPE_OVERRIDES = {}
     
-    def __init__(self, bearer_token: str = None):
+    def __init__(self, bearer_token: str = None, lineup_id: str = None):
         self._token_manager = None
         self.bearer_token = bearer_token
+        self.lineup_id = lineup_id
         self._update_headers()
     
     def _update_headers(self):
@@ -49,6 +50,53 @@ class SiriusXMAPI:
             'Content-Type': 'application/json'
         }
     
+    def _load_lineup_id_from_db(self) -> Optional[str]:
+        """Load the most recent stored SiriusXM channel lineup id."""
+        if self.lineup_id:
+            return self.lineup_id
+        try:
+            from database import get_db_session, Session as AuthSession
+            with get_db_session() as db:
+                session = (
+                    db.query(AuthSession)
+                    .filter(AuthSession.is_valid == True)
+                    .filter(AuthSession.lineup_id.isnot(None))
+                    .order_by(AuthSession.created_at.desc())
+                    .first()
+                )
+                if session and session.lineup_id:
+                    self.lineup_id = session.lineup_id
+                    return self.lineup_id
+        except Exception as e:
+            print(f"⚠️ Could not load SXM lineup id from DB: {e}")
+        return None
+
+    def _payload_with_lineup_variants(self, payload: Dict) -> List[Dict]:
+        """Return tuneSource payload variants, preferring the stored lineup id.
+
+        SiriusXM currently rejects playback requests without a channel lineup id.
+        Different client builds have used slightly different field names, so retry
+        a small set of compatible variants before giving up.
+        """
+        lineup_id = self._load_lineup_id_from_db()
+        variants = []
+        if lineup_id:
+            for key in ("channelLineupId", "lineupId", "channelLineupID"):
+                candidate = dict(payload)
+                candidate[key] = lineup_id
+                variants.append(candidate)
+        variants.append(payload)
+        return variants
+
+    def _is_missing_lineup_response(self, response: httpx.Response) -> bool:
+        if response.status_code != 403:
+            return False
+        try:
+            text = response.text.lower()
+        except Exception:
+            return False
+        return "lineup" in text and ("no channel lineup" in text or "lineup id" in text or "lineupid" in text)
+
     async def _ensure_valid_token(self) -> bool:
         """Ensure we have a valid token, refreshing if needed"""
         from services.token_manager import get_token_manager
@@ -61,6 +109,7 @@ class SiriusXMAPI:
             self.bearer_token = token
             self._update_headers()
         
+        self._load_lineup_id_from_db()
         return self.bearer_token is not None
     
     async def _refresh_and_retry(self) -> bool:
@@ -125,8 +174,23 @@ class SiriusXMAPI:
         for attempt in range(self.MAX_RETRIES + 1):
             try:
                 async with httpx.AsyncClient() as client:
-                    response = await client.post(url, headers=self.headers, json=payload, timeout=15)
+                    response = None
+                    used_payload = payload
+                    for payload_variant in self._payload_with_lineup_variants(payload):
+                        used_payload = payload_variant
+                        response = await client.post(url, headers=self.headers, json=payload_variant, timeout=15)
+                        if self._is_missing_lineup_response(response) and payload_variant is not payload:
+                            # Try the next compatible lineup field name without refreshing the token.
+                            continue
+                        break
                     
+                    # Missing lineup id is not an expired-token problem. Refreshing just spams auth.
+                    if self._is_missing_lineup_response(response):
+                        print("⚠️ Stream URL API rejected request: missing/invalid channel lineup id")
+                        print(f"Payload keys tried: {list(used_payload.keys())}")
+                        print(f"Response: {response.text[:300]}")
+                        return None
+
                     # Auto-retry on 401/403 (like m3u8XM approach)
                     if response.status_code in (401, 403) and attempt < self.MAX_RETRIES:
                         print(f"⚠️ Stream URL got {response.status_code}, refreshing token (attempt {attempt + 1})")

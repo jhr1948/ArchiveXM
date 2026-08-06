@@ -113,6 +113,7 @@ async def add_credential(request: CredentialCreate, db: DBSession = Depends(get_
         credential_id=credential.id,
         bearer_token=result["bearer_token"],
         cookies=json.dumps(result.get("cookies", {})),
+        lineup_id=result.get("lineup_id"),
         expires_at=result.get("expires_at"),
         is_valid=True
     )
@@ -162,6 +163,7 @@ async def update_credential(
                 credential_id=credential.id,
                 bearer_token=result["bearer_token"],
                 cookies=json.dumps(result.get("cookies", {})),
+                lineup_id=result.get("lineup_id"),
                 expires_at=result.get("expires_at"),
                 is_valid=True
             )
@@ -230,6 +232,7 @@ async def test_credential(credential_id: int, db: DBSession = Depends(get_db)):
                 credential_id=credential.id,
                 bearer_token=result["bearer_token"],
                 cookies=json.dumps(result.get("cookies", {})),
+                lineup_id=result.get("lineup_id"),
                 expires_at=result.get("expires_at"),
                 is_valid=True
             )

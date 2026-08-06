@@ -55,6 +55,7 @@ class Session(Base):
     credential_id = Column(Integer, index=True)  # Link to credential used
     bearer_token = Column(Text)
     cookies = Column(Text)  # JSON encoded
+    lineup_id = Column(String(255))  # SiriusXM channel lineup ID required by playback API
     expires_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
     is_valid = Column(Boolean, default=True)
@@ -197,6 +198,8 @@ def run_migrations():
                 UPDATE sessions SET credential_id = (SELECT id FROM credentials LIMIT 1)
                 WHERE credential_id IS NULL
             """))
+        if 'lineup_id' not in session_columns:
+            conn.execute(text("ALTER TABLE sessions ADD COLUMN lineup_id VARCHAR(255)"))
         
         # Create active_streams table if it doesn't exist
         if 'active_streams' not in inspector.get_table_names():

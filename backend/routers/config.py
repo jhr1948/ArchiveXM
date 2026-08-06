@@ -307,6 +307,7 @@ async def initial_setup(request: SetupRequest, db: DBSession = Depends(get_db)):
         session = AuthSession(
             bearer_token=result["bearer_token"],
             cookies=json.dumps(result.get("cookies", {})),
+            lineup_id=result.get("lineup_id"),
             expires_at=result.get("expires_at"),
             is_valid=True
         )

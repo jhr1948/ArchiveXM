@@ -30,7 +30,11 @@ class TrackResponse(BaseModel):
     artist: Optional[str]
     title: Optional[str]
     album: Optional[str]
+    album_artist: Optional[str] = None
+    year: Optional[str] = None
     genre: Optional[str]
+    track_number: Optional[str] = None
+    disc_number: Optional[str] = None
     duration_seconds: Optional[float]
     file_size: Optional[int]
     format: Optional[str]
@@ -113,15 +117,29 @@ class MetadataApplyRequest(BaseModel):
     artist: Optional[str] = None
     title: Optional[str] = None
     album: Optional[str] = None
-    genre: Optional[str] = None
+    album_artist: Optional[str] = None
     year: Optional[str] = None
+    genre: Optional[str] = None
+    track_number: Optional[str] = None
+    disc_number: Optional[str] = None
     cover_url: Optional[str] = None
     provider: Optional[str] = None
     recording_id: Optional[str] = None
     release_id: Optional[str] = None
-    # Optional per-field controls from the manual metadata apply dialog.
-    # When omitted, preserve the old behavior and apply all available fields.
     apply_fields: Optional[Dict[str, bool]] = None
+
+
+class TrackManualMetadataUpdate(BaseModel):
+    title: Optional[str] = None
+    artist: Optional[str] = None
+    album_artist: Optional[str] = None
+    album: Optional[str] = None
+    year: Optional[str] = None
+    genre: Optional[str] = None
+    track_number: Optional[str] = None
+    disc_number: Optional[str] = None
+    cover_url: Optional[str] = None
+    clear_cover_art: bool = False
 
 
 def _first_text(*values, default: str = "") -> str:
@@ -940,13 +958,25 @@ def _musicbrainz_release_artist(release: Dict[str, Any], fallback: str = "") -> 
     return "".join(parts).strip() or fallback
 
 
+def _musicbrainz_artist_credit_ids(item: Dict[str, Any]) -> List[str]:
+    ids: List[str] = []
+    for credit in (item or {}).get("artist-credit") or []:
+        if not isinstance(credit, dict):
+            continue
+        artist_obj = credit.get("artist") or {}
+        artist_id = artist_obj.get("id")
+        if artist_id and artist_id not in ids:
+            ids.append(str(artist_id))
+    return ids
+
+
 def _candidate_key(candidate: Dict[str, Any]) -> tuple:
     return (
         str(candidate.get("artist") or "").lower(),
         str(candidate.get("title") or "").lower(),
         str(candidate.get("album") or "").lower(),
         str(candidate.get("year") or ""),
-        str(candidate.get("release_id") or ""),
+        str(candidate.get("release_type") or "").lower(),
     )
 
 
@@ -1045,27 +1075,72 @@ def _metadata_release_flags(release: Optional[Dict[str, Any]]) -> Dict[str, Any]
     rg = (release or {}).get("release-group") or {}
     primary = str(rg.get("primary-type") or "").strip().lower()
     secondary = {str(t).strip().lower() for t in (rg.get("secondary-types") or []) if str(t).strip()}
-    bad_secondary = {"compilation", "soundtrack", "live", "remix", "dj-mix", "mixtape/street", "demo"}
+    # Do not treat all compilations as bad. Artist-owned official B-sides /
+    # rarities albums (Nirvana - Incesticide) are often the canonical home for
+    # tracks that never belonged to a standard studio album. Penalize Various
+    # Artists and noisy live/demo/bootleg-style releases later, but keep artist
+    # compilation albums eligible for the official album discovery pass.
+    bad_secondary = {"soundtrack", "live", "remix", "dj-mix", "mixtape/street", "demo", "interview"}
     return {
         "primary": primary,
         "secondary": secondary,
         "is_album": primary == "album",
         "is_single": primary == "single",
+        "is_ep": primary == "ep",
         "is_bad_secondary": bool(secondary & bad_secondary),
         "is_compilation": "compilation" in secondary,
         "is_live": "live" in secondary,
+        "is_artist_collection": primary == "album" and "compilation" in secondary and not bool(secondary & bad_secondary),
     }
 
-
 def _metadata_release_year(release: Optional[Dict[str, Any]]) -> int | None:
-    date = str((release or {}).get("date") or "")
-    try:
-        year = int(date[:4])
-        if 1900 <= year <= 2035:
-            return year
-    except Exception:
-        pass
+    """Return the best human-facing release year for metadata cleanup.
+
+    For album candidates, MusicBrainz individual release dates often point to
+    later remasters/reissues even though the release group knows the original
+    first-release-date. Prefer that original album year whenever available so
+    a 1993 album does not show as a 2023 anniversary reissue.
+    """
+    release = release or {}
+    rg = release.get("release-group") or {}
+    date_candidates = [
+        release.get("__canonical_year"),
+        release.get("__release_group_first_release_date"),
+        rg.get("first-release-date"),
+        release.get("date"),
+    ]
+    for raw_date in date_candidates:
+        date = str(raw_date or "")
+        try:
+            year = int(date[:4])
+            if 1900 <= year <= 2035:
+                return year
+        except Exception:
+            pass
     return None
+
+
+def _metadata_is_reissue_like_release(release: Optional[Dict[str, Any]]) -> bool:
+    release = release or {}
+    rg = release.get("release-group") or {}
+    text = " ".join(str(v or "") for v in (
+        release.get("title"),
+        release.get("disambiguation"),
+        rg.get("title"),
+        rg.get("disambiguation"),
+    )).lower()
+    return any(marker in text for marker in (
+        "remaster",
+        "remastered",
+        "deluxe",
+        "anniversary",
+        "expanded",
+        "super deluxe",
+        "box set",
+        "reissue",
+        "legacy edition",
+        "special edition",
+    ))
 
 
 def _metadata_title_mentions_live(title: str) -> bool:
@@ -1083,24 +1158,26 @@ def _metadata_title_mentions_live(title: str) -> bool:
 def _metadata_release_type_rank(release_type: str, requested_title: str = "") -> int:
     """Human-friendly release ordering for metadata search results.
 
-    Prefer the canonical studio album first, then singles, then compilations.
-    Live albums are useful only for explicitly live track searches; otherwise
-    they are pushed below normal metadata cleanup candidates.
+    Prefer canonical artist-owned releases: normal official albums first,
+    then artist-owned B-sides/rarities compilation albums, then singles/EPs.
+    Push Various Artists compilations, live albums, demos, and bootlegs below
+    normal cleanup candidates.
     """
     reltype = str(release_type or "").lower().strip()
     is_live_query = _metadata_title_mentions_live(requested_title)
 
     is_album = reltype.startswith("album")
     is_single = reltype.startswith("single")
+    is_ep = reltype.startswith("ep") or reltype == "ep"
     is_compilation = "compilation" in reltype
     is_live = "live" in reltype
-    is_bad_album = any(bad in reltype for bad in ("soundtrack", "remix", "dj-mix", "mixtape/street", "demo"))
+    is_bad_album = any(bad in reltype for bad in ("soundtrack", "remix", "dj-mix", "mixtape/street", "demo", "interview"))
 
     if is_album and not is_compilation and not is_live and not is_bad_album:
         return 0
-    if is_single:
+    if is_album and is_compilation and not is_live and not is_bad_album:
         return 1
-    if is_album and is_compilation and not is_live:
+    if is_single or is_ep:
         return 2
     if is_album and is_live:
         return 3 if is_live_query else 9
@@ -1109,7 +1186,6 @@ def _metadata_release_type_rank(release_type: str, requested_title: str = "") ->
     if reltype == "recording":
         return 8
     return 7
-
 
 def _metadata_release_score(
     recording_score: int,
@@ -1145,10 +1221,17 @@ def _metadata_release_score(
     # Strongly prefer a clean studio album. This is the common desired answer
     # for cleanup, e.g. Rebel Yell should show the Rebel Yell album before the
     # 1985 single or later compilation/live releases.
-    if flags["is_album"] and not flags["is_bad_secondary"]:
+    if flags["is_album"] and not flags["is_bad_secondary"] and not flags["is_compilation"]:
         score += 0.28
+    elif flags.get("is_artist_collection"):
+        score += 0.23
     elif flags["is_album"]:
         score += 0.08
+
+    # Later remasters/reissues can be valid, but for manual cleanup the
+    # original official album should rank ahead of anniversary/deluxe variants.
+    if _metadata_is_reissue_like_release(release):
+        score -= 0.10
     elif flags["is_single"]:
         score += 0.02
     elif flags["primary"]:
@@ -1156,7 +1239,10 @@ def _metadata_release_score(
 
     is_live_query = _metadata_title_mentions_live(requested_title)
     if flags["is_compilation"]:
-        score -= 0.28
+        # Artist-owned compilations can be canonical B-sides / rarities albums
+        # (e.g. Incesticide), so penalize them only slightly. Various Artists
+        # compilations are handled separately below.
+        score += 0.03 if flags.get("is_artist_collection") else -0.28
     if flags["is_live"]:
         score += 0.03 if is_live_query else -0.42
     if flags["is_bad_secondary"] and not (flags["is_compilation"] or flags["is_live"]):
@@ -1169,15 +1255,34 @@ def _metadata_release_score(
     # but do not let a random early compilation beat a later official album.
     year = _metadata_release_year(release)
     if year:
-        if flags["is_album"] and not flags["is_bad_secondary"]:
+        if flags["is_album"] and not flags["is_bad_secondary"] and not flags["is_compilation"]:
             score += max(0.0, min(0.06, (2035 - year) / 1200.0))
+        elif flags.get("is_artist_collection"):
+            score += max(0.0, min(0.05, (2035 - year) / 1400.0))
         else:
             score += max(0.0, min(0.02, (2035 - year) / 3000.0))
+
+    rg = (release or {}).get("release-group") or {}
+    release_year = None
+    group_year = None
+    try:
+        release_year = int(str((release or {}).get("date") or "")[:4])
+    except Exception:
+        pass
+    try:
+        group_year = int(str(rg.get("first-release-date") or (release or {}).get("__release_group_first_release_date") or "")[:4])
+    except Exception:
+        pass
+    if release_year and group_year and release_year - group_year >= 8:
+        # A track on a much later expanded/remastered edition is often a bonus
+        # track and should not outrank the artist-owned release where the song
+        # originally/canonically appears.
+        score -= min(0.24, 0.04 + ((release_year - group_year) / 100.0))
 
     return max(0.0, min(1.0, score))
 
 
-async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 10) -> List[Dict[str, Any]]:
+async def _search_musicbrainz_candidates(artist: str, title: str, album_hint: str = "", limit: int = 10) -> List[Dict[str, Any]]:
     """Find likely album/cover candidates using MusicBrainz + Cover Art Archive.
 
     This is deliberately user-triggered. Music metadata is not always unique,
@@ -1186,6 +1291,7 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
     """
     artist = (artist or "").strip()
     title = (title or "").strip()
+    album_hint = (album_hint or "").strip()
     if not title:
         return []
 
@@ -1298,7 +1404,7 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
         params = {
             "query": query,
             "fmt": "json",
-            "limit": "15",
+            "limit": "50",
             "inc": "artist-credits",
         }
         response = await client.get("https://musicbrainz.org/ws/2/release-group/", params=params, headers=headers)
@@ -1318,23 +1424,67 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
         return data if isinstance(data, dict) else None
 
     def release_contains_requested_track(release: Dict[str, Any]) -> Dict[str, Any] | None:
-        for medium in release.get("media") or []:
-            for track_item in medium.get("tracks") or []:
+        for medium_index, medium in enumerate(release.get("media") or [], start=1):
+            tracks = medium.get("tracks") or []
+            for track_index, track_item in enumerate(tracks, start=1):
                 rec = track_item.get("recording") or {}
                 rec_title = rec.get("title") or track_item.get("title") or ""
                 if _metadata_similarity(title, rec_title) >= 0.72:
-                    return rec or {"title": rec_title}
+                    matched = dict(rec or {"title": rec_title})
+                    matched.setdefault("title", rec_title)
+                    matched["__medium_position"] = medium_index
+                    matched["__track_position"] = track_index
+                    matched["__medium_track_count"] = len(tracks)
+                    matched["__track_number"] = track_item.get("number") or track_item.get("position")
+                    return matched
         return None
 
     def release_group_flags(release_group: Dict[str, Any]) -> Dict[str, Any]:
         primary = str(release_group.get("primary-type") or "").strip().lower()
         secondary = {str(t).strip().lower() for t in (release_group.get("secondary-types") or []) if str(t).strip()}
-        bad_secondary = {"compilation", "soundtrack", "live", "remix", "dj-mix", "mixtape/street", "demo"}
+        noisy_secondary = {"soundtrack", "live", "remix", "dj-mix", "mixtape/street", "demo", "interview"}
         return {
             "primary": primary,
             "secondary": secondary,
-            "is_clean_album": primary == "album" and not bool(secondary & bad_secondary),
+            "is_clean_album": primary == "album" and not bool(secondary & noisy_secondary) and "compilation" not in secondary,
+            "is_artist_collection": primary == "album" and "compilation" in secondary and not bool(secondary & noisy_secondary),
+            "is_eligible_album_group": primary == "album" and not bool(secondary & noisy_secondary),
         }
+
+    def album_hint_similarity(album_title: str) -> float:
+        if not album_hint or not album_title:
+            return 0.0
+        return _metadata_similarity(album_hint, album_title)
+
+    def album_hint_matches_album(album_title: str) -> bool:
+        if not album_hint or not album_title:
+            return False
+        hint_clean = _metadata_clean_text(album_hint)
+        album_clean = _metadata_clean_text(album_title)
+        hint_key = _metadata_compact_key(album_hint)
+        album_key = _metadata_compact_key(album_title)
+        if hint_clean and album_clean and (hint_clean == album_clean or hint_clean in album_clean or album_clean in hint_clean):
+            return True
+        if hint_key and album_key and (hint_key == album_key or hint_key in album_key or album_key in hint_key):
+            return True
+        return album_hint_similarity(album_title) >= 0.78
+
+    def release_album_hint_similarity(release: Dict[str, Any]) -> float:
+        if not album_hint or not release:
+            return 0.0
+        rg = release.get("release-group") or {}
+        return max(
+            album_hint_similarity(release.get("title") or ""),
+            album_hint_similarity(rg.get("title") or "") if isinstance(rg, dict) else 0.0,
+        )
+
+    def release_matches_album_hint(release: Dict[str, Any]) -> bool:
+        if not album_hint or not release:
+            return False
+        rg = release.get("release-group") or {}
+        return album_hint_matches_album(release.get("title") or "") or (
+            isinstance(rg, dict) and album_hint_matches_album(rg.get("title") or "")
+        )
 
     recordings_by_id: Dict[str, Dict[str, Any]] = {}
     extra_releases_by_id: Dict[str, Dict[str, Any]] = {}
@@ -1387,6 +1537,216 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
                 if "score" not in hydrated and "score" in base:
                     hydrated["score"] = base.get("score")
                 recordings_by_id[rid] = hydrated
+
+        artist_ids: List[str] = []
+        if artist_known:
+            for recording in recordings_by_id.values():
+                rec_artist = _musicbrainz_artist_credit(recording) or artist
+                if _metadata_artist_similarity(artist, rec_artist) < artist_similarity_threshold:
+                    continue
+                for artist_id in _musicbrainz_artist_credit_ids(recording):
+                    if artist_id not in artist_ids:
+                        artist_ids.append(artist_id)
+
+        # When the user types an album hint in the Find Metadata dialog, treat
+        # that as an authoritative search target first. A broad recording
+        # search for Prince - Let's Go Crazy can find many later compilations,
+        # but a user-supplied album hint like "Purple Rain" should make us
+        # search that album/release-group, verify the tracklist, and promote
+        # the verified album above broad hits. If this targeted pass finds
+        # nothing, the normal broad lookup below still provides fallback
+        # candidates.
+        if album_hint and artist_known:
+            album_hint_release_queries: List[str] = []
+            album_hint_group_queries: List[str] = []
+
+            def add_album_release_query(query: str):
+                query = re.sub(r"\s+", " ", str(query or "").strip())
+                if query and query not in album_hint_release_queries:
+                    album_hint_release_queries.append(query)
+
+            def add_album_group_query(query: str):
+                query = re.sub(r"\s+", " ", str(query or "").strip())
+                if query and query not in album_hint_group_queries:
+                    album_hint_group_queries.append(query)
+
+            album_variants = _metadata_title_variants(album_hint)[:4] or [album_hint]
+            for album_variant in album_variants:
+                quoted_album = album_variant.replace('"', '\"')
+                for artist_id in artist_ids[:3]:
+                    add_album_release_query(f'arid:{artist_id} AND release:"{quoted_album}"')
+                    add_album_group_query(f'arid:{artist_id} AND releasegroup:"{quoted_album}"')
+                    add_album_group_query(f'arid:{artist_id} AND release:"{quoted_album}"')
+                for artist_variant in artist_variants[:4]:
+                    quoted_artist = artist_variant.replace('"', '\"')
+                    add_album_release_query(f'artist:"{quoted_artist}" AND release:"{quoted_album}"')
+                    add_album_release_query(f'artistname:"{quoted_artist}" AND release:"{quoted_album}"')
+                    add_album_group_query(f'artist:"{quoted_artist}" AND releasegroup:"{quoted_album}"')
+                    add_album_group_query(f'artistname:"{quoted_artist}" AND releasegroup:"{quoted_album}"')
+
+            for query in album_hint_release_queries[:12]:
+                try:
+                    found_releases = await run_release_query(client, query)
+                except httpx.HTTPStatusError as e:
+                    status = e.response.status_code if e.response is not None else "unknown"
+                    print(f"Metadata album-hint release lookup skipped: status={status} query={query[:140]}")
+                    continue
+                except Exception as e:
+                    print(f"Metadata album-hint release lookup skipped: {type(e).__name__}: {str(e)[:160]} query={query[:140]}")
+                    continue
+
+                # Search endpoint order is not always useful; inspect close
+                # album-title matches first, but still allow fuzzy matches.
+                def hint_release_stub_sort_key(release: Dict[str, Any]):
+                    sim = release_album_hint_similarity(release)
+                    status_rank = 0 if str(release.get("status") or "").lower() == "official" else 1
+                    flags = _metadata_release_flags(release)
+                    type_rank = 0 if flags["is_album"] and not flags["is_bad_secondary"] else 1
+                    date = str(release.get("date") or "9999")
+                    try:
+                        year = int(date[:4])
+                    except Exception:
+                        year = 9999
+                    return (-sim, status_rank, type_rank, year, str(release.get("title") or "").lower())
+
+                for release in sorted(found_releases, key=hint_release_stub_sort_key)[:8]:
+                    rid = release.get("id")
+                    if not rid or rid in extra_releases_by_id:
+                        continue
+                    if not release_matches_album_hint(release):
+                        continue
+                    flags = _metadata_release_flags(release)
+                    if not flags["is_album"] or flags["is_bad_secondary"]:
+                        continue
+                    release_artist = _musicbrainz_release_artist(release, artist)
+                    if artist_known and _metadata_artist_similarity(artist, release_artist) < artist_similarity_threshold:
+                        continue
+                    try:
+                        hydrated_release = await hydrate_release(client, rid)
+                    except Exception as e:
+                        print(f"Metadata album-hint release hydrate skipped: {type(e).__name__}: {str(e)[:160]} release={rid}")
+                        continue
+                    if not hydrated_release:
+                        continue
+                    # Preserve useful search/release-group values from the
+                    # stub because the hydrated release can omit the group
+                    # first-release-date that gives the original album year.
+                    stub_rg = release.get("release-group") or {}
+                    rg = hydrated_release.setdefault("release-group", {})
+                    if isinstance(rg, dict) and isinstance(stub_rg, dict):
+                        rg.setdefault("id", stub_rg.get("id"))
+                        rg.setdefault("title", stub_rg.get("title") or release.get("title"))
+                        rg.setdefault("primary-type", stub_rg.get("primary-type"))
+                        rg.setdefault("secondary-types", stub_rg.get("secondary-types") or [])
+                        rg.setdefault("first-release-date", stub_rg.get("first-release-date"))
+                    if not release_matches_album_hint(hydrated_release):
+                        continue
+                    matched_track = release_contains_requested_track(hydrated_release)
+                    if not matched_track:
+                        continue
+                    hydrated_release["__matched_track"] = matched_track
+                    hydrated_release["__album_hint_targeted"] = True
+                    hydrated_release["__album_discovery"] = True
+                    hydrated_release.setdefault("score", max(int(release.get("score") or 0), 100))
+                    extra_releases_by_id[rid] = hydrated_release
+                if len(extra_releases_by_id) >= 5:
+                    break
+
+            if len(extra_releases_by_id) < 5:
+                album_hint_groups_by_id: Dict[str, Dict[str, Any]] = {}
+                for query in album_hint_group_queries[:12]:
+                    try:
+                        found_groups = await run_release_group_query(client, query)
+                    except httpx.HTTPStatusError as e:
+                        status = e.response.status_code if e.response is not None else "unknown"
+                        print(f"Metadata album-hint group lookup skipped: status={status} query={query[:140]}")
+                        continue
+                    except Exception as e:
+                        print(f"Metadata album-hint group lookup skipped: {type(e).__name__}: {str(e)[:160]} query={query[:140]}")
+                        continue
+
+                    for group in found_groups[:15]:
+                        gid = group.get("id")
+                        if not gid or gid in album_hint_groups_by_id:
+                            continue
+                        if not album_hint_matches_album(group.get("title") or ""):
+                            continue
+                        group_flags = release_group_flags(group)
+                        if not group_flags["is_eligible_album_group"]:
+                            continue
+                        group_artist = _musicbrainz_release_artist(group, artist)
+                        if _metadata_artist_similarity(artist, group_artist) < artist_similarity_threshold:
+                            continue
+                        album_hint_groups_by_id[gid] = group
+                    if len(album_hint_groups_by_id) >= 8:
+                        break
+
+                def hint_group_sort_key(group: Dict[str, Any]):
+                    sim = album_hint_similarity(group.get("title") or "")
+                    date = str(group.get("first-release-date") or "9999")
+                    try:
+                        year = int(date[:4])
+                    except Exception:
+                        year = 9999
+                    try:
+                        score = int(group.get("score") or 0)
+                    except Exception:
+                        score = 0
+                    flags = release_group_flags(group)
+                    canonical_rank = 0 if flags["is_clean_album"] else 1 if flags["is_artist_collection"] else 4
+                    return (-sim, canonical_rank, year, -score, str(group.get("title") or "").lower())
+
+                for group in sorted(album_hint_groups_by_id.values(), key=hint_group_sort_key)[:6]:
+                    gid = group.get("id")
+                    try:
+                        hydrated_group = await hydrate_release_group(client, gid)
+                    except Exception as e:
+                        print(f"Metadata album-hint group hydrate skipped: {type(e).__name__}: {str(e)[:160]} group={gid}")
+                        continue
+                    if not hydrated_group:
+                        continue
+                    releases = hydrated_group.get("releases") or []
+
+                    def hint_group_release_sort_key(release: Dict[str, Any]):
+                        status_rank = 0 if str(release.get("status") or "").lower() == "official" else 1
+                        date = str(release.get("date") or "9999")
+                        try:
+                            year = int(date[:4])
+                        except Exception:
+                            year = 9999
+                        reissue_rank = 1 if _metadata_is_reissue_like_release(release) else 0
+                        return (status_rank, reissue_rank, year, str(release.get("country") or ""), str(release.get("title") or "").lower())
+
+                    for release_stub in sorted(releases, key=hint_group_release_sort_key)[:6]:
+                        rid = release_stub.get("id")
+                        if not rid or rid in extra_releases_by_id:
+                            continue
+                        try:
+                            hydrated_release = await hydrate_release(client, rid)
+                        except Exception as e:
+                            print(f"Metadata album-hint group release hydrate skipped: {type(e).__name__}: {str(e)[:160]} release={rid}")
+                            continue
+                        if not hydrated_release:
+                            continue
+                        rg = hydrated_release.setdefault("release-group", {})
+                        if isinstance(rg, dict):
+                            rg.setdefault("id", group.get("id"))
+                            rg.setdefault("title", group.get("title"))
+                            rg.setdefault("primary-type", group.get("primary-type"))
+                            rg.setdefault("secondary-types", group.get("secondary-types") or [])
+                            rg.setdefault("first-release-date", group.get("first-release-date"))
+                        matched_track = release_contains_requested_track(hydrated_release)
+                        if not matched_track:
+                            continue
+                        hydrated_release["__matched_track"] = matched_track
+                        hydrated_release["__album_hint_targeted"] = True
+                        hydrated_release["__album_discovery"] = True
+                        hydrated_release["__release_group_first_release_date"] = group.get("first-release-date")
+                        hydrated_release.setdefault("score", max(int(group.get("score") or 0), 100))
+                        extra_releases_by_id[rid] = hydrated_release
+                        break
+                    if len(extra_releases_by_id) >= 5:
+                        break
 
         # Recording searches can still miss the canonical studio album,
         # especially when MusicBrainz has several similarly named recordings or
@@ -1464,12 +1824,23 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
         # search the artist's official album release groups, hydrate a few of
         # the oldest clean albums, and keep only releases that actually contain
         # the requested track.
-        if artist_known and len(extra_releases_by_id) < 8 and not recording_results_have_clean_album():
+        # Always run a bounded official-album discovery pass. Recording search
+        # can report a "clean album" from a later reissue and then prevent the
+        # original release group from being inspected. Keep this pass capped so
+        # popular artists do not become painfully slow, but do not skip it just
+        # because a recording result already found an album-ish release.
+        if artist_known and len(extra_releases_by_id) < 8:
             release_group_queries: List[str] = []
+            for artist_id in artist_ids[:3]:
+                release_group_queries.append(f'arid:{artist_id} AND type:album')
             for artist_variant in artist_variants[:4]:
                 quoted_artist = artist_variant.replace('"', '\"')
                 release_group_queries.append(f'artist:"{quoted_artist}" AND type:album')
                 release_group_queries.append(f'artistname:"{quoted_artist}" AND type:album')
+
+            # de-dupe while preserving priority: exact MusicBrainz artist-id
+            # queries first, then name fallbacks.
+            release_group_queries = list(dict.fromkeys(release_group_queries))
 
             release_groups_by_id: Dict[str, Dict[str, Any]] = {}
             for query in release_group_queries[:8]:
@@ -1483,17 +1854,18 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
                     print(f"Metadata album-group lookup skipped: {type(e).__name__}: {str(e)[:160]} query={query[:140]}")
                     continue
 
-                for group in found_groups[:12]:
+                for group in found_groups[:30]:
                     gid = group.get("id")
                     if not gid or gid in release_groups_by_id:
                         continue
-                    if not release_group_flags(group)["is_clean_album"]:
+                    group_flags = release_group_flags(group)
+                    if not group_flags["is_eligible_album_group"]:
                         continue
                     group_artist = _musicbrainz_release_artist(group, artist)
                     if _metadata_artist_similarity(artist, group_artist) < artist_similarity_threshold:
                         continue
                     release_groups_by_id[gid] = group
-                if len(release_groups_by_id) >= 18:
+                if len(release_groups_by_id) >= 40:
                     break
 
             def group_sort_key(group: Dict[str, Any]):
@@ -1507,9 +1879,11 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
                     score = int(group.get("score") or 0)
                 except Exception:
                     score = 0
-                return (year, -score, str(group.get("title") or "").lower())
+                flags = release_group_flags(group)
+                canonical_rank = 0 if flags["is_clean_album"] else 1 if flags["is_artist_collection"] else 4
+                return (canonical_rank, year, -score, str(group.get("title") or "").lower())
 
-            for group in sorted(release_groups_by_id.values(), key=group_sort_key)[:10]:
+            for group in sorted(release_groups_by_id.values(), key=group_sort_key)[:24]:
                 gid = group.get("id")
                 try:
                     hydrated_group = await hydrate_release_group(client, gid)
@@ -1543,13 +1917,28 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
                     hydrated_count += 1
                     if not hydrated_release:
                         continue
+                    # Preserve release-group first-release-date/title on the
+                    # hydrated release. The MusicBrainz release endpoint often
+                    # has the specific edition date, while the release group
+                    # carries the original album date we want to display/rank.
+                    rg = hydrated_release.setdefault("release-group", {})
+                    if isinstance(rg, dict):
+                        rg.setdefault("id", group.get("id"))
+                        rg.setdefault("title", group.get("title"))
+                        rg.setdefault("primary-type", group.get("primary-type"))
+                        rg.setdefault("secondary-types", group.get("secondary-types") or [])
+                        rg.setdefault("first-release-date", group.get("first-release-date"))
+                    hydrated_release["__album_discovery"] = True
+                    hydrated_release["__release_group_first_release_date"] = group.get("first-release-date")
                     flags = _metadata_release_flags(hydrated_release)
                     if not (flags["is_album"] and not flags["is_bad_secondary"]):
                         continue
                     release_artist = _musicbrainz_release_artist(hydrated_release, artist)
                     if _metadata_artist_similarity(artist, release_artist) < artist_similarity_threshold:
                         continue
-                    if release_contains_requested_track(hydrated_release):
+                    matched_track = release_contains_requested_track(hydrated_release)
+                    if matched_track:
+                        hydrated_release["__matched_track"] = matched_track
                         hydrated_release.setdefault("score", max(int(group.get("score") or 0), 96))
                         extra_releases_by_id[rid] = hydrated_release
                         break
@@ -1606,8 +1995,8 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
         for release in releases[:50]:
             release_id = release.get("id")
             album = release.get("title") or ""
-            date = str(release.get("date") or "")
-            year = date[:4] if date else ""
+            release_year = _metadata_release_year(release)
+            year = str(release_year) if release_year else ""
             rg = release.get("release-group") or {}
             primary_type = rg.get("primary-type") or ""
             secondary_types = rg.get("secondary-types") or []
@@ -1638,17 +2027,19 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
 
     for release in extra_releases_by_id.values():
         release_id = release.get("id")
-        album = release.get("title") or ""
-        date = str(release.get("date") or "")
-        year = date[:4] if date else ""
+        rg = release.get("release-group") or {}
+        # For official-album-discovery candidates, display the canonical
+        # release-group album title/date rather than the specific reissue date.
+        album = (rg.get("title") if release.get("__album_discovery") and isinstance(rg, dict) else None) or release.get("title") or ""
+        release_year = _metadata_release_year(release)
+        year = str(release_year) if release_year else ""
         release_artist = _musicbrainz_release_artist(release, artist or "Unknown")
         if artist_known and _metadata_artist_similarity(artist, release_artist) < artist_match_threshold():
             continue
-        matched_recording = release_contains_requested_track(release)
+        matched_recording = release.get("__matched_track") or release_contains_requested_track(release)
         if not matched_recording:
             continue
 
-        rg = release.get("release-group") or {}
         primary_type = rg.get("primary-type") or ""
         secondary_types = rg.get("secondary-types") or []
         release_type_parts = []
@@ -1666,8 +2057,13 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
         )
         # Same-named verified studio albums are usually the canonical result;
         # give them enough confidence to appear in the first page without
-        # bypassing the normal release-type ordering.
-        confidence = max(confidence, 0.96)
+        # bypassing the normal release-type ordering. When the user supplied an
+        # album hint and this release was found by the targeted album-hint pass,
+        # treat the verified tracklist match as the strongest candidate.
+        if release.get("__album_hint_targeted"):
+            confidence = max(confidence, 1.0)
+        else:
+            confidence = max(confidence, 0.98 if _metadata_release_flags(release).get("is_artist_collection") else 0.96)
         candidate = {
             "provider": "musicbrainz",
             "recording_id": matched_recording.get("id"),
@@ -1697,18 +2093,37 @@ async def _search_musicbrainz_candidates(artist: str, title: str, limit: int = 1
                 year = y
         except Exception:
             pass
+        reissue_rank = 1 if any(marker in (str(c.get("label") or "") + " " + str(c.get("album") or "")).lower() for marker in (
+            "remaster", "remastered", "deluxe", "anniversary", "expanded", "super deluxe", "box set", "reissue", "edition"
+        )) else 0
         # Explicit user-facing order:
         # Album, Single, Album/Compilation, then Album/Live only for live
-        # track queries. Confidence is still used inside each bucket.
+        # track queries. Confidence is still used inside each bucket, but
+        # original non-reissue albums beat later deluxe/reissue variants.
         return (
             _metadata_release_type_rank(reltype, title),
             has_album,
-            -float(c.get("confidence") or 0),
+            reissue_rank,
             year,
+            -float(c.get("confidence") or 0),
             str(c.get("album") or "").lower(),
         )
 
+    if album_hint:
+        hint_clean = _metadata_clean_text(album_hint)
+        for candidate in candidates:
+            album_clean = _metadata_clean_text(candidate.get("album") or "")
+            if hint_clean and album_clean:
+                similarity = _metadata_similarity(hint_clean, album_clean)
+                if similarity >= 0.78:
+                    candidate["confidence"] = round(min(1.0, float(candidate.get("confidence") or 0) + 0.08), 3)
+                    candidate["__album_hint_match"] = True
+
     candidates.sort(key=sort_key)
+    if album_hint:
+        candidates.sort(key=lambda c: (0 if c.get("__album_hint_match") else 1, -float(c.get("confidence") or 0)))
+        for candidate in candidates:
+            candidate.pop("__album_hint_match", None)
     return candidates[:limit]
 
 async def _save_track_cover_from_url(db: DBSession, track: LocalTrack, cover_url: str | None) -> str | None:
@@ -2116,6 +2531,7 @@ async def bulk_delete_tracks(
 async def search_metadata_candidates(
     artist: Optional[str] = None,
     title: Optional[str] = None,
+    album: Optional[str] = None,
 ):
     """
     Search external metadata candidates directly by artist/title.
@@ -2129,14 +2545,14 @@ async def search_metadata_candidates(
         raise HTTPException(status_code=400, detail="Track title is required for metadata search")
 
     try:
-        candidates = await _search_musicbrainz_candidates(search_artist, search_title)
+        candidates = await _search_musicbrainz_candidates(search_artist, search_title, _first_text(album, default=""))
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"MusicBrainz lookup failed: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Metadata lookup failed: {e}")
 
     return {
-        "query": {"artist": search_artist, "title": search_title},
+        "query": {"artist": search_artist, "title": search_title, "album": _first_text(album, default="")},
         "candidates": candidates,
     }
 
@@ -2146,6 +2562,7 @@ async def search_track_metadata(
     track_id: int,
     artist: Optional[str] = None,
     title: Optional[str] = None,
+    album: Optional[str] = None,
     db: DBSession = Depends(get_db),
 ):
     """
@@ -2161,11 +2578,12 @@ async def search_track_metadata(
 
     search_artist = _first_text(artist, track.artist, default="")
     search_title = _first_text(title, track.title, track.filename, default="")
+    search_album = _first_text(album, track.album, default="")
     if not search_title:
         raise HTTPException(status_code=400, detail="Track title is required for metadata search")
 
     try:
-        candidates = await _search_musicbrainz_candidates(search_artist, search_title)
+        candidates = await _search_musicbrainz_candidates(search_artist, search_title, search_album)
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"MusicBrainz lookup failed: {e}")
     except Exception as e:
@@ -2173,7 +2591,7 @@ async def search_track_metadata(
 
     return {
         "track_id": track.id,
-        "query": {"artist": search_artist, "title": search_title},
+        "query": {"artist": search_artist, "title": search_title, "album": search_album},
         "candidates": candidates,
     }
 
@@ -2186,40 +2604,51 @@ async def apply_track_metadata(
 ):
     """
     Apply user-selected metadata to a local Jukebox track.
+
+    The frontend may send apply_fields to limit which fields are updated.
+    Older clients that omit apply_fields keep the previous behavior and apply
+    all populated fields from the selected match.
     """
     track = db.query(LocalTrack).filter(LocalTrack.id == track_id).first()
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
 
-    apply_fields = request.apply_fields
+    apply_fields = request.apply_fields or {}
 
-    def should_apply(*names: str) -> bool:
-        # Backward compatible: old frontend sent only the candidate payload,
-        # which should still apply all available metadata.
-        if apply_fields is None:
-            return True
-        return any(bool(apply_fields.get(name)) for name in names)
+    def should_apply(field: str) -> bool:
+        return True if request.apply_fields is None else bool(apply_fields.get(field))
 
-    applied_fields: List[str] = []
+    def clean_optional(value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
-    if should_apply("artist") and request.artist is not None and str(request.artist).strip():
-        track.artist = str(request.artist).strip()
-        applied_fields.append("artist")
-    if should_apply("title", "track_title") and request.title is not None and str(request.title).strip():
-        track.title = str(request.title).strip()
-        applied_fields.append("title")
-    if should_apply("album", "album_title") and request.album is not None:
-        track.album = str(request.album).strip() or None
-        applied_fields.append("album")
+    if should_apply("artist") and request.artist is not None:
+        value = clean_optional(request.artist)
+        if value:
+            track.artist = value
+    if should_apply("title") and request.title is not None:
+        value = clean_optional(request.title)
+        if value:
+            track.title = value
+    if should_apply("album") and request.album is not None:
+        track.album = clean_optional(request.album)
+    if should_apply("album_artist") and request.album_artist is not None and hasattr(track, "album_artist"):
+        track.album_artist = clean_optional(request.album_artist)
+    if should_apply("year") and request.year is not None and hasattr(track, "year"):
+        track.year = clean_optional(request.year)
     if should_apply("genre") and request.genre is not None:
-        track.genre = str(request.genre).strip() or None
-        applied_fields.append("genre")
+        track.genre = clean_optional(request.genre)
+    if should_apply("track_number") and request.track_number is not None and hasattr(track, "track_number"):
+        track.track_number = clean_optional(request.track_number)
+    if should_apply("disc_number") and request.disc_number is not None and hasattr(track, "disc_number"):
+        track.disc_number = clean_optional(request.disc_number)
 
     cover_error = None
-    if should_apply("cover_art", "cover", "artwork") and request.cover_url:
+    if should_apply("cover_art") and request.cover_url:
         try:
             await _save_track_cover_from_url(db, track, request.cover_url)
-            applied_fields.append("cover_art")
         except Exception as e:
             cover_error = str(e)
             print(f"Metadata apply: cover download failed for track {track.id}: {e}")
@@ -2236,9 +2665,44 @@ async def apply_track_metadata(
             "recording_id": request.recording_id,
             "release_id": request.release_id,
             "year": request.year,
-            "applied_fields": applied_fields,
         },
     }
+
+
+@router.patch("/tracks/{track_id}/metadata")
+async def update_track_metadata_manual(
+    track_id: int,
+    request: TrackManualMetadataUpdate,
+    db: DBSession = Depends(get_db),
+):
+    """Manually edit Jukebox metadata fields for odd lookup cases."""
+    track = db.query(LocalTrack).filter(LocalTrack.id == track_id).first()
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+
+    def clean_optional(value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    for field in ["title", "artist", "album", "album_artist", "year", "genre", "track_number", "disc_number"]:
+        if hasattr(request, field) and getattr(request, field) is not None and hasattr(track, field):
+            setattr(track, field, clean_optional(getattr(request, field)))
+
+    cover_error = None
+    if request.clear_cover_art:
+        track.cover_art_path = None
+    elif request.cover_url:
+        try:
+            await _save_track_cover_from_url(db, track, request.cover_url)
+        except Exception as e:
+            cover_error = str(e)
+            print(f"Manual metadata edit: cover download failed for track {track.id}: {e}")
+
+    db.commit()
+    db.refresh(track)
+    return {"success": True, "track": TrackResponse.from_orm(track), "cover_error": cover_error}
 
 
 @router.get("/tracks/{track_id}")

@@ -121,6 +121,9 @@ export const libraryApi = {
 
   applyTrackMetadata: (trackId, metadata) =>
     api.post(`/api/library/tracks/${trackId}/metadata/apply`, metadata),
+
+  updateTrackMetadata: (trackId, metadata) =>
+    api.patch(`/api/library/tracks/${trackId}/metadata`, metadata),
   
   getStreamUrl: (trackId) => 
     `${API_URL}/api/library/tracks/${trackId}/stream`,

@@ -1,7 +1,7 @@
 """
 Database configuration and models
 """
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, Float
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, Float, case, or_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
@@ -206,6 +206,16 @@ def run_migrations():
             conn.execute(text("ALTER TABLE sessions ADD COLUMN playback_status VARCHAR(30)"))
         if 'playback_message' not in session_columns:
             conn.execute(text("ALTER TABLE sessions ADD COLUMN playback_message TEXT"))
+
+        # Older fresh-install/setup paths could create sessions without credential_id.
+        # When the database has exactly one credential, the relationship is
+        # unambiguous, so repair those legacy/orphan rows during startup.
+        conn.execute(text("""
+            UPDATE sessions
+            SET credential_id = (SELECT id FROM credentials ORDER BY priority ASC, id ASC LIMIT 1)
+            WHERE credential_id IS NULL
+              AND (SELECT COUNT(*) FROM credentials) = 1
+        """))
         
         # Create active_streams table if it doesn't exist
         if 'active_streams' not in inspector.get_table_names():
@@ -224,6 +234,63 @@ def run_migrations():
         conn.commit()
     
     print("✅ Database migrations completed")
+
+
+def get_preferred_credential(db, credential_id=None):
+    """Return the active credential ArchiveXM should use for shared/global API work."""
+    if credential_id is not None:
+        credential = db.query(Credentials).filter(
+            Credentials.id == credential_id,
+            Credentials.is_active == True
+        ).first()
+        if credential:
+            return credential
+
+    credential = (
+        db.query(Credentials)
+        .filter(Credentials.is_active == True)
+        .order_by(Credentials.priority.asc(), Credentials.id.asc())
+        .first()
+    )
+    if credential:
+        return credential
+
+    # Backward-compatible fallback for databases created before is_active existed.
+    return db.query(Credentials).order_by(Credentials.priority.asc(), Credentials.id.asc()).first()
+
+
+def get_preferred_auth_session(db, credential_id=None):
+    """Return one deterministic valid auth session.
+
+    Linked sessions for active credentials always win over legacy/orphan sessions.
+    Within a credential, the newest session wins.  This prevents fresh installs or
+    token refreshes from accidentally selecting an older bearer token.
+    """
+    if credential_id is not None:
+        return (
+            db.query(Session)
+            .filter(
+                Session.credential_id == credential_id,
+                Session.is_valid == True
+            )
+            .order_by(Session.created_at.desc(), Session.id.desc())
+            .first()
+        )
+
+    return (
+        db.query(Session)
+        .outerjoin(Credentials, Session.credential_id == Credentials.id)
+        .filter(Session.is_valid == True)
+        .filter(or_(Session.credential_id.is_(None), Credentials.is_active == True))
+        .order_by(
+            case((Session.credential_id.isnot(None), 0), else_=1),
+            case((Credentials.is_active == True, 0), else_=1),
+            Credentials.priority.asc(),
+            Session.created_at.desc(),
+            Session.id.desc(),
+        )
+        .first()
+    )
 
 
 def get_db():

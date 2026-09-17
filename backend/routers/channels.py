@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session as DBSession
 from typing import List, Optional
 from datetime import datetime
 
-from database import get_db, Channel, Session as AuthSession
+from database import get_db, Channel, Session as AuthSession, get_preferred_auth_session
 from services.sxm_api import SiriusXMAPI
 
 router = APIRouter()
@@ -139,7 +139,7 @@ async def refresh_channels(db: DBSession = Depends(get_db)):
     Refresh channel list from SiriusXM API
     """
     # Get bearer token
-    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+    session = get_preferred_auth_session(db)
 
     if not session:
         raise HTTPException(status_code=401, detail="Not authenticated")

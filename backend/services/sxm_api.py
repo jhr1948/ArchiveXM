@@ -56,18 +56,29 @@ class SiriusXMAPI:
         if self.lineup_id:
             return self.lineup_id
         try:
-            from database import get_db_session, Session as AuthSession
+            from database import get_db_session, Session as AuthSession, get_preferred_auth_session
             with get_db_session() as db:
-                session = (
-                    db.query(AuthSession)
-                    .filter(AuthSession.is_valid == True)
-                    .filter(AuthSession.lineup_id.isnot(None))
-                    .order_by(AuthSession.created_at.desc())
-                    .first()
-                )
+                session = get_preferred_auth_session(db)
                 if session and session.lineup_id:
                     self.lineup_id = session.lineup_id
                     return self.lineup_id
+
+                # If the current session omitted the lineup id, only reuse a stored
+                # lineup from the same credential. Never borrow one from another
+                # SiriusXM account.
+                if session and session.credential_id is not None:
+                    prior = (
+                        db.query(AuthSession)
+                        .filter(
+                            AuthSession.credential_id == session.credential_id,
+                            AuthSession.lineup_id.isnot(None)
+                        )
+                        .order_by(AuthSession.created_at.desc(), AuthSession.id.desc())
+                        .first()
+                    )
+                    if prior and prior.lineup_id:
+                        self.lineup_id = prior.lineup_id
+                        return self.lineup_id
         except Exception as e:
             print(f"⚠️ Could not load SXM lineup id from DB: {e}")
         return None

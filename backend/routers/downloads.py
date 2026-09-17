@@ -9,7 +9,7 @@ from typing import List, Optional
 from datetime import datetime
 import os
 
-from database import get_db, Channel, Download, Session as AuthSession, Config, LocalTrack, Playlist, PlaylistTrack
+from database import get_db, Channel, Download, Session as AuthSession, Config, LocalTrack, Playlist, PlaylistTrack, get_preferred_auth_session
 from services.download_service import DownloadService
 from routers.library import _find_existing_jukebox_track
 
@@ -125,7 +125,7 @@ async def download_track(
     """
     Download a single track from DVR buffer
     """
-    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+    session = get_preferred_auth_session(db)
     if not session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     
@@ -212,7 +212,7 @@ async def download_bulk(
     """
     Download multiple tracks from DVR buffer
     """
-    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+    session = get_preferred_auth_session(db)
     if not session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     

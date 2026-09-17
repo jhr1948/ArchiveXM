@@ -33,6 +33,7 @@ class TokenManager:
     def __init__(self):
         self._bearer_token: Optional[str] = None
         self._expires_at: Optional[datetime] = None
+        self._credential_id: Optional[int] = None
         self._refresh_lock = asyncio.Lock()
         self._last_refresh_attempt: Optional[datetime] = None
         self._refresh_cooldown_seconds = 30  # Minimum time between refresh attempts
@@ -63,14 +64,15 @@ class TokenManager:
     
     def load_from_db(self):
         """Load current token from database"""
-        from database import get_db_session, Session as AuthSession
+        from database import get_db_session, get_preferred_auth_session
         
         with get_db_session() as db:
-            session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+            session = get_preferred_auth_session(db)
             
             if session:
                 self._bearer_token = session.bearer_token
                 self._expires_at = session.expires_at
+                self._credential_id = session.credential_id
                 if self._expires_at and self._expires_at.tzinfo is None:
                     # Make timezone-aware if needed
                     self._expires_at = self._expires_at.replace(tzinfo=timezone.utc)
@@ -78,6 +80,9 @@ class TokenManager:
                 print(f"🔑 Token loaded from DB, expires: {self._expires_at}")
                 return True
             
+            self._bearer_token = None
+            self._expires_at = None
+            self._credential_id = None
             print("⚠️ No valid session in database")
             return False
     
@@ -127,12 +132,16 @@ class TokenManager:
             print("🔐 Refreshing authentication token...")
             
             try:
-                from database import get_db_session, Credentials, Session as AuthSession
+                from database import (
+                    get_db_session, Session as AuthSession,
+                    get_preferred_credential
+                )
                 from services.auth_service import AuthService
+                from sqlalchemy import or_
                 import json
                 
                 with get_db_session() as db:
-                    creds = db.query(Credentials).first()
+                    creds = get_preferred_credential(db, self._credential_id)
                     
                     if not creds:
                         print("❌ No stored credentials for refresh")
@@ -147,14 +156,24 @@ class TokenManager:
                         print(f"❌ Token refresh failed: {result.get('error')}")
                         return False
                     
-                    # Invalidate old sessions
-                    db.query(AuthSession).update({"is_valid": False})
+                    # Invalidate only this account's sessions plus legacy orphan
+                    # sessions. Other configured SiriusXM accounts remain untouched.
+                    db.query(AuthSession).filter(
+                        or_(
+                            AuthSession.credential_id == creds.id,
+                            AuthSession.credential_id.is_(None)
+                        )
+                    ).update({"is_valid": False}, synchronize_session=False)
                     
-                    # Create new session
+                    # Create a replacement session linked to the credential that
+                    # actually authenticated.
                     new_session = AuthSession(
+                        credential_id=creds.id,
                         bearer_token=result["bearer_token"],
                         cookies=json.dumps(result.get("cookies", {})),
                         lineup_id=result.get("lineup_id"),
+                        playback_status="valid",
+                        playback_message="Login valid",
                         expires_at=result.get("expires_at"),
                         is_valid=True
                     )
@@ -164,6 +183,7 @@ class TokenManager:
                     # Update local state
                     self._bearer_token = result["bearer_token"]
                     self._expires_at = result.get("expires_at")
+                    self._credential_id = creds.id
                     if self._expires_at and self._expires_at.tzinfo is None:
                         self._expires_at = self._expires_at.replace(tzinfo=timezone.utc)
                     
@@ -235,6 +255,7 @@ class TokenManager:
         """Invalidate current token (forces refresh on next use)"""
         self._bearer_token = None
         self._expires_at = None
+        self._credential_id = None
         print("🔒 Token invalidated")
 
 

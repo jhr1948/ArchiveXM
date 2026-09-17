@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session as DBSession
 from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 
-from database import get_db, Channel, Session as AuthSession, Config
+from database import get_db, Channel, Session as AuthSession, Config, get_preferred_auth_session
 from services.sxm_api import SiriusXMAPI
 from services.hls_service import HLSService
 
@@ -203,7 +203,7 @@ async def get_schedule(
     """
     Get track schedule for a channel (DVR buffer - up to 5 hours)
     """
-    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+    session = get_preferred_auth_session(db)
     if not session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     
@@ -249,7 +249,7 @@ async def get_now_playing(channel_id: str, db: DBSession = Depends(get_db)):
     """
     Get currently playing track for a channel
     """
-    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+    session = get_preferred_auth_session(db)
     if not session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     
@@ -294,7 +294,7 @@ async def get_stream_url(channel_id: str, db: DBSession = Depends(get_db)):
     """
     Get HLS stream URL for a channel
     """
-    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+    session = get_preferred_auth_session(db)
     if not session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     
@@ -1222,7 +1222,7 @@ async def xtra_next(channel_id: str, db: DBSession = Depends(get_db)):
     if get_channel_type(channel_id, db) != "channel-xtra":
         raise HTTPException(status_code=400, detail="Next is only supported for XTRA channels")
 
-    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+    session = get_preferred_auth_session(db)
     if not session:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -1470,7 +1470,7 @@ async def xtra_resume(channel_id: str, db: DBSession = Depends(get_db)):
     resume_track = tracks[resume_index]
     previous_track = tracks[resume_index - 1] if resume_index > 0 else None
 
-    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+    session = get_preferred_auth_session(db)
     if not session:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -1563,7 +1563,7 @@ async def xtra_previous(channel_id: str, db: DBSession = Depends(get_db)):
             headers={"Access-Control-Allow-Origin": "*"},
         )
 
-    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+    session = get_preferred_auth_session(db)
     if not session:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -1611,7 +1611,7 @@ async def proxy_stream(channel_id: str, db: DBSession = Depends(get_db)):
     import httpx
     from fastapi.responses import Response
     
-    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+    session = get_preferred_auth_session(db)
     if not session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     
@@ -1723,7 +1723,7 @@ async def hls_proxy(channel_id: str, path: str, db: DBSession = Depends(get_db))
     stream_info = _stream_sessions.get(channel_id)
     if not stream_info:
         # Try to get fresh session
-        session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+        session = get_preferred_auth_session(db)
         if not session:
             raise HTTPException(status_code=401, detail="Not authenticated")
 
@@ -1996,7 +1996,7 @@ async def hls_key_proxy(channel_id: str, encoded_key: str, db: DBSession = Depen
     if stream_info:
         bearer = stream_info['bearer']
     else:
-        session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+        session = get_preferred_auth_session(db)
         if not session:
             raise HTTPException(status_code=401, detail="Not authenticated")
         bearer = session.bearer_token
@@ -2053,7 +2053,7 @@ async def get_hls_playlist(
     """
     Get HLS variant playlist with segments (for DVR operations)
     """
-    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+    session = get_preferred_auth_session(db)
     if not session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     

@@ -8,7 +8,7 @@ from typing import Optional
 from pathlib import Path
 import os
 
-from database import get_db, Session as AuthSession, Config
+from database import get_db, Session as AuthSession, Config, get_preferred_auth_session
 from services.live_recorder import LiveRecorder
 
 router = APIRouter()
@@ -48,7 +48,7 @@ async def start_recording(
     """
     global active_recorder
     
-    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+    session = get_preferred_auth_session(db)
     if not session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     

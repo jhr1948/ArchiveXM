@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session as DBSession
 from datetime import datetime, timezone
 import json
 
-from database import get_db, Credentials, Session as AuthSession
+from database import get_db, Credentials, Session as AuthSession, get_preferred_auth_session, get_preferred_credential
 from services.auth_service import AuthService
 
 router = APIRouter()
@@ -78,6 +78,9 @@ async def login(request: LoginRequest, db: DBSession = Depends(get_db)):
         )
         db.add(session)
         db.commit()
+
+        from services.token_manager import get_token_manager
+        get_token_manager().invalidate()
         
         return LoginResponse(
             success=True,
@@ -96,8 +99,12 @@ async def auth_status(db: DBSession = Depends(get_db)):
     """
     Check current authentication status
     """
-    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
-    creds = db.query(Credentials).first()
+    session = get_preferred_auth_session(db)
+    creds = (
+        db.query(Credentials).filter(Credentials.id == session.credential_id).first()
+        if session and session.credential_id is not None
+        else get_preferred_credential(db)
+    )
     
     if not session:
         return StatusResponse(
@@ -128,7 +135,10 @@ async def refresh_token(db: DBSession = Depends(get_db)):
     """
     Refresh authentication token using stored credentials
     """
-    creds = db.query(Credentials).first()
+    current_session = get_preferred_auth_session(db)
+    creds = get_preferred_credential(
+        db, current_session.credential_id if current_session else None
+    )
     
     if not creds:
         raise HTTPException(status_code=401, detail="No stored credentials")
@@ -141,21 +151,32 @@ async def refresh_token(db: DBSession = Depends(get_db)):
         if not result["success"]:
             raise HTTPException(status_code=401, detail="Token refresh failed")
         
-        # Update session
-        db.query(AuthSession).update({"is_valid": False})
+        # Replace only the selected credential's session, while retiring any
+        # legacy orphan sessions left by older setup/refresh code.
+        db.query(AuthSession).filter(
+            (AuthSession.credential_id == creds.id) | (AuthSession.credential_id.is_(None))
+        ).update({"is_valid": False}, synchronize_session=False)
         
         session = AuthSession(
+            credential_id=creds.id,
             bearer_token=result["bearer_token"],
             cookies=json.dumps(result.get("cookies", {})),
             lineup_id=result.get("lineup_id"),
+            playback_status="valid",
+            playback_message="Login valid",
             expires_at=result.get("expires_at"),
             is_valid=True
         )
         db.add(session)
         db.commit()
+
+        from services.token_manager import get_token_manager
+        get_token_manager().invalidate()
         
         return {"success": True, "message": "Token refreshed"}
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Refresh error: {str(e)}")
 
@@ -167,6 +188,8 @@ async def logout(db: DBSession = Depends(get_db)):
     """
     db.query(AuthSession).update({"is_valid": False})
     db.commit()
+    from services.token_manager import get_token_manager
+    get_token_manager().invalidate()
     return {"success": True, "message": "Logged out"}
 
 
@@ -175,7 +198,7 @@ async def get_bearer_token(db: DBSession = Depends(get_db)):
     """
     Get current bearer token (for internal use)
     """
-    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
+    session = get_preferred_auth_session(db)
     
     if not session:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -194,8 +217,12 @@ async def token_status(db: DBSession = Depends(get_db)):
     from datetime import timedelta
     from services.token_manager import get_token_manager
     
-    session = db.query(AuthSession).filter(AuthSession.is_valid == True).first()
-    creds = db.query(Credentials).first()
+    session = get_preferred_auth_session(db)
+    creds = (
+        db.query(Credentials).filter(Credentials.id == session.credential_id).first()
+        if session and session.credential_id is not None
+        else get_preferred_credential(db)
+    )
     token_manager = get_token_manager()
     
     if not session:

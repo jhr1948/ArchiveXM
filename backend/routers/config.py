@@ -9,7 +9,7 @@ from typing import Optional, Dict
 import os
 import json
 
-from database import get_db, Config, Credentials, Channel
+from database import get_db, Config, Credentials, Channel, Session as AuthSession
 
 router = APIRouter()
 
@@ -289,25 +289,39 @@ async def initial_setup(request: SetupRequest, db: DBSession = Depends(get_db)):
         if not result["success"]:
             raise HTTPException(status_code=401, detail="Authentication failed")
 
-        existing_creds = db.query(Credentials).first()
+        existing_creds = db.query(Credentials).order_by(Credentials.priority.asc(), Credentials.id.asc()).first()
         if existing_creds:
-            existing_creds.username = request.username
-            existing_creds.password_encrypted = auth_service.encrypt_password(request.password)
-            existing_creds.updated_at = datetime.utcnow()
+            credential = existing_creds
+            credential.username = request.username
+            credential.password_encrypted = auth_service.encrypt_password(request.password)
+            credential.is_active = True
+            credential.updated_at = datetime.utcnow()
         else:
-            creds = Credentials(
+            credential = Credentials(
+                name="Primary",
                 username=request.username,
-                password_encrypted=auth_service.encrypt_password(request.password)
+                password_encrypted=auth_service.encrypt_password(request.password),
+                is_active=True,
+                max_streams=3,
+                priority=0,
             )
-            db.add(creds)
+            db.add(credential)
+            # We need the credential id before constructing its auth session.
+            db.flush()
 
-        from database import Session as AuthSession
-        db.query(AuthSession).update({"is_valid": False})
+        # Retire sessions for this credential plus legacy unlinked sessions left by
+        # older setup builds. Do not invalidate sessions belonging to other accounts.
+        db.query(AuthSession).filter(
+            (AuthSession.credential_id == credential.id) | (AuthSession.credential_id.is_(None))
+        ).update({"is_valid": False}, synchronize_session=False)
 
         session = AuthSession(
+            credential_id=credential.id,
             bearer_token=result["bearer_token"],
             cookies=json.dumps(result.get("cookies", {})),
             lineup_id=result.get("lineup_id"),
+            playback_status="valid",
+            playback_message="Login valid",
             expires_at=result.get("expires_at"),
             is_valid=True
         )
@@ -328,6 +342,11 @@ async def initial_setup(request: SetupRequest, db: DBSession = Depends(get_db)):
         _set_json_config(db, "live_metadata_channel_offsets", request.live_metadata_channel_offsets or {})
 
         db.commit()
+
+        # A process that attempted API access before setup may still have an old
+        # token cached. Force the next request to load the new linked session.
+        from services.token_manager import get_token_manager
+        get_token_manager().invalidate()
 
         channels_refreshed = 0
         playlist_result = None

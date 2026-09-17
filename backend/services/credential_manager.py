@@ -72,10 +72,15 @@ class CredentialManager:
     
     def _get_valid_session(self, db: DBSession, credential: Credentials) -> Optional[AuthSession]:
         """Get a valid session for a credential, refreshing if needed."""
-        session = db.query(AuthSession).filter(
-            AuthSession.credential_id == credential.id,
-            AuthSession.is_valid == True
-        ).first()
+        session = (
+            db.query(AuthSession)
+            .filter(
+                AuthSession.credential_id == credential.id,
+                AuthSession.is_valid == True
+            )
+            .order_by(AuthSession.created_at.desc())
+            .first()
+        )
         
         # Check if session exists and is not expired
         if session and session.expires_at and session.expires_at > datetime.utcnow():
@@ -109,6 +114,8 @@ class CredentialManager:
                 bearer_token=result["bearer_token"],
                 cookies=json.dumps(result.get("cookies", {})),
                 lineup_id=result.get("lineup_id"),
+                playback_status="valid",
+                playback_message="Login valid",
                 expires_at=result.get("expires_at"),
                 is_valid=True
             )
@@ -162,10 +169,15 @@ class CredentialManager:
             ).scalar() or 0
             
             # Get session status
-            session = db.query(AuthSession).filter(
-                AuthSession.credential_id == cred.id,
-                AuthSession.is_valid == True
-            ).first()
+            session = (
+                db.query(AuthSession)
+                .filter(
+                    AuthSession.credential_id == cred.id,
+                    AuthSession.is_valid == True
+                )
+                .order_by(AuthSession.created_at.desc())
+                .first()
+            )
             
             has_valid_session = session is not None and (
                 session.expires_at is None or session.expires_at > datetime.utcnow()
@@ -190,6 +202,23 @@ class CredentialManager:
                 else:
                     session_expires_in = "Expired"
             
+            if not has_valid_session:
+                playback_status = 'needs_auth'
+                status_message = 'Authentication required'
+            elif session and session.playback_status in ('ready', 'login_only', 'playback_error'):
+                playback_status = session.playback_status
+                status_message = session.playback_message or (
+                    'Playback verified' if playback_status == 'ready'
+                    else 'Login valid, but playback is unavailable' if playback_status == 'login_only'
+                    else 'Login valid, but the playback check failed'
+                )
+            else:
+                # A valid authenticated session is not a playback failure merely because
+                # SiriusXM omitted lineup_id from the login response. Playback readiness
+                # is only downgraded after a real tuneSource probe fails.
+                playback_status = 'valid'
+                status_message = session.playback_message or 'Login valid'
+
             stats['credentials'].append({
                 'id': cred.id,
                 'name': cred.name,
@@ -198,6 +227,8 @@ class CredentialManager:
                 'max_streams': cred.max_streams,
                 'priority': cred.priority,
                 'has_valid_session': has_valid_session,
+                'playback_status': playback_status,
+                'status_message': status_message,
                 'session_expires_at': session_expires_at,
                 'session_expires_in': session_expires_in,
                 'available_capacity': cred.max_streams - active_count

@@ -39,6 +39,7 @@ class SiriusXMAPI:
         self._token_manager = None
         self.bearer_token = bearer_token
         self.lineup_id = lineup_id
+        self.last_stream_error = None
         self._update_headers()
     
     def _update_headers(self):
@@ -71,14 +72,14 @@ class SiriusXMAPI:
             print(f"⚠️ Could not load SXM lineup id from DB: {e}")
         return None
 
-    def _payload_with_lineup_variants(self, payload: Dict) -> List[Dict]:
+    def _payload_with_lineup_variants(self, payload: Dict, load_lineup_from_db: bool = True) -> List[Dict]:
         """Return tuneSource payload variants, preferring the stored lineup id.
 
         SiriusXM currently rejects playback requests without a channel lineup id.
         Different client builds have used slightly different field names, so retry
         a small set of compatible variants before giving up.
         """
-        lineup_id = self._load_lineup_id_from_db()
+        lineup_id = self._load_lineup_id_from_db() if load_lineup_from_db else self.lineup_id
         variants = []
         if lineup_id:
             for key in ("channelLineupId", "lineupId", "channelLineupID"):
@@ -145,7 +146,13 @@ class SiriusXMAPI:
         config_b64 = base64.b64encode(config_json.encode()).decode()
         return f"{self.CDN_BASE}{config_b64}"
     
-    async def get_stream_url(self, channel_id: str, channel_type: str = "channel-linear") -> Optional[Dict]:
+    async def get_stream_url(
+        self,
+        channel_id: str,
+        channel_type: str = "channel-linear",
+        ensure_valid_token: bool = True,
+        load_lineup_from_db: bool = True,
+    ) -> Optional[Dict]:
         """
         Get HLS stream URL for a channel using m3u8XM approach
         
@@ -156,8 +163,10 @@ class SiriusXMAPI:
         Returns:
             Dict with stream info including URLs
         """
-        await self._ensure_valid_token()
-        
+        self.last_stream_error = None
+        if ensure_valid_token:
+            await self._ensure_valid_token()
+
         url = f'{self.BASE_URL}/playback/play/v1/tuneSource'
         
         payload = {
@@ -176,7 +185,9 @@ class SiriusXMAPI:
                 async with httpx.AsyncClient() as client:
                     response = None
                     used_payload = payload
-                    for payload_variant in self._payload_with_lineup_variants(payload):
+                    for payload_variant in self._payload_with_lineup_variants(
+                        payload, load_lineup_from_db=load_lineup_from_db
+                    ):
                         used_payload = payload_variant
                         response = await client.post(url, headers=self.headers, json=payload_variant, timeout=15)
                         if self._is_missing_lineup_response(response) and payload_variant is not payload:
@@ -186,6 +197,16 @@ class SiriusXMAPI:
                     
                     # Missing lineup id is not an expired-token problem. Refreshing just spams auth.
                     if self._is_missing_lineup_response(response):
+                        try:
+                            error_data = response.json()
+                        except Exception:
+                            error_data = {}
+                        self.last_stream_error = {
+                            'status_code': response.status_code,
+                            'code': error_data.get('code'),
+                            'description': error_data.get('description') or response.text[:300],
+                            'kind': 'entitlement',
+                        }
                         print("⚠️ Stream URL API rejected request: missing/invalid channel lineup id")
                         print(f"Payload keys tried: {list(used_payload.keys())}")
                         print(f"Response: {response.text[:300]}")
@@ -219,11 +240,29 @@ class SiriusXMAPI:
                         print(f"No stream URL in response: {list(data.keys())}")
                         return None
                     else:
+                        try:
+                            error_data = response.json()
+                        except Exception:
+                            error_data = {}
+                        description = error_data.get('description') or error_data.get('message') or response.text[:300]
+                        error_text = str(description).lower()
+                        self.last_stream_error = {
+                            'status_code': response.status_code,
+                            'code': error_data.get('code'),
+                            'description': description,
+                            'kind': 'entitlement' if response.status_code == 403 and ('entitl' in error_text or 'lineup' in error_text) else 'api',
+                        }
                         print(f"Stream URL API error: {response.status_code}")
                         print(f"Response: {response.text[:300]}")
                         return None
                         
             except Exception as e:
+                self.last_stream_error = {
+                    'status_code': None,
+                    'code': None,
+                    'description': str(e),
+                    'kind': 'network',
+                }
                 print(f"Error getting stream URL: {e}")
                 if attempt < self.MAX_RETRIES:
                     print(f"Retrying after error (attempt {attempt + 1})")

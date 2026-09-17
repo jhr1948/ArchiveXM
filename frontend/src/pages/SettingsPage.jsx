@@ -186,8 +186,11 @@ function SettingsPage() {
 
   const handleUpdateCredential = async (id) => {
     try {
-      await api.put(`/api/settings/credentials/${id}`, editForm)
+      const payload = { ...editForm }
+      if (!payload.password) delete payload.password
+      await api.put(`/api/settings/credentials/${id}`, payload)
       setEditingId(null)
+      setEditForm({})
       await loadCredentials()
     } catch (error) {
       alert(error.response?.data?.detail || 'Failed to update credential')
@@ -195,7 +198,7 @@ function SettingsPage() {
   }
 
   const handleDeleteCredential = async (id, name) => {
-    if (!confirm(`Are you sure you want to delete "${name}"?`)) return
+    if (!confirm(`Delete "${name}"? This also removes its saved sessions and active-stream records.`)) return
     
     try {
       await api.delete(`/api/settings/credentials/${id}`)
@@ -211,7 +214,13 @@ function SettingsPage() {
     
     try {
       const res = await api.post(`/api/settings/credentials/${id}/test`)
-      setTestResult({ id, success: res.data.success, message: res.data.message })
+      setTestResult({
+        id,
+        success: res.data.success,
+        status: res.data.status,
+        playbackAvailable: res.data.playback_available,
+        message: res.data.message
+      })
       await loadCredentials()
     } catch (error) {
       setTestResult({ id, success: false, message: error.response?.data?.detail || 'Test failed' })
@@ -224,6 +233,8 @@ function SettingsPage() {
     setEditingId(cred.id)
     setEditForm({
       name: cred.name,
+      username: cred.username,
+      password: '',
       max_streams: cred.max_streams,
       is_active: cred.is_active
     })
@@ -590,26 +601,53 @@ function SettingsPage() {
                 {editingId === cred.id ? (
                   // Edit mode
                   <div className="space-y-3">
-                    <div className="flex items-center gap-3">
-                      <input
-                        type="text"
-                        value={editForm.name}
-                        onChange={(e) => setEditForm({ ...editForm, name: e.target.value })}
-                        className="input flex-1"
-                        placeholder="Account name"
-                      />
-                      <div className="flex items-center gap-2">
-                        <span className="text-gray-400 text-sm">Max streams:</span>
+                    <div className="grid grid-cols-1 lg:grid-cols-[1fr_auto] gap-3">
+                      <div>
+                        <label className="block text-gray-400 text-xs mb-1">Account name</label>
+                        <input
+                          type="text"
+                          value={editForm.name || ''}
+                          onChange={(e) => setEditForm({ ...editForm, name: e.target.value })}
+                          className="input w-full"
+                          placeholder="Account name"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-gray-400 text-xs mb-1">Max streams</label>
                         <input
                           type="number"
                           min="1"
                           max="5"
                           value={editForm.max_streams}
                           onChange={(e) => setEditForm({ ...editForm, max_streams: parseInt(e.target.value) })}
-                          className="input w-16 text-center"
+                          className="input w-24 text-center"
                         />
                       </div>
                     </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-gray-400 text-xs mb-1">SiriusXM username/email</label>
+                        <input
+                          type="text"
+                          value={editForm.username || ''}
+                          onChange={(e) => setEditForm({ ...editForm, username: e.target.value })}
+                          className="input w-full"
+                          autoComplete="username"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-gray-400 text-xs mb-1">New password</label>
+                        <input
+                          type="password"
+                          value={editForm.password || ''}
+                          onChange={(e) => setEditForm({ ...editForm, password: e.target.value })}
+                          className="input w-full"
+                          placeholder="Leave blank to keep current password"
+                          autoComplete="new-password"
+                        />
+                      </div>
+                    </div>
+                    <p className="text-gray-500 text-xs">Changing the username or password verifies the new SiriusXM login and replaces the saved session.</p>
                     <div className="flex items-center justify-between">
                       <label className="flex items-center gap-2 cursor-pointer">
                         <input
@@ -666,11 +704,15 @@ function SettingsPage() {
                       </div>
                       
                       {/* Status & Expiration */}
-                      <div className="text-right hidden sm:block">
-                        <div className={`flex items-center gap-1 text-sm ${
-                          cred.has_valid_session ? 'text-sxm-success' : 'text-sxm-warning'
+                      <div className="text-right hidden sm:block max-w-56">
+                        <div className={`flex items-center justify-end gap-1 text-sm ${
+                          ['ready', 'valid'].includes(cred.playback_status)
+                            ? 'text-sxm-success'
+                            : ['login_only', 'playback_error'].includes(cred.playback_status)
+                              ? 'text-yellow-400'
+                              : 'text-sxm-warning'
                         }`}>
-                          {cred.has_valid_session ? (
+                          {['ready', 'valid'].includes(cred.playback_status) ? (
                             <>
                               <CheckCircle className="w-4 h-4" />
                               <span>Valid</span>
@@ -678,22 +720,33 @@ function SettingsPage() {
                           ) : (
                             <>
                               <AlertCircle className="w-4 h-4" />
-                              <span>Needs auth</span>
+                              <span>{['login_only', 'playback_error'].includes(cred.playback_status) ? 'Login valid' : 'Needs auth'}</span>
                             </>
                           )}
                         </div>
-                        {cred.session_expires_in && cred.has_valid_session && (
-                          <div className="text-gray-500 text-xs">
-                            Expires in {cred.session_expires_in}
-                          </div>
-                        )}
+                        <div className="text-gray-500 text-xs" title={cred.status_message}>
+                          {cred.playback_status === 'login_only'
+                            ? 'Playback unavailable'
+                            : cred.playback_status === 'playback_error'
+                              ? 'Playback check failed'
+                              : cred.session_expires_in && cred.has_valid_session
+                              ? `Expires in ${cred.session_expires_in}`
+                              : cred.status_message}
+                        </div>
                       </div>
                       
                       {/* Mobile status icon only */}
-                      <div className={`sm:hidden ${
-                        cred.has_valid_session ? 'text-sxm-success' : 'text-sxm-warning'
-                      }`}>
-                        {cred.has_valid_session ? (
+                      <div
+                        className={`sm:hidden ${
+                          ['ready', 'valid'].includes(cred.playback_status)
+                            ? 'text-sxm-success'
+                            : ['login_only', 'playback_error'].includes(cred.playback_status)
+                              ? 'text-yellow-400'
+                              : 'text-sxm-warning'
+                        }`}
+                        title={cred.status_message}
+                      >
+                        {['ready', 'valid'].includes(cred.playback_status) ? (
                           <CheckCircle className="w-4 h-4" />
                         ) : (
                           <AlertCircle className="w-4 h-4" />
@@ -702,8 +755,17 @@ function SettingsPage() {
                       
                       {/* Test result */}
                       {testResult?.id === cred.id && (
-                        <span className={`text-sm ${testResult.success ? 'text-sxm-success' : 'text-sxm-error'}`}>
-                          {testResult.success ? '✓' : '✗'}
+                        <span
+                          className={`text-xs max-w-52 ${
+                            !testResult.success
+                              ? 'text-sxm-error'
+                              : ['login_only', 'playback_error'].includes(testResult.status)
+                                ? 'text-yellow-400'
+                                : 'text-sxm-success'
+                          }`}
+                          title={testResult.message}
+                        >
+                          {testResult.message}
                         </span>
                       )}
                       
@@ -727,8 +789,7 @@ function SettingsPage() {
                         <button
                           onClick={() => handleDeleteCredential(cred.id, cred.name)}
                           className="p-2 text-gray-400 hover:text-red-400 hover:bg-gray-700 rounded transition-colors"
-                          title="Delete"
-                          disabled={credentials.length <= 1}
+                          title="Delete account"
                         >
                           <Trash2 className="w-4 h-4" />
                         </button>

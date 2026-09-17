@@ -7,11 +7,61 @@ from sqlalchemy.orm import Session as DBSession
 from typing import Optional, List
 from datetime import datetime
 
-from database import get_db, Credentials, Session as AuthSession, ActiveStream, Config
+from database import get_db, Credentials, Session as AuthSession, ActiveStream, Channel, Config
 from services.auth_service import AuthService
+from services.sxm_api import SiriusXMAPI
 from services.credential_manager import get_credential_manager
+from services.token_manager import get_token_manager
 
 router = APIRouter()
+
+
+async def _probe_playback(db: DBSession, bearer_token: str, lineup_id: Optional[str] = None):
+    """Verify playback with a real tuneSource request instead of lineup-id presence."""
+    channel = (
+        db.query(Channel)
+        .filter(Channel.channel_type == "channel-linear")
+        .order_by(Channel.number.asc(), Channel.id.asc())
+        .first()
+    )
+    if channel is None:
+        channel = db.query(Channel).order_by(Channel.id.asc()).first()
+
+    if channel is None:
+        return {
+            "status": "valid",
+            "available": None,
+            "message": "Login is valid; playback was not tested because no channels are loaded",
+        }
+
+    api = SiriusXMAPI(bearer_token=bearer_token, lineup_id=lineup_id)
+    result = await api.get_stream_url(
+        channel.channel_id,
+        channel.channel_type or "channel-linear",
+        ensure_valid_token=False,
+        load_lineup_from_db=False,
+    )
+    if result and result.get("stream_url"):
+        return {
+            "status": "ready",
+            "available": True,
+            "message": "Playback verified",
+        }
+
+    error = api.last_stream_error or {}
+    description = str(error.get("description") or "").strip()
+    if error.get("kind") == "entitlement":
+        return {
+            "status": "login_only",
+            "available": False,
+            "message": "Login is valid, but SiriusXM rejected playback entitlement",
+        }
+
+    return {
+        "status": "playback_error",
+        "available": None,
+        "message": f"Login is valid, but the playback check failed{': ' + description if description else ''}",
+    }
 
 
 class CredentialCreate(BaseModel):
@@ -40,6 +90,8 @@ class CredentialResponse(BaseModel):
     priority: int
     active_streams: int
     has_valid_session: bool
+    playback_status: str
+    status_message: str
     session_expires_at: Optional[str] = None
     session_expires_in: Optional[str] = None
     created_at: str
@@ -69,6 +121,8 @@ async def list_credentials(db: DBSession = Depends(get_db)):
             priority=cred.priority,
             active_streams=cred_stat['active_streams'],
             has_valid_session=cred_stat['has_valid_session'],
+            playback_status=cred_stat.get('playback_status', 'needs_auth'),
+            status_message=cred_stat.get('status_message', 'Authentication required'),
             session_expires_at=cred_stat.get('session_expires_at'),
             session_expires_in=cred_stat.get('session_expires_in'),
             created_at=cred.created_at.isoformat() if cred.created_at else ""
@@ -94,6 +148,10 @@ async def add_credential(request: CredentialCreate, db: DBSession = Depends(get_
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Could not verify credentials: {str(e)}")
     
+    playback_check = await _probe_playback(
+        db, result["bearer_token"], result.get("lineup_id")
+    )
+
     # Create credential
     credential = Credentials(
         name=request.name,
@@ -114,6 +172,8 @@ async def add_credential(request: CredentialCreate, db: DBSession = Depends(get_
         bearer_token=result["bearer_token"],
         cookies=json.dumps(result.get("cookies", {})),
         lineup_id=result.get("lineup_id"),
+        playback_status=playback_check["status"],
+        playback_message=playback_check["message"],
         expires_at=result.get("expires_at"),
         is_valid=True
     )
@@ -123,92 +183,130 @@ async def add_credential(request: CredentialCreate, db: DBSession = Depends(get_
     return {
         "success": True,
         "message": f"Credential '{request.name}' added successfully",
-        "credential_id": credential.id
+        "credential_id": credential.id,
+        "status": playback_check["status"],
+        "playback_available": playback_check["available"],
     }
 
 
 @router.put("/credentials/{credential_id}")
 async def update_credential(
-    credential_id: int, 
-    request: CredentialUpdate, 
+    credential_id: int,
+    request: CredentialUpdate,
     db: DBSession = Depends(get_db)
 ):
-    """Update an existing credential."""
+    """Update an existing credential, including its SiriusXM login."""
     credential = db.query(Credentials).filter(Credentials.id == credential_id).first()
     if not credential:
         raise HTTPException(status_code=404, detail="Credential not found")
-    
+
     auth_service = AuthService()
-    
-    # Update fields
+    requested_username = request.username.strip() if request.username is not None else credential.username
+    requested_password = request.password if request.password not in (None, "") else None
+    username_changed = request.username is not None and requested_username != credential.username
+    password_changed = requested_password is not None
+    auth_changed = username_changed or password_changed
+    auth_result = None
+
+    if auth_changed:
+        try:
+            password_to_test = (
+                requested_password
+                if password_changed
+                else auth_service.decrypt_password(credential.password_encrypted)
+            )
+            auth_result = await auth_service.authenticate(requested_username, password_to_test)
+            if not auth_result.get("success"):
+                raise HTTPException(
+                    status_code=401,
+                    detail=auth_result.get("error") or "Invalid SiriusXM username or password"
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"Could not verify updated SiriusXM login: {str(e)}")
+
     if request.name is not None:
         credential.name = request.name
-    if request.username is not None:
-        credential.username = request.username
-    if request.password is not None:
-        # Test new password
-        try:
-            result = await auth_service.authenticate(
-                request.username or credential.username, 
-                request.password
-            )
-            if not result.get("success"):
-                raise HTTPException(status_code=401, detail="Invalid password")
-            credential.password_encrypted = auth_service.encrypt_password(request.password)
-            
-            # Invalidate old sessions and create new one
-            db.query(AuthSession).filter(AuthSession.credential_id == credential_id).update({"is_valid": False})
-            import json
-            session = AuthSession(
-                credential_id=credential.id,
-                bearer_token=result["bearer_token"],
-                cookies=json.dumps(result.get("cookies", {})),
-                lineup_id=result.get("lineup_id"),
-                expires_at=result.get("expires_at"),
-                is_valid=True
-            )
-            db.add(session)
-        except Exception as e:
-            raise HTTPException(status_code=401, detail=f"Could not verify new password: {str(e)}")
-    
+    if username_changed:
+        credential.username = requested_username
+    if password_changed:
+        credential.password_encrypted = auth_service.encrypt_password(requested_password)
     if request.max_streams is not None:
         credential.max_streams = request.max_streams
     if request.priority is not None:
         credential.priority = request.priority
     if request.is_active is not None:
         credential.is_active = request.is_active
-    
+
+    playback_check = None
+    if auth_result:
+        playback_check = await _probe_playback(
+            db, auth_result["bearer_token"], auth_result.get("lineup_id")
+        )
+
+        # Keep historical sessions for diagnostics, but make only the newly verified
+        # login session valid. This prevents a username/password edit from continuing
+        # to use an older bearer token.
+        db.query(AuthSession).filter(
+            AuthSession.credential_id == credential_id
+        ).update({"is_valid": False})
+
+        import json
+        db.add(AuthSession(
+            credential_id=credential.id,
+            bearer_token=auth_result["bearer_token"],
+            cookies=json.dumps(auth_result.get("cookies", {})),
+            lineup_id=auth_result.get("lineup_id"),
+            playback_status=playback_check["status"],
+            playback_message=playback_check["message"],
+            expires_at=auth_result.get("expires_at"),
+            is_valid=True
+        ))
+
     credential.updated_at = datetime.utcnow()
     db.commit()
-    
-    return {"success": True, "message": "Credential updated successfully"}
+
+    if auth_changed:
+        # The singleton may still hold the old account token in memory. Force the
+        # next API request to reload the newly-created session.
+        get_token_manager().invalidate()
+
+    return {
+        "success": True,
+        "message": playback_check["message"] if playback_check else "Credential updated successfully",
+        "status": playback_check["status"] if playback_check else None,
+        "playback_available": playback_check["available"] if playback_check else None,
+    }
 
 
 @router.delete("/credentials/{credential_id}")
 async def delete_credential(credential_id: int, db: DBSession = Depends(get_db)):
-    """Delete a credential."""
+    """Delete a credential and all of its dependent session/stream rows."""
     credential = db.query(Credentials).filter(Credentials.id == credential_id).first()
     if not credential:
         raise HTTPException(status_code=404, detail="Credential not found")
-    
-    # Check if this is the last credential
-    cred_count = db.query(Credentials).count()
-    if cred_count <= 1:
-        raise HTTPException(status_code=400, detail="Cannot delete the last credential")
-    
-    # Check for active streams
-    active_streams = db.query(ActiveStream).filter(ActiveStream.credential_id == credential_id).count()
-    if active_streams > 0:
-        raise HTTPException(status_code=400, detail=f"Cannot delete - credential has {active_streams} active streams")
-    
-    # Delete sessions
-    db.query(AuthSession).filter(AuthSession.credential_id == credential_id).delete()
-    
-    # Delete credential
-    db.query(Credentials).filter(Credentials.id == credential_id).delete()
+
+    # Account deletion is an explicit reset operation. Remove dependent rows first
+    # instead of blocking deletion because stale stream/session records exist.
+    deleted_streams = db.query(ActiveStream).filter(
+        ActiveStream.credential_id == credential_id
+    ).delete(synchronize_session=False)
+    deleted_sessions = db.query(AuthSession).filter(
+        AuthSession.credential_id == credential_id
+    ).delete(synchronize_session=False)
+    db.delete(credential)
     db.commit()
-    
-    return {"success": True, "message": "Credential deleted successfully"}
+
+    # A deleted account's bearer may still be cached by the global token manager.
+    get_token_manager().invalidate()
+
+    return {
+        "success": True,
+        "message": "Credential deleted successfully",
+        "deleted_sessions": deleted_sessions,
+        "deleted_active_streams": deleted_streams
+    }
 
 
 @router.post("/credentials/{credential_id}/test")
@@ -225,7 +323,11 @@ async def test_credential(credential_id: int, db: DBSession = Depends(get_db)):
         result = await auth_service.authenticate(credential.username, password)
         
         if result.get("success"):
-            # Update session
+            playback_check = await _probe_playback(
+                db, result["bearer_token"], result.get("lineup_id")
+            )
+
+            # Update session only after login and playback probing are complete.
             db.query(AuthSession).filter(AuthSession.credential_id == credential_id).update({"is_valid": False})
             import json
             session = AuthSession(
@@ -233,15 +335,20 @@ async def test_credential(credential_id: int, db: DBSession = Depends(get_db)):
                 bearer_token=result["bearer_token"],
                 cookies=json.dumps(result.get("cookies", {})),
                 lineup_id=result.get("lineup_id"),
+                playback_status=playback_check["status"],
+                playback_message=playback_check["message"],
                 expires_at=result.get("expires_at"),
                 is_valid=True
             )
             db.add(session)
             db.commit()
-            
+            get_token_manager().invalidate()
+
             return {
                 "success": True,
-                "message": "Credential is valid",
+                "status": playback_check["status"],
+                "playback_available": playback_check["available"],
+                "message": playback_check["message"],
                 "expires_at": result.get("expires_at").isoformat() if result.get("expires_at") else None
             }
         else:

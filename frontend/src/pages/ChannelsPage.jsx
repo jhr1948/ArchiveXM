@@ -10,6 +10,8 @@ function ChannelsPage() {
   const [refreshing, setRefreshing] = useState(false)
   const [search, setSearch] = useState('')
   const [selectedCategory, setSelectedCategory] = useState('')
+  const [refreshMessage, setRefreshMessage] = useState('')
+  const [refreshError, setRefreshError] = useState('')
 
   useEffect(() => {
     loadChannels()
@@ -38,12 +40,29 @@ function ChannelsPage() {
 
   const refreshChannels = async () => {
     setRefreshing(true)
+    setRefreshMessage('')
+    setRefreshError('')
     try {
-      await channelsApi.refresh()
+      const response = await channelsApi.refresh()
+      const data = response.data || {}
       await loadChannels()
       await loadCategories()
+
+      const parts = [
+        `Refreshed ${data.total ?? 0} channels`,
+        `${data.added ?? 0} added`,
+        `${data.renamed ?? 0} renamed`,
+        `${data.removed ?? 0} removed`,
+        'M3U updated',
+        'Changes report created'
+      ]
+      setRefreshMessage(parts.join(' • '))
     } catch (error) {
       console.error('Error refreshing channels:', error)
+      setRefreshError(
+        error.response?.data?.detail ||
+        'Channel refresh failed. Existing channels and M3U were preserved.'
+      )
     } finally {
       setRefreshing(false)
     }
@@ -89,6 +108,18 @@ function ChannelsPage() {
           {refreshing ? 'Refreshing...' : 'Refresh Channels'}
         </button>
       </div>
+
+      {refreshMessage && (
+        <div className="mb-6 rounded-lg border border-green-700 bg-green-950/40 px-4 py-3 text-sm text-green-200">
+          {refreshMessage}
+        </div>
+      )}
+
+      {refreshError && (
+        <div className="mb-6 rounded-lg border border-red-700 bg-red-950/40 px-4 py-3 text-sm text-red-200">
+          {refreshError}
+        </div>
+      )}
 
       {/* Filters */}
       <div className="flex flex-col md:flex-row gap-4 mb-6">

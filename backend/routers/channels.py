@@ -13,6 +13,7 @@ from database import get_db, Channel, Session as AuthSession, get_preferred_auth
 from services.sxm_api import SiriusXMAPI
 from routers.playlist import (
     backup_existing_m3u,
+    read_existing_m3u_channels,
     write_channel_changes_report,
     write_m3u_to_file,
 )
@@ -209,11 +210,11 @@ async def refresh_channels(db: DBSession = Depends(get_db)):
 
         old_channels = db.query(Channel).all()
         old_snapshots = [_channel_snapshot(channel) for channel in old_channels]
-        old_by_identity = {
-            _change_identity(channel): channel
-            for channel in old_snapshots
-            if _change_identity(channel)
-        }
+
+        # The existing on-disk M3U is the authoritative "before" playlist for
+        # the change report. This intentionally lets an older .bak be restored
+        # as siriusxm.m3u and compared against a freshly generated lineup.
+        old_m3u_snapshots = read_existing_m3u_channels(db)
 
         new_by_channel_id = {}
         new_snapshots = []
@@ -243,30 +244,6 @@ async def refresh_channels(db: DBSession = Depends(get_db)):
                     "Existing channels and M3U were preserved."
                 ),
             )
-
-        new_by_identity = {
-            _change_identity(channel): channel
-            for channel in new_snapshots
-            if _change_identity(channel)
-        }
-
-        added = [
-            channel
-            for identity, channel in new_by_identity.items()
-            if identity not in old_by_identity
-        ]
-        removed = [
-            channel
-            for identity, channel in old_by_identity.items()
-            if identity not in new_by_identity
-        ]
-        renamed = []
-        for identity, new_channel in new_by_identity.items():
-            old_channel = old_by_identity.get(identity)
-            if not old_channel:
-                continue
-            if _normalized_name_for_compare(old_channel.get("name")) != _normalized_name_for_compare(new_channel.get("name")):
-                renamed.append({"old": old_channel, "new": new_channel})
 
         # Update database only after the fetched snapshot passes the integrity
         # guard and the before/after comparison has been captured.
@@ -323,12 +300,48 @@ async def refresh_channels(db: DBSession = Depends(get_db)):
         # backup uses the local date and adds a time suffix only on collision.
         backup_path = backup_existing_m3u()
         playlist_result = write_m3u_to_file(db)
+
+        # Compare the actual old and new M3U channel states. If no previous M3U
+        # exists, fall back to the pre-refresh database snapshot so an existing
+        # installation does not suddenly report its whole lineup as "added".
+        new_m3u_snapshots = read_existing_m3u_channels(db)
+        before_snapshots = old_m3u_snapshots or old_snapshots
+
+        old_by_identity = {
+            _change_identity(channel): channel
+            for channel in before_snapshots
+            if _change_identity(channel)
+        }
+        new_by_identity = {
+            _change_identity(channel): channel
+            for channel in new_m3u_snapshots
+            if _change_identity(channel)
+        }
+
+        added = [
+            channel
+            for identity, channel in new_by_identity.items()
+            if identity not in old_by_identity
+        ]
+        removed = [
+            channel
+            for identity, channel in old_by_identity.items()
+            if identity not in new_by_identity
+        ]
+        renamed = []
+        for identity, new_channel in new_by_identity.items():
+            old_channel = old_by_identity.get(identity)
+            if not old_channel:
+                continue
+            if _normalized_name_for_compare(old_channel.get("name")) != _normalized_name_for_compare(new_channel.get("name")):
+                renamed.append({"old": old_channel, "new": new_channel})
+
         changes_path = write_channel_changes_report(
             added=added,
             renamed=renamed,
             removed=removed,
-            previous_count=old_count,
-            current_count=new_count,
+            previous_count=len(before_snapshots),
+            current_count=len(new_m3u_snapshots),
         )
 
         return {

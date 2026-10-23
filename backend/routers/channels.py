@@ -66,7 +66,11 @@ def _channel_data_snapshot(ch_data: dict) -> dict:
 
 
 def _change_identity(channel: dict) -> str:
-    return str(channel.get("public_uuid") or channel.get("channel_id") or "")
+    # ArchiveXM's authenticated channel_id is the primary stable identity and
+    # already exists on pre-migration databases. Prefer it so the first refresh
+    # after adding public metadata cannot falsely report the whole lineup as
+    # removed/added merely because public_uuid has just been populated.
+    return str(channel.get("channel_id") or channel.get("public_uuid") or "")
 
 
 def extract_channel_type(ch_data: dict) -> str:

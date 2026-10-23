@@ -2,6 +2,9 @@
 Playlist Router - Generate local M3U playlists for IPTV players
 """
 import os
+import re
+import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -253,10 +256,162 @@ def generate_m3u(db: DBSession) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _playlist_output_path() -> Path:
+    return Path(os.getenv("PLAYLIST_OUTPUT", "/app/output/siriusxm.m3u"))
+
+
+def backup_existing_m3u(output_path: Optional[Path] = None) -> Optional[str]:
+    """Preserve the currently generated M3U before a successful channel refresh."""
+    output_path = Path(output_path) if output_path else _playlist_output_path()
+    if not output_path.exists():
+        return None
+
+    stamp = datetime.now().strftime("%m.%d.%Y")
+    backup_path = output_path.with_name(f"{output_path.name}.{stamp}.bak")
+    if backup_path.exists():
+        time_stamp = datetime.now().strftime("%H%M%S")
+        backup_path = output_path.with_name(
+            f"{output_path.name}.{stamp}-{time_stamp}.bak"
+        )
+        counter = 2
+        while backup_path.exists():
+            backup_path = output_path.with_name(
+                f"{output_path.name}.{stamp}-{time_stamp}-{counter}.bak"
+            )
+            counter += 1
+
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(output_path, backup_path)
+    return str(backup_path)
+
+
+def _xmltv_id_for_channel(channel: dict) -> str:
+    name = str(channel.get("name") or "")
+    base = re.sub(r"[^A-Za-z0-9]+", "", name)
+    if not base:
+        base = re.sub(
+            r"[^A-Za-z0-9]+",
+            "",
+            str(channel.get("public_uuid") or channel.get("channel_id") or "Channel"),
+        )
+    return f"{base}.sxm"
+
+
+def _site_id_for_channel(channel: dict) -> str:
+    channel_type = str(channel.get("channel_type") or "channel-linear").lower()
+    if channel_type == "channel-xtra":
+        return "dummy"
+
+    public_path = str(channel.get("public_path") or "").strip()
+    public_uuid = str(channel.get("public_uuid") or "").strip()
+
+    if public_path.lower().startswith("/sports/"):
+        return public_path
+
+    slug = ""
+    if public_path:
+        clean_path = public_path.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        if clean_path.lower().startswith("/channels/"):
+            slug = clean_path[len("/channels/"):]
+        else:
+            slug = clean_path.strip("/").rsplit("/", 1)[-1]
+
+    if not slug:
+        # Last-resort fallback for a public object that exposes a UUID/name but
+        # no URL. Prefer the real public_path whenever SiriusXM provides it.
+        slug = re.sub(r"[^a-z0-9]+", "-", str(channel.get("name") or "").lower()).strip("-")
+
+    if public_uuid and slug:
+        return f"{slug}##{public_uuid}"
+    return public_path or slug or public_uuid or str(channel.get("channel_id") or "")
+
+
+def format_webgrab_channel_line(channel: dict) -> str:
+    site_id = html_lib.escape(_site_id_for_channel(channel), quote=True)
+    xmltv_id = html_lib.escape(_xmltv_id_for_channel(channel), quote=True)
+    name = html_lib.escape(str(channel.get("name") or "Unknown"), quote=False)
+    return (
+        f'<channel update="i" site="siriusxm" site_id="{site_id}" '
+        f'xmltv_id="{xmltv_id}">{name}</channel>'
+    )
+
+
+def write_channel_changes_report(
+    added: list[dict],
+    renamed: list[dict],
+    removed: list[dict],
+    previous_count: int,
+    current_count: int,
+) -> str:
+    """Write changes.txt beside the generated M3U after a successful refresh."""
+    output_path = _playlist_output_path()
+    report_path = output_path.parent / "changes.txt"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        "ArchiveXM SiriusXM Channel Changes",
+        f"Refresh: {datetime.now().strftime('%m/%d/%Y %I:%M %p')}",
+        "",
+        f"Previous channels: {previous_count}",
+        f"Current channels: {current_count}",
+        "",
+    ]
+
+    lines.extend([
+        "====================",
+        "Added Channels",
+        "====================",
+        "",
+    ])
+    if added:
+        for channel in added:
+            lines.append(format_webgrab_channel_line(channel))
+    else:
+        lines.append("None")
+
+    lines.extend([
+        "",
+        "",
+        "====================",
+        "Renamed Channels",
+        "====================",
+        "",
+    ])
+    if renamed:
+        for item in renamed:
+            old = item["old"]
+            new = item["new"]
+            lines.append(f"OLD: {old.get('name') or 'Unknown'}")
+            lines.append(f"NEW: {new.get('name') or 'Unknown'}")
+            identity = new.get("public_uuid") or new.get("channel_id")
+            if identity:
+                lines.append(f"UUID: {identity}")
+            lines.append(format_webgrab_channel_line(new))
+            lines.append("")
+    else:
+        lines.append("None")
+
+    lines.extend([
+        "",
+        "====================",
+        "Removed Channels",
+        "====================",
+        "",
+    ])
+    if removed:
+        for channel in removed:
+            lines.append(format_webgrab_channel_line(channel))
+    else:
+        lines.append("None")
+
+    report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return str(report_path)
+
+
 def write_m3u_to_file(db: DBSession) -> dict:
     playlist = generate_m3u(db)
 
-    output_path = Path(os.getenv("PLAYLIST_OUTPUT", "/app/output/siriusxm.m3u"))
+    output_path = _playlist_output_path()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(playlist, encoding="utf-8")
 

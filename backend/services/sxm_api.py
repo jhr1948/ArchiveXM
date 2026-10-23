@@ -484,8 +484,21 @@ class SiriusXMAPI:
                                 obj = json.loads(candidate)
                                 if (
                                     isinstance(obj, dict)
-                                    and "streamingChannelNumber" in obj
-                                    and "uuid" in obj
+                                    and any(
+                                        key in obj
+                                        for key in ("streamingChannelNumber", "xmChannelNumber", "channelNumber")
+                                    )
+                                    and (
+                                        any(key in obj for key in ("uuid", "channelGuid", "channelId", "id"))
+                                        or any(
+                                            key in obj
+                                            for key in (
+                                                "url", "channelUrl", "channelURL", "webUrl", "webURL",
+                                                "seoUrl", "seoURL", "path", "href", "slug",
+                                                "contentPath", "channelPath", "seoPath",
+                                            )
+                                        )
+                                    )
                                 ):
                                     return candidate
                             except Exception:
@@ -514,6 +527,36 @@ class SiriusXMAPI:
                 return value
         return ""
 
+    def _normalize_public_channel_path(self, value) -> str:
+        """Normalize a SiriusXM public channel/sports URL to a stable relative path."""
+        raw = self._normalize_public_text(value)
+        if not raw:
+            return ""
+
+        raw = re.sub(
+            r"^https?://(?:www\.)?siriusxm\.com",
+            "",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        raw = raw.split("?", 1)[0].split("#", 1)[0].strip()
+
+        match = re.search(r"(/(?:channels|sports)/[^\s"'<>]+)", raw, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).rstrip("/")
+
+        lowered = raw.lower()
+        if lowered.startswith("channels/") or lowered.startswith("sports/"):
+            return f"/{raw.rstrip('/')}"
+        if raw.startswith("/"):
+            return raw.rstrip("/")
+
+        # Some public objects expose only a slug instead of a complete path.
+        if "/" not in raw:
+            return f"/channels/{raw.strip('/')}"
+
+        return ""
+
     def _add_public_channel_result(self, results: Dict[str, Dict], item: Dict) -> bool:
         """Add one siriusxm.com/channels channel object to results."""
         if not isinstance(item, dict):
@@ -525,10 +568,29 @@ class SiriusXMAPI:
         )
         channel_uuid = self._first_public_value(
             item,
-            ["uuid", "id", "channelGuid", "channelId"]
+            ["uuid", "channelGuid", "channelId"]
+        )
+        if not channel_uuid:
+            candidate_id = self._first_public_value(item, ["id"])
+            if re.fullmatch(
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                str(candidate_id or ""),
+            ):
+                channel_uuid = candidate_id
+
+        public_path = self._normalize_public_channel_path(
+            self._first_public_value(
+                item,
+                [
+                    "url", "channelUrl", "channelURL", "webUrl", "webURL",
+                    "seoUrl", "seoURL", "path", "href", "slug",
+                    "contentPath", "channelPath", "seoPath",
+                    "relativeUrl", "relativeURL",
+                ]
+            )
         )
 
-        if not channel_number or not channel_uuid:
+        if not channel_number or (not channel_uuid and not public_path):
             return False
 
         try:
@@ -577,6 +639,8 @@ class SiriusXMAPI:
             "genre": genre or existing.get("genre", ""),
             "channel_type": "channel-xtra" if is_xtra else existing.get("channel_type", "channel-linear"),
             "id": str(channel_uuid) or existing.get("id", ""),
+            "public_uuid": str(channel_uuid) or existing.get("public_uuid", ""),
+            "public_path": public_path or existing.get("public_path", ""),
             "logo_path": logo_path or existing.get("logo_path", ""),
         }
         return True
@@ -636,7 +700,7 @@ class SiriusXMAPI:
                             "streamingChannelNumber" in obj
                             or "xmChannelNumber" in obj
                             or "channelNumber" in obj
-                        ) and ("uuid" in obj or "id" in obj or "channelGuid" in obj):
+                        ):
                             self._add_public_channel_result(results, obj)
 
             # Fallback path: scrape escaped JSON channel objects exactly like
@@ -701,6 +765,9 @@ class SiriusXMAPI:
 
             if override.get("title"):
                 channel["name"] = override["title"]
+
+            channel["public_uuid"] = override.get("public_uuid") or override.get("id") or ""
+            channel["public_path"] = override.get("public_path") or ""
 
             # Use the public channel page for nicer display names and base groups,
             # but keep authenticated browse artwork as the source of truth. The

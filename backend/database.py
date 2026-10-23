@@ -82,6 +82,8 @@ class Channel(Base):
     id = Column(Integer, primary_key=True, index=True)
     channel_id = Column(String(100), unique=True, index=True)
     channel_type = Column(String(50), default="channel-linear")
+    public_uuid = Column(String(100))
+    public_path = Column(Text)
     name = Column(String(255))
     number = Column(Integer)
     category = Column(String(100))
@@ -176,6 +178,10 @@ def run_migrations():
 
         if 'channel_type' not in channel_columns:
             conn.execute(text("ALTER TABLE channels ADD COLUMN channel_type VARCHAR(50) DEFAULT 'channel-linear'"))
+        if 'public_uuid' not in channel_columns:
+            conn.execute(text("ALTER TABLE channels ADD COLUMN public_uuid VARCHAR(100)"))
+        if 'public_path' not in channel_columns:
+            conn.execute(text("ALTER TABLE channels ADD COLUMN public_path TEXT"))
 
         # Check and add new columns to credentials table
         cred_columns = [col['name'] for col in inspector.get_columns('credentials')]

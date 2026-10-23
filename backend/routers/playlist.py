@@ -260,6 +260,27 @@ def _playlist_output_path() -> Path:
     return Path(os.getenv("PLAYLIST_OUTPUT", "/app/output/siriusxm.m3u"))
 
 
+def _split_extinf_metadata_and_name(line: str) -> tuple[str, str]:
+    """Split an EXTINF line at the first comma that is outside quotes."""
+    in_quotes = False
+    escape = False
+
+    for index, char in enumerate(line):
+        if escape:
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            in_quotes = not in_quotes
+            continue
+        if char == "," and not in_quotes:
+            return line[:index], line[index + 1:]
+
+    return line, ""
+
+
 def read_existing_m3u_channels(
     db: Optional[DBSession] = None,
     output_path: Optional[Path] = None,
@@ -302,13 +323,12 @@ def read_existing_m3u_channels(
             continue
 
         if line.startswith("#EXTINF"):
+            metadata_text, display_name = _split_extinf_metadata_and_name(line)
             attrs = {
                 match.group(1): html_lib.unescape(match.group(2))
-                for match in re.finditer(r'([A-Za-z0-9_-]+)="([^"]*)"', line)
+                for match in re.finditer(r'([A-Za-z0-9_-]+)="([^"]*)"', metadata_text)
             }
-            name = ""
-            if "," in line:
-                name = html_lib.unescape(line.split(",", 1)[1].strip())
+            name = html_lib.unescape(display_name.strip())
             if not name:
                 name = attrs.get("tvg-name", "")
 

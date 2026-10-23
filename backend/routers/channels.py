@@ -6,6 +6,8 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session as DBSession
 from typing import List, Optional
 from datetime import datetime
+import re
+import unicodedata
 
 from database import get_db, Channel, Session as AuthSession, get_preferred_auth_session
 from services.sxm_api import SiriusXMAPI
@@ -71,6 +73,21 @@ def _change_identity(channel: dict) -> str:
     # after adding public metadata cannot falsely report the whole lineup as
     # removed/added merely because public_uuid has just been populated.
     return str(channel.get("channel_id") or channel.get("public_uuid") or "")
+
+
+def _normalized_name_for_compare(value) -> str:
+    """Normalize display names so cosmetic text differences are not renames."""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = (
+        text.replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("\u02bc", "'")
+        .replace("\u00a0", " ")
+        .replace("\u200b", "")
+        .replace("\ufeff", "")
+    )
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.casefold()
 
 
 def extract_channel_type(ch_data: dict) -> str:
@@ -248,7 +265,7 @@ async def refresh_channels(db: DBSession = Depends(get_db)):
             old_channel = old_by_identity.get(identity)
             if not old_channel:
                 continue
-            if str(old_channel.get("name") or "").strip() != str(new_channel.get("name") or "").strip():
+            if _normalized_name_for_compare(old_channel.get("name")) != _normalized_name_for_compare(new_channel.get("name")):
                 renamed.append({"old": old_channel, "new": new_channel})
 
         # Update database only after the fetched snapshot passes the integrity

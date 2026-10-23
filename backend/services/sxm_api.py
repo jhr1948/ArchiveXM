@@ -541,7 +541,7 @@ class SiriusXMAPI:
         )
         raw = raw.split("?", 1)[0].split("#", 1)[0].strip()
 
-        match = re.search(r"(/(?:channels|sports)/[^\s"'<>]+)", raw, flags=re.IGNORECASE)
+        match = re.search(r'(/(?:channels|sports)/[^\\s"\'<>]+)', raw, flags=re.IGNORECASE)
         if match:
             return match.group(1).rstrip("/")
 

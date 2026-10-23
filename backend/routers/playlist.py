@@ -7,7 +7,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 import html as html_lib
 import unicodedata
 
@@ -258,6 +258,104 @@ def generate_m3u(db: DBSession) -> str:
 
 def _playlist_output_path() -> Path:
     return Path(os.getenv("PLAYLIST_OUTPUT", "/app/output/siriusxm.m3u"))
+
+
+def read_existing_m3u_channels(
+    db: Optional[DBSession] = None,
+    output_path: Optional[Path] = None,
+) -> list[dict]:
+    """Parse the current generated M3U into a channel snapshot.
+
+    The on-disk M3U is the authoritative "before" state for Refresh Channels.
+    Database metadata is used only to enrich parsed entries with public UUID/path
+    information needed for changes.txt.
+    """
+    output_path = Path(output_path) if output_path else _playlist_output_path()
+    if not output_path.exists():
+        return []
+
+    db_metadata = {}
+    if db is not None:
+        for channel in db.query(Channel).all():
+            channel_id = str(channel.channel_id or "")
+            if not channel_id:
+                continue
+            db_metadata[channel_id] = {
+                "public_uuid": str(getattr(channel, "public_uuid", None) or ""),
+                "public_path": str(getattr(channel, "public_path", None) or ""),
+                "number": channel.number,
+                "category": channel.category,
+                "genre": channel.genre,
+            }
+
+    try:
+        lines = output_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return []
+
+    channels = []
+    pending = None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith("#EXTINF"):
+            attrs = {
+                match.group(1): html_lib.unescape(match.group(2))
+                for match in re.finditer(r'([A-Za-z0-9_-]+)="([^"]*)"', line)
+            }
+            name = ""
+            if "," in line:
+                name = html_lib.unescape(line.split(",", 1)[1].strip())
+            if not name:
+                name = attrs.get("tvg-name", "")
+
+            pending = {
+                "name": name or "Unknown",
+                "channel_type": attrs.get("x-sxm-type", "channel-linear"),
+            }
+            continue
+
+        if line.startswith("#") or pending is None:
+            continue
+
+        # Ignore ArchiveXM Jukebox playlist pseudo-channels; changes.txt is only
+        # for SiriusXM channel lineup changes.
+        if str(pending.get("channel_type") or "").lower() == "archivexm-playlist":
+            pending = None
+            continue
+
+        channel_id = ""
+        try:
+            path = unquote(urlparse(line).path or "")
+            listen_match = re.search(r"/listen/([^/?#]+)", path)
+            api_match = re.search(r"/api/streams/([^/?#]+)/proxy-stream", path)
+            match = listen_match or api_match
+            if match:
+                channel_id = match.group(1)
+        except Exception:
+            channel_id = ""
+
+        if not channel_id:
+            pending = None
+            continue
+
+        metadata = db_metadata.get(channel_id, {})
+        channels.append({
+            "channel_id": channel_id,
+            "channel_type": pending.get("channel_type") or "channel-linear",
+            "public_uuid": metadata.get("public_uuid") or "",
+            "public_path": metadata.get("public_path") or "",
+            "name": pending.get("name") or "Unknown",
+            "number": metadata.get("number"),
+            "category": metadata.get("category"),
+            "genre": metadata.get("genre"),
+        })
+        pending = None
+
+    return channels
 
 
 def backup_existing_m3u(output_path: Optional[Path] = None) -> Optional[str]:

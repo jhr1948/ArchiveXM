@@ -628,7 +628,7 @@ class SiriusXMAPI:
         """
         links = {}
         anchor_re = re.compile(
-            r'<a\\b[^>]*?href=(["\'])(.*?)\\1[^>]*>(.*?)</a>',
+            r'<a\b[^>]*?href=(["\'])(.*?)\1[^>]*>(.*?)</a>',
             flags=re.IGNORECASE | re.DOTALL,
         )
 

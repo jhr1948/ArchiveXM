@@ -14,6 +14,7 @@ from services.sxm_api import SiriusXMAPI
 from routers.playlist import (
     backup_existing_m3u,
     read_existing_m3u_channels,
+    refresh_channel_mapping,
     write_channel_changes_report,
     write_m3u_to_file,
 )
@@ -344,6 +345,8 @@ async def refresh_channels(db: DBSession = Depends(get_db)):
             current_count=len(new_m3u_snapshots),
         )
 
+        mapping_result = refresh_channel_mapping(db)
+
         return {
             "success": True,
             "message": (
@@ -358,6 +361,13 @@ async def refresh_channels(db: DBSession = Depends(get_db)):
             "playlist_path": playlist_result.get("path"),
             "playlist_backup_path": backup_path,
             "changes_path": changes_path,
+            "channel_map_path": mapping_result.get("path"),
+            "channel_map_backup_path": mapping_result.get("backup_path"),
+            "channel_map_changes_path": mapping_result.get("changes_path"),
+            "mapping_count": mapping_result.get("count", 0),
+            "mapping_added": mapping_result.get("added", 0),
+            "mapping_updated": mapping_result.get("updated", 0),
+            "mapping_removed": mapping_result.get("removed", 0),
         }
 
     except HTTPException:

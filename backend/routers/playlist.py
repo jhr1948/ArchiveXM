@@ -779,18 +779,31 @@ def generate_channels_xml_entries(db: DBSession, current_map: dict) -> dict:
     # SiriusXM can expose the same sports team twice: once as a normal channel
     # object and once as the canonical /sports/{league}/{team} public page.
     # Prefer the sports-path version and suppress the duplicate normal entry.
-    # Preserve canonical team paths from the previous channels XML when the
-    # refreshed SiriusXM channel object only exposes a normal /channels slug.
-    # This is important because team streams can appear as both a normal
-    # channel and a /sports/{league}/{team} public page.
+    #
+    # Recover canonical team paths from the current XML OR any dated backup.
+    # This lets ArchiveXM repair a currently-generated XML that already lost
+    # the /sports/... paths during an earlier test refresh.
     existing_sports_path_by_name = {}
-    for entry in existing_entries:
-        site_id = str(entry.get("site_id") or "").strip()
-        base_site_id = site_id.split("##", 1)[0]
-        if base_site_id.lower().startswith("/sports/"):
-            existing_sports_path_by_name[
-                _mapping_name_for_compare(entry.get("name"))
-            ] = base_site_id.rstrip("/")
+    xml_path = _channels_xml_output_path()
+    candidate_xml_paths = [xml_path]
+    candidate_xml_paths.extend(
+        sorted(
+            xml_path.parent.glob(f"{xml_path.name}.*.bak"),
+            key=lambda path: path.stat().st_mtime if path.exists() else 0,
+            reverse=True,
+        )
+    )
+
+    for candidate_path in candidate_xml_paths:
+        for entry in _parse_existing_channels_xml(candidate_path):
+            site_id = str(entry.get("site_id") or "").strip()
+            base_site_id = site_id.split("##", 1)[0]
+            if not base_site_id.lower().startswith("/sports/"):
+                continue
+
+            name_key = _mapping_name_for_compare(entry.get("name"))
+            if name_key not in existing_sports_path_by_name:
+                existing_sports_path_by_name[name_key] = base_site_id.rstrip("/")
 
     sports_team_names = {
         _mapping_name_for_compare(clean_m3u_text(channel.name or "Unknown"))
@@ -801,6 +814,8 @@ def generate_channels_xml_entries(db: DBSession, current_map: dict) -> dict:
             in existing_sports_path_by_name
         )
     }
+
+    seen_sports_paths = set()
 
     for channel in channels:
         name = clean_m3u_text(channel.name or "Unknown")
@@ -827,6 +842,10 @@ def generate_channels_xml_entries(db: DBSession, current_map: dict) -> dict:
         if section == "xtra":
             site_id = "dummy"
         elif section == "sports":
+            sports_key = sports_path.lower().rstrip("/")
+            if sports_key in seen_sports_paths:
+                continue
+            seen_sports_paths.add(sports_key)
             site_id = _sports_site_id(channel, sports_path)
         else:
             snapshot = {

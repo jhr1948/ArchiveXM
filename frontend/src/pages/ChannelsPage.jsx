@@ -57,7 +57,8 @@ function ChannelsPage() {
         'Changes report created',
         `Mapping JSON updated (${data.mapping_added ?? 0} added, ${data.mapping_updated ?? 0} updated, ${data.mapping_removed ?? 0} removed)`,
         `Channels XML updated (${data.channels_xml_added ?? 0} added, ${data.channels_xml_updated ?? 0} updated, ${data.channels_xml_removed ?? 0} removed)`,
-        'Boss mapping updated'
+        'Boss mapping updated',
+        `XTRA data updated (${data.xtra_data_count ?? 0} entries)`
       ]
       setRefreshMessage(parts.join(' • '))
     } catch (error) {

@@ -343,10 +343,16 @@ def _load_existing_channel_map(path: Optional[Path] = None) -> dict:
 
 def _mapping_display_name(channel: Channel) -> str:
     name = clean_m3u_text(channel.name or "Unknown")
-    channel_type = str(getattr(channel, "channel_type", None) or "channel-linear").lower()
-    if channel_type == "channel-xtra":
-        return name
     return f"Radio: {name}"
+
+
+def _mapping_plain_name(display_name: str) -> str:
+    return re.sub(
+        r"^\s*Radio:\s*",
+        "",
+        str(display_name or ""),
+        flags=re.IGNORECASE,
+    ).strip()
 
 
 def _mapping_uuid(channel: Channel) -> str:
@@ -410,14 +416,28 @@ def generate_channel_mapping(db: DBSession, previous_map: Optional[dict] = None)
         }
 
         aliases = previous.get("aliases")
+        clean_aliases = []
+        seen_aliases = set()
+
+        # Every mapping gets the plain current channel name as its first alias.
+        # Preserve any additional curated aliases from the previous map.
+        plain_name = _mapping_plain_name(display_name)
+        alias_candidates = [plain_name]
         if isinstance(aliases, list):
-            clean_aliases = [
-                str(alias).strip()
-                for alias in aliases
-                if str(alias).strip()
-            ]
-            if clean_aliases:
-                entry["aliases"] = clean_aliases
+            alias_candidates.extend(aliases)
+
+        for alias in alias_candidates:
+            cleaned = str(alias or "").strip()
+            if not cleaned:
+                continue
+            key = _mapping_name_for_compare(cleaned)
+            if key in seen_aliases:
+                continue
+            seen_aliases.add(key)
+            clean_aliases.append(cleaned)
+
+        if clean_aliases:
+            entry["aliases"] = clean_aliases
 
         # JSON object keys must be unique. If SiriusXM reuses a UUID, the final
         # current channel row wins rather than emitting invalid duplicate keys.

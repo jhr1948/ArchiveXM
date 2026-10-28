@@ -796,7 +796,12 @@ class SiriusXMAPI:
                                 best_path = path
                                 best_distance = distance
 
-            if best_path and best_score >= 0.72:
+            existing_quality = int(channel.get("_public_path_quality") or 0)
+            if (
+                best_path
+                and best_score >= 0.72
+                and existing_quality < 190
+            ):
                 if channel.get("public_path") != best_path:
                     matched += 1
                 channel["public_path"] = best_path

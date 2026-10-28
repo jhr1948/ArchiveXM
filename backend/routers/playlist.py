@@ -294,12 +294,37 @@ def _backup_file(path: Path) -> Optional[str]:
     return str(backup_path)
 
 
+def _mapping_xmltv_base(value: str, fallback: str = "") -> str:
+    """Return an ASCII alphanumeric-only XMLTV id base."""
+    text = str(value or "").strip()
+    text = re.sub(r"^\s*Radio:\s*", "", text, flags=re.IGNORECASE)
+    text = unicodedata.normalize("NFKD", text)
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^A-Za-z0-9]+", "", text)
+
+    if not text:
+        fallback_text = unicodedata.normalize("NFKD", str(fallback or ""))
+        fallback_text = fallback_text.encode("ascii", "ignore").decode("ascii")
+        text = re.sub(r"[^A-Za-z0-9]+", "", fallback_text)
+
+    return text or "Channel"
+
+
 def _mapping_xmltv_id(display_name: str, channel_uuid: str) -> str:
-    base = re.sub(r"^\s*Radio:\s*", "", str(display_name or ""), flags=re.IGNORECASE)
-    base = re.sub(r"\s+", "", base.strip())
-    if not base:
-        base = channel_uuid
-    return f"{base}.sxm"
+    return f"{_mapping_xmltv_base(display_name, channel_uuid)}.sxm"
+
+
+def _sanitize_existing_mapping_xmltv_id(xmltv_id: str, channel_uuid: str) -> str:
+    value = str(xmltv_id or "").strip()
+    value = re.sub(r"\.sxm$", "", value, flags=re.IGNORECASE)
+    return f"{_mapping_xmltv_base(value, channel_uuid)}.sxm"
+
+
+def _mapping_name_for_compare(value: str) -> str:
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = text.replace("\u00a0", " ").replace("\u200b", "").replace("\ufeff", "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.casefold()
 
 
 def _load_existing_channel_map(path: Optional[Path] = None) -> dict:
@@ -334,10 +359,10 @@ def _mapping_uuid(channel: Channel) -> str:
 def generate_channel_mapping(db: DBSession, previous_map: Optional[dict] = None) -> dict:
     """Build one unique JSON mapping entry per current SiriusXM UUID.
 
-    Existing xmltvId values and aliases are intentionally preserved for UUIDs
-    already present in the prior map; the current channel name refreshes
-    displayName. New UUIDs receive a deterministic xmltvId generated from the
-    display name using the requested no-spaces rule.
+    Existing aliases are preserved. Existing xmltvId values are retained when
+    the channel name is unchanged, but sanitized to letters/numbers only. If a
+    UUID's display name changes, xmltvId is regenerated from the new name so a
+    reassigned/renamed channel cannot keep the old channel's XMLTV id.
     """
     previous_map = previous_map or {}
     mapping = {}
@@ -359,8 +384,23 @@ def generate_channel_mapping(db: DBSession, previous_map: Optional[dict] = None)
         previous = previous_map.get(channel_uuid)
         previous = previous if isinstance(previous, dict) else {}
 
-        xmltv_id = str(previous.get("xmltvId") or "").strip()
-        if not xmltv_id:
+        previous_xmltv_id = str(previous.get("xmltvId") or "").strip()
+        previous_display_name = str(previous.get("displayName") or "").strip()
+
+        if (
+            previous_xmltv_id
+            and _mapping_name_for_compare(previous_display_name)
+            == _mapping_name_for_compare(display_name)
+        ):
+            # Preserve deliberate/custom XMLTV naming for unchanged channels,
+            # while enforcing the alphanumeric-only ID rule.
+            xmltv_id = _sanitize_existing_mapping_xmltv_id(
+                previous_xmltv_id,
+                channel_uuid,
+            )
+        else:
+            # A changed display name on the same UUID means the channel was
+            # renamed/reassigned; regenerate the XMLTV id from the new name.
             xmltv_id = _mapping_xmltv_id(display_name, channel_uuid)
 
         entry = {

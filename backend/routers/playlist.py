@@ -591,10 +591,11 @@ def _channel_xml_section(channel: Channel) -> str:
     if channel_type == "channel-xtra":
         return "xtra"
 
+    # Only actual SiriusXM team URLs use the special /sports/{league}/{team}
+    # site_id form. Sports play-by-play channels otherwise behave like normal
+    # ON NOW channels and retain their public web slug plus ##UUID.
     public_path = str(getattr(channel, "public_path", None) or "").strip()
     if public_path.lower().startswith("/sports/"):
-        return "sports"
-    if _is_sports_play_by_play(channel.name or "", public_path):
         return "sports"
     return "on_now"
 
@@ -662,9 +663,6 @@ def _channel_xml_identity(entry: dict) -> str:
     base_site_id = site_id.split("##", 1)[0]
     if base_site_id.lower().startswith("/sports/"):
         return f"sports:{base_site_id.lower().rstrip('/')}"
-
-    if _is_sports_play_by_play(name, base_site_id):
-        return f"sports:{base_site_id.lower()}"
 
     uuid_match = re.search(
         r"##([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",

@@ -603,7 +603,11 @@ def _channel_xml_section(channel: Channel) -> str:
 def _sports_site_id(channel: Channel) -> str:
     public_path = str(getattr(channel, "public_path", None) or "").strip()
     if public_path.lower().startswith("/sports/"):
-        return public_path.rstrip("/")
+        sports_path = public_path.rstrip("/")
+        channel_uuid = _mapping_uuid(channel)
+        if channel_uuid:
+            return f"{sports_path}##{channel_uuid}"
+        return sports_path
 
     if public_path:
         clean_path = public_path.split("?", 1)[0].split("#", 1)[0].rstrip("/")

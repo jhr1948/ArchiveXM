@@ -2,6 +2,7 @@
 Playlist Router - Generate local M3U playlists for IPTV players
 """
 import os
+import base64
 import re
 import json
 import shutil
@@ -282,6 +283,13 @@ def _boss_mapping_output_path() -> Path:
     return _playlist_output_path().parent / "boss.mapping.txt"
 
 
+def _xtra_data_output_path() -> Path:
+    configured = os.getenv("XTRA_DATA_OUTPUT", "").strip()
+    if configured:
+        return Path(configured)
+    return _playlist_output_path().parent / "SXM_XTRA_data.json"
+
+
 def _dated_backup_path(path: Path) -> Path:
     stamp = datetime.now().strftime("%m.%d.%Y")
     backup_path = path.with_name(f"{path.name}.{stamp}.bak")
@@ -306,6 +314,114 @@ def _backup_file(path: Path) -> Optional[str]:
     backup_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(path, backup_path)
     return str(backup_path)
+
+
+def _xtra_public_logo_url(logo_path: str) -> str:
+    """Build the 1920x1920 SiriusXM CDN logo URL used by the XTRA EPG data."""
+    raw = str(logo_path or "").strip()
+    if not raw:
+        return ""
+
+    if raw.startswith(("http://", "https://")):
+        parsed = urlparse(raw)
+        raw = parsed.path
+
+    raw = raw.split("?", 1)[0].split("#", 1)[0].lstrip("/")
+    if not raw:
+        return ""
+
+    payload = {
+        "key": raw,
+        "edits": [
+            {"format": {"type": "jpeg"}},
+            {"resize": {"width": 1920, "height": 1920}},
+        ],
+    }
+    encoded = base64.b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    return (
+        "https://imgsrv-sxm-prod-device.streaming.siriusxm.com/"
+        f"{encoded}"
+    )
+
+
+def refresh_xtra_data(channels_data: list[dict]) -> dict:
+    """Generate SXM_XTRA_data.json from the live SiriusXM public XTRA metadata."""
+    output_path = _xtra_data_output_path()
+    backup_path = _backup_file(output_path)
+
+    entries = []
+    seen = set()
+
+    for channel in channels_data or []:
+        channel_type = str(
+            channel.get("channel_type")
+            or channel.get("channelType")
+            or ""
+        ).lower()
+        if channel_type not in ("channel-xtra", "xtra"):
+            continue
+
+        display_name = str(
+            channel.get("xtra_public_display_name")
+            or channel.get("name")
+            or ""
+        ).strip()
+        public_uuid = str(
+            channel.get("xtra_public_uuid")
+            or channel.get("public_uuid")
+            or channel.get("id")
+            or ""
+        ).strip()
+
+        if not display_name:
+            continue
+
+        identity = (
+            display_name.casefold(),
+            public_uuid.casefold(),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+
+        entries.append({
+            "displayName": display_name,
+            "mediumDescription": str(
+                channel.get("xtra_public_medium_description")
+                or channel.get("description")
+                or ""
+            ).strip(),
+            "categoryTitle": str(
+                channel.get("xtra_public_category_title")
+                or channel.get("category")
+                or ""
+            ).strip(),
+            "uuid": public_uuid,
+            "logo": _xtra_public_logo_url(
+                channel.get("xtra_public_logo_path") or ""
+            ),
+        })
+
+    entries.sort(
+        key=lambda item: (
+            str(item.get("displayName") or "").casefold(),
+            str(item.get("uuid") or "").casefold(),
+        )
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(entries, indent=4, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    return {
+        "path": str(output_path),
+        "backup_path": backup_path,
+        "count": len(entries),
+    }
 
 
 def _mapping_xmltv_base(value: str, fallback: str = "") -> str:

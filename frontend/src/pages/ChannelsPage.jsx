@@ -54,7 +54,8 @@ function ChannelsPage() {
         `${data.renamed ?? 0} renamed`,
         `${data.removed ?? 0} removed`,
         'M3U updated',
-        'Changes report created'
+        'Changes report created',
+        `Mapping JSON updated (${data.mapping_added ?? 0} added, ${data.mapping_updated ?? 0} updated, ${data.mapping_removed ?? 0} removed)`
       ]
       setRefreshMessage(parts.join(' • '))
     } catch (error) {

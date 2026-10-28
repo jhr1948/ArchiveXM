@@ -567,58 +567,57 @@ class SiriusXMAPI:
 
     def _best_public_path_from_item(self, item: Dict) -> tuple[str, int]:
         """
-        Return the best channel path exposed by one public-page JSON object.
+        Return only a literal SiriusXM public route from one channel object.
 
-        Prefer actual URL/path/href fields. A bare slug is only a fallback and
-        must never displace a real /channels/... or /sports/... path found from
-        another representation of the same channel.
+        Internal labels/bare slugs such as "pitbull" or "bob-marley" are not
+        public URLs and must never populate public_path. Search the whole nested
+        object because Next/React often stores the href below the channel row.
         """
-        path_keys = [
-            "href",
-            "channelUrl", "channelURL",
-            "webUrl", "webURL",
-            "seoUrl", "seoURL",
-            "path",
-            "contentPath", "channelPath", "seoPath",
-            "relativeUrl", "relativeURL",
-            "url",
-        ]
+        explicit_path_re = re.compile(
+            r"(?:(?:https?://(?:www\.)?siriusxm\.com)?/"
+            r"(?:channels|sports)/[^\\s\"'<>]+)",
+            flags=re.IGNORECASE,
+        )
 
         best_path = ""
         best_quality = 0
 
-        for key in path_keys:
-            raw = self._normalize_public_text(item.get(key))
+        def consider(value) -> None:
+            nonlocal best_path, best_quality
+            if not isinstance(value, str):
+                return
+
+            raw = self._normalize_public_text(value)
             if not raw:
-                continue
+                return
 
-            lowered = raw.lower()
-            has_explicit_channel_path = bool(
-                re.search(r"(?:^|siriusxm\.com)/(?:channels|sports)/", lowered)
-                or lowered.startswith("channels/")
-                or lowered.startswith("sports/")
-                or lowered.startswith("/channels/")
-                or lowered.startswith("/sports/")
-            )
+            match = explicit_path_re.search(raw.replace("\\/", "/"))
+            if not match:
+                return
 
-            # Ignore unrelated absolute URLs (images, app links, etc.).
-            if lowered.startswith(("http://", "https://")) and not has_explicit_channel_path:
-                continue
-
-            path = self._normalize_public_channel_path(raw)
+            path = self._normalize_public_channel_path(match.group(0))
             if not path:
-                continue
+                return
 
-            quality = 100 if has_explicit_channel_path else 70
+            quality = 120
+            if path.lower().startswith("/sports/"):
+                quality = 125
+
             if quality > best_quality:
                 best_path = path
                 best_quality = quality
 
-        raw_slug = self._normalize_public_text(item.get("slug"))
-        if raw_slug and best_quality < 20:
-            best_path = self._normalize_public_channel_path(raw_slug)
-            best_quality = 20
+        def walk(value) -> None:
+            if isinstance(value, dict):
+                for child in value.values():
+                    walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+            else:
+                consider(value)
 
+        walk(item)
         return best_path, best_quality
 
     def _extract_public_page_links(self, raw_html: str) -> Dict[str, str]:
@@ -659,7 +658,7 @@ class SiriusXMAPI:
 
 
     def _public_path_title_similarity(self, title: str, path: str) -> float:
-        """Score how well a literal SiriusXM page path matches a channel title."""
+        """Score a real SiriusXM page route against one known channel title."""
         title_text = self._normalize_public_text(title).lower()
         slug = str(path or "").split("?", 1)[0].split("#", 1)[0].rstrip("/")
         slug = slug.rsplit("/", 1)[-1].lower()
@@ -670,33 +669,34 @@ class SiriusXMAPI:
             return 0.0
         if title_compact == slug_compact:
             return 1.0
-        if (
-            min(len(title_compact), len(slug_compact)) >= 6
-            and (
-                title_compact in slug_compact
-                or slug_compact in title_compact
-            )
-        ):
-            return 0.92
+
+        stop = {
+            "the", "on", "and", "radio", "channel", "siriusxm",
+            "in", "of", "a", "an",
+        }
 
         def token_set(value: str) -> set[str]:
             tokens = re.findall(r"[a-z0-9]+", value)
             normalized = set()
-            stop = {"the", "on", "and", "radio", "channel", "siriusxm"}
             for token in tokens:
                 if token in stop:
                     continue
-                if len(token) > 4 and token.endswith("s"):
+                # Light plural normalization helps "Headlines" vs "headline"
+                # without turning the word "news" into "new".
+                if len(token) > 5 and token.endswith("s"):
                     token = token[:-1]
                 normalized.add(token)
             return normalized
 
         title_tokens = token_set(title_text)
         slug_tokens = token_set(slug.replace("-", " ").replace("/", " "))
+
         token_score = 0.0
         if title_tokens and slug_tokens:
             overlap = len(title_tokens & slug_tokens)
-            token_score = overlap / max(1, min(len(title_tokens), len(slug_tokens)))
+            title_coverage = overlap / len(title_tokens)
+            slug_precision = overlap / len(slug_tokens)
+            token_score = (0.65 * title_coverage) + (0.35 * slug_precision)
 
         sequence_score = difflib.SequenceMatcher(
             None,
@@ -704,7 +704,9 @@ class SiriusXMAPI:
             slug_compact,
         ).ratio()
 
-        return max(sequence_score, token_score * 0.9)
+        # Token coverage is more trustworthy than simple substring matching:
+        # "pitbull" must not beat "pitbulls-globalization".
+        return max(sequence_score * 0.9, token_score)
 
     def _overlay_public_paths_from_serialized_page(
         self,
@@ -712,14 +714,16 @@ class SiriusXMAPI:
         results: Dict[str, Dict],
     ) -> int:
         """
-        Recover literal /channels/... and /sports/... hrefs from Next/React
-        serialized page content when they are not emitted as plain HTML anchors.
-
-        The real path nearest a matching channel title wins only when the title
-        and path are sufficiently similar, preventing neighboring channel cards
-        from being cross-matched.
+        Match channels only against literal /channels/... or /sports/... routes
+        published in the SiriusXM page payload. Bare internal slugs are ignored.
         """
-        prepared_sources = []
+        path_re = re.compile(
+            r"(?:(?:https?://(?:www\.)?siriusxm\.com)?/"
+            r"(?:channels|sports)/[A-Za-z0-9][A-Za-z0-9._~%+\\-/]*)",
+            flags=re.IGNORECASE,
+        )
+
+        explicit_paths = {}
         for source in sources:
             if not source:
                 continue
@@ -729,77 +733,57 @@ class SiriusXMAPI:
                 .replace("\\u002F", "/")
                 .replace("\\u002f", "/")
             )
-            prepared_sources.append((normalized, normalized.lower()))
+            for match in path_re.finditer(normalized):
+                path = self._normalize_public_channel_path(match.group(0))
+                if path:
+                    explicit_paths[path.lower()] = path
 
-        path_re = re.compile(
-            r'(?:(?:https?://(?:www\.)?siriusxm\.com)?/(?:channels|sports)/'
-            r'[A-Za-z0-9][A-Za-z0-9._~%+\-/]*)',
-            flags=re.IGNORECASE,
-        )
-
+        candidate_paths = list(explicit_paths.values())
         matched = 0
+
         for channel in results.values():
-            title = self._normalize_public_text(channel.get("title") or "")
-            if len(title) < 3:
+            existing_quality = int(channel.get("_public_path_quality") or 0)
+            if existing_quality >= 200:
                 continue
 
-            title_variants = {
-                title.lower(),
-                title.lower().replace("’", "'").replace("‘", "'"),
-            }
+            titles = []
+            current_title = self._normalize_public_text(channel.get("title") or "")
+            if current_title:
+                titles.append(current_title)
 
-            best_path = ""
-            best_score = 0.0
-            best_distance = None
+            for alias in channel.get("_public_titles") or []:
+                alias = self._normalize_public_text(alias)
+                if alias and alias not in titles:
+                    titles.append(alias)
 
-            for source, lowered_source in prepared_sources:
-                for title_variant in title_variants:
-                    search_from = 0
-                    occurrences = 0
-                    while occurrences < 8:
-                        title_pos = lowered_source.find(title_variant, search_from)
-                        if title_pos < 0:
-                            break
-                        occurrences += 1
-                        search_from = title_pos + max(1, len(title_variant))
+            if not titles:
+                continue
 
-                        window_start = max(0, title_pos - 1800)
-                        window_end = min(len(source), title_pos + len(title_variant) + 1800)
-                        window = source[window_start:window_end]
+            ranked = []
+            for path in candidate_paths:
+                score = max(
+                    self._public_path_title_similarity(title, path)
+                    for title in titles
+                )
+                if score > 0:
+                    ranked.append((score, path))
 
-                        for path_match in path_re.finditer(window):
-                            raw_path = path_match.group(0)
-                            path = self._normalize_public_channel_path(raw_path)
-                            if not path:
-                                continue
+            if not ranked:
+                continue
 
-                            absolute_pos = window_start + path_match.start()
-                            distance = abs(absolute_pos - title_pos)
-                            similarity = self._public_path_title_similarity(title, path)
+            ranked.sort(key=lambda item: item[0], reverse=True)
+            best_score, best_path = ranked[0]
+            second_score = ranked[1][0] if len(ranked) > 1 else 0.0
 
-                            # Proximity matters because adjacent channel cards
-                            # can appear in the same serialized page chunk.
-                            proximity_bonus = max(0.0, 1.0 - (distance / 1800.0)) * 0.22
-                            score = similarity + proximity_bonus
-
-                            if (
-                                score > best_score
-                                or (
-                                    abs(score - best_score) < 0.0001
-                                    and (
-                                        best_distance is None
-                                        or distance < best_distance
-                                    )
-                                )
-                            ):
-                                best_score = score
-                                best_path = path
-                                best_distance = distance
-
-            existing_quality = int(channel.get("_public_path_quality") or 0)
+            # Require a strong match and a useful margin over the runner-up.
+            # This prevents nearby/partial routes from winning just because
+            # their text resembles part of the channel title.
             if (
-                best_path
-                and best_score >= 0.72
+                best_score >= 0.60
+                and (
+                    best_score >= 0.92
+                    or best_score - second_score >= 0.08
+                )
                 and existing_quality < 190
             ):
                 if channel.get("public_path") != best_path:
@@ -882,10 +866,16 @@ class SiriusXMAPI:
             chosen_public_path = public_path
             chosen_path_quality = public_path_quality
 
-        # Prefer entries with a friendly public displayName/title, but preserve
-        # already-found fields when a later partial object is less complete.
+        public_titles = list(existing.get("_public_titles") or [])
+        if title and title not in public_titles:
+            public_titles.append(title)
+
+        # Preserve every title SiriusXM exposes for this channel number. Some
+        # cards use a short display name while their public route follows the
+        # fuller branded title.
         results[number_key] = {
             "title": title or existing.get("title", ""),
+            "_public_titles": public_titles,
             "genre": genre or existing.get("genre", ""),
             "channel_type": "channel-xtra" if is_xtra else existing.get("channel_type", "channel-linear"),
             "id": str(channel_uuid) or existing.get("id", ""),

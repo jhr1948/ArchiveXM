@@ -268,6 +268,20 @@ def _channel_map_output_path() -> Path:
     return _playlist_output_path().parent / "sxm_channel_map.json"
 
 
+def _channels_xml_output_path() -> Path:
+    configured = os.getenv("CHANNELS_XML_OUTPUT", "").strip()
+    if configured:
+        return Path(configured)
+    return _playlist_output_path().parent / "siriusxm.channels.xml"
+
+
+def _boss_mapping_output_path() -> Path:
+    configured = os.getenv("BOSS_MAPPING_OUTPUT", "").strip()
+    if configured:
+        return Path(configured)
+    return _playlist_output_path().parent / "boss.mapping.txt"
+
+
 def _dated_backup_path(path: Path) -> Path:
     stamp = datetime.now().strftime("%m.%d.%Y")
     backup_path = path.with_name(f"{path.name}.{stamp}.bak")
@@ -555,6 +569,414 @@ def refresh_channel_mapping(db: DBSession) -> dict:
         "added": changes["added"],
         "updated": changes["updated"],
         "removed": changes["removed"],
+    }
+
+
+
+def _channel_xml_slug(value: str) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = text.lower().replace("&", " and ")
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return text
+
+
+def _is_sports_play_by_play(channel_name: str, public_path: str = "") -> bool:
+    haystack = f"{channel_name} {public_path}".lower()
+    return bool(re.search(r"play[- ]by[- ]play", haystack))
+
+
+def _channel_xml_section(channel: Channel) -> str:
+    channel_type = str(getattr(channel, "channel_type", None) or "channel-linear").lower()
+    if channel_type == "channel-xtra":
+        return "xtra"
+
+    public_path = str(getattr(channel, "public_path", None) or "").strip()
+    if public_path.lower().startswith("/sports/"):
+        return "sports"
+    if _is_sports_play_by_play(channel.name or "", public_path):
+        return "sports"
+    return "on_now"
+
+
+def _sports_site_id(channel: Channel) -> str:
+    public_path = str(getattr(channel, "public_path", None) or "").strip()
+    if public_path.lower().startswith("/sports/"):
+        return public_path.rstrip("/")
+
+    if public_path:
+        clean_path = public_path.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        if clean_path.lower().startswith("/channels/"):
+            return clean_path[len("/channels/"):]
+        return clean_path.strip("/").rsplit("/", 1)[-1]
+
+    return _channel_xml_slug(channel.name or "")
+
+
+def _parse_existing_channels_xml(path: Optional[Path] = None) -> list[dict]:
+    path = Path(path) if path else _channels_xml_output_path()
+    if not path.exists():
+        return []
+
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return []
+
+    entries = []
+    channel_re = re.compile(
+        r'^\s*<channel\s+([^>]+)>(.*?)</channel>\s*$',
+        flags=re.IGNORECASE,
+    )
+
+    for line in lines:
+        match = channel_re.match(line)
+        if not match:
+            continue
+
+        attrs_text, display_text = match.groups()
+        attrs = {
+            attr.group(1): html_lib.unescape(attr.group(2))
+            for attr in re.finditer(r'([A-Za-z0-9_-]+)="([^"]*)"', attrs_text)
+        }
+        if attrs.get("site") != "siriusxm":
+            continue
+
+        entries.append({
+            "site_id": str(attrs.get("site_id") or "").strip(),
+            "xmltv_id": str(attrs.get("xmltv_id") or "").strip(),
+            "name": html_lib.unescape(display_text.strip()),
+        })
+
+    return entries
+
+
+def _channel_xml_identity(entry: dict) -> str:
+    site_id = str(entry.get("site_id") or "").strip()
+    name = str(entry.get("name") or "").strip()
+    lowered = site_id.lower()
+
+    if lowered == "dummy":
+        return f"xtra:{_mapping_name_for_compare(name)}"
+
+    base_site_id = site_id.split("##", 1)[0]
+    if base_site_id.lower().startswith("/sports/"):
+        return f"sports:{base_site_id.lower().rstrip('/')}"
+
+    if _is_sports_play_by_play(name, base_site_id):
+        return f"sports:{base_site_id.lower()}"
+
+    uuid_match = re.search(
+        r"##([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
+        site_id,
+    )
+    if uuid_match:
+        return f"uuid:{uuid_match.group(1).lower()}"
+
+    if site_id:
+        return f"site:{site_id.lower()}"
+
+    return f"name:{_mapping_name_for_compare(name)}"
+
+
+def _existing_xml_entry_for_channel(
+    channel: Channel,
+    existing_by_identity: dict,
+    candidate_site_id: str,
+) -> Optional[dict]:
+    name = clean_m3u_text(channel.name or "Unknown")
+    section = _channel_xml_section(channel)
+
+    if section == "xtra":
+        identity = f"xtra:{_mapping_name_for_compare(name)}"
+    elif section == "sports":
+        identity = _channel_xml_identity({
+            "site_id": candidate_site_id,
+            "name": name,
+        })
+    else:
+        public_uuid = _mapping_uuid(channel)
+        if public_uuid:
+            identity = f"uuid:{public_uuid.lower()}"
+        else:
+            identity = _channel_xml_identity({
+                "site_id": candidate_site_id,
+                "name": name,
+            })
+
+    return existing_by_identity.get(identity)
+
+
+def _channel_xml_xmltv_id(
+    channel: Channel,
+    existing_entry: Optional[dict],
+    current_map: dict,
+) -> str:
+    name = clean_m3u_text(channel.name or "Unknown")
+    current_uuid = _mapping_uuid(channel)
+
+    # Prefer the freshly normalized JSON mapping when this UUID maps to the
+    # same current channel name. This keeps the JSON and XML outputs aligned.
+    map_entry = current_map.get(current_uuid)
+    if isinstance(map_entry, dict):
+        mapped_name = _mapping_plain_name(map_entry.get("displayName") or "")
+        mapped_id = str(map_entry.get("xmltvId") or "").strip()
+        if (
+            mapped_id
+            and _mapping_name_for_compare(mapped_name)
+            == _mapping_name_for_compare(name)
+        ):
+            return mapped_id
+
+    # For legacy sports/play-by-play entries that cannot be represented
+    # uniquely by UUID, retain the established XMLTV id while the name is the
+    # same.
+    if existing_entry:
+        old_name = str(existing_entry.get("name") or "").strip()
+        old_id = str(existing_entry.get("xmltv_id") or "").strip()
+        if (
+            old_id
+            and _mapping_name_for_compare(old_name)
+            == _mapping_name_for_compare(name)
+        ):
+            return old_id
+
+    return _mapping_xmltv_id(name, current_uuid or candidate_site_id if False else current_uuid)
+
+
+def _format_channels_xml_line(entry: dict) -> str:
+    site_id = html_lib.escape(str(entry.get("site_id") or ""), quote=True)
+    xmltv_id = html_lib.escape(str(entry.get("xmltv_id") or ""), quote=True)
+    name = html_lib.escape(str(entry.get("name") or "Unknown"), quote=False)
+    return (
+        f'  <channel update="i" site="siriusxm" site_id="{site_id}" '
+        f'xmltv_id="{xmltv_id}">{name}</channel>'
+    )
+
+
+def generate_channels_xml_entries(db: DBSession, current_map: dict) -> dict:
+    existing_entries = _parse_existing_channels_xml()
+    existing_by_identity = {}
+    for entry in existing_entries:
+        existing_by_identity[_channel_xml_identity(entry)] = entry
+
+    sections = {
+        "on_now": [],
+        "sports": [],
+        "xtra": [],
+    }
+
+    channels = (
+        db.query(Channel)
+        .filter(Channel.channel_id.isnot(None))
+        .filter(Channel.name.isnot(None))
+        .order_by(Channel.number.asc(), Channel.id.asc())
+        .all()
+    )
+
+    for channel in channels:
+        section = _channel_xml_section(channel)
+        name = clean_m3u_text(channel.name or "Unknown")
+
+        if section == "xtra":
+            site_id = "dummy"
+        elif section == "sports":
+            site_id = _sports_site_id(channel)
+        else:
+            snapshot = {
+                "channel_id": str(channel.channel_id or ""),
+                "channel_type": str(channel.channel_type or "channel-linear"),
+                "public_uuid": str(getattr(channel, "public_uuid", None) or ""),
+                "public_path": str(getattr(channel, "public_path", None) or ""),
+                "name": name,
+            }
+            site_id = _site_id_for_channel(snapshot)
+
+        existing_entry = _existing_xml_entry_for_channel(
+            channel,
+            existing_by_identity,
+            site_id,
+        )
+        xmltv_id = _channel_xml_xmltv_id(
+            channel,
+            existing_entry,
+            current_map,
+        )
+
+        entry = {
+            "site_id": site_id,
+            "xmltv_id": xmltv_id,
+            "name": name,
+            "section": section,
+        }
+        entry["identity"] = _channel_xml_identity(entry)
+        sections[section].append(entry)
+
+    return {
+        "existing": existing_entries,
+        "sections": sections,
+        "all": sections["on_now"] + sections["sports"] + sections["xtra"],
+    }
+
+
+def _write_channels_xml_changes_report(old_entries: list[dict], new_entries: list[dict]) -> dict:
+    report_path = _channels_xml_output_path().parent / "siriusxm_channels_changes.txt"
+
+    old_by_identity = {}
+    for entry in old_entries:
+        old_by_identity[_channel_xml_identity(entry)] = entry
+    new_by_identity = {}
+    for entry in new_entries:
+        new_by_identity[_channel_xml_identity(entry)] = entry
+
+    added = [
+        entry for key, entry in new_by_identity.items()
+        if key not in old_by_identity
+    ]
+    removed = [
+        entry for key, entry in old_by_identity.items()
+        if key not in new_by_identity
+    ]
+    updated = [
+        {"old": old_by_identity[key], "new": entry}
+        for key, entry in new_by_identity.items()
+        if key in old_by_identity
+        and (
+            old_by_identity[key].get("site_id") != entry.get("site_id")
+            or old_by_identity[key].get("xmltv_id") != entry.get("xmltv_id")
+            or _mapping_name_for_compare(old_by_identity[key].get("name"))
+            != _mapping_name_for_compare(entry.get("name"))
+        )
+    ]
+
+    lines = [
+        "ArchiveXM SiriusXM WebGrab Channel List Changes",
+        f"Refresh: {datetime.now().strftime('%m/%d/%Y %I:%M %p')}",
+        "",
+        f"Previous channels: {len(old_by_identity)}",
+        f"Current channels: {len(new_by_identity)}",
+        "",
+        "====================",
+        "Added Channels",
+        "====================",
+        "",
+    ]
+    if added:
+        lines.extend(_format_channels_xml_line(entry) for entry in added)
+    else:
+        lines.append("None")
+
+    lines.extend([
+        "",
+        "",
+        "====================",
+        "Updated Channels",
+        "====================",
+        "",
+    ])
+    if updated:
+        for item in updated:
+            lines.append("OLD:")
+            lines.append(_format_channels_xml_line(item["old"]))
+            lines.append("NEW:")
+            lines.append(_format_channels_xml_line(item["new"]))
+            lines.append("")
+    else:
+        lines.append("None")
+
+    lines.extend([
+        "",
+        "====================",
+        "Removed Channels",
+        "====================",
+        "",
+    ])
+    if removed:
+        lines.extend(_format_channels_xml_line(entry) for entry in removed)
+    else:
+        lines.append("None")
+
+    report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return {
+        "path": str(report_path),
+        "added": len(added),
+        "updated": len(updated),
+        "removed": len(removed),
+    }
+
+
+def write_boss_mapping(entries: list[dict]) -> str:
+    output_path = _boss_mapping_output_path()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = []
+    seen = set()
+    for entry in entries:
+        xmltv_id = str(entry.get("xmltv_id") or "").strip()
+        name = str(entry.get("name") or "").strip()
+        if not xmltv_id or not name:
+            continue
+        key = (xmltv_id.casefold(), _mapping_name_for_compare(name))
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"{xmltv_id};;{name}::Radio: {name}")
+
+    output_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return str(output_path)
+
+
+def refresh_channels_xml_and_boss_mapping(db: DBSession) -> dict:
+    xml_path = _channels_xml_output_path()
+    xml_path.parent.mkdir(parents=True, exist_ok=True)
+
+    old_entries = _parse_existing_channels_xml(xml_path)
+    backup_path = _backup_file(xml_path)
+
+    current_map = _load_existing_channel_map()
+    generated = generate_channels_xml_entries(db, current_map)
+    sections = generated["sections"]
+
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<site generator-info-name="ArchiveXM" site="siriusxm">',
+        '<channels>',
+        '<!-- ON NOW MATCHED -->',
+    ]
+    lines.extend(_format_channels_xml_line(entry) for entry in sections["on_now"])
+    lines.extend([
+        "",
+        "<!-- ON NOW SPORTS MATCHED -->",
+    ])
+    lines.extend(_format_channels_xml_line(entry) for entry in sections["sports"])
+    lines.extend([
+        "",
+        "<!-- XTRA Channels -->",
+    ])
+    lines.extend(_format_channels_xml_line(entry) for entry in sections["xtra"])
+    lines.extend([
+        "",
+        "</channels>",
+        "</site>",
+    ])
+
+    xml_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    changes = _write_channels_xml_changes_report(
+        old_entries,
+        generated["all"],
+    )
+    boss_path = write_boss_mapping(generated["all"])
+
+    return {
+        "path": str(xml_path),
+        "backup_path": backup_path,
+        "changes_path": changes["path"],
+        "added": changes["added"],
+        "updated": changes["updated"],
+        "removed": changes["removed"],
+        "boss_mapping_path": boss_path,
+        "count": len(generated["all"]),
     }
 
 

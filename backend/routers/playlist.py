@@ -1179,12 +1179,17 @@ def _xmltv_id_for_channel(channel: dict) -> str:
 
 
 def _channel_name_slug_preserving_numeric_slashes(value: str) -> str:
-    """Build a channel slug while retaining meaningful numeric slashes like 24/7."""
+    """Build a SiriusXM-style channel slug from a display name."""
     text = unicodedata.normalize("NFKD", str(value or ""))
     text = text.encode("ascii", "ignore").decode("ascii").lower()
 
+    # SiriusXM removes apostrophes rather than treating them as word
+    # separators: "Pitbull's" -> "pitbulls", "Marley's" -> "marleys".
+    text = text.replace("'", "")
+
     # Split only slashes that are directly between digits. Each side is then
-    # slugified normally and the numeric slash is restored between the pieces.
+    # slugified normally and the numeric slash is restored between the pieces,
+    # preserving channel URLs such as "dateline-24/7".
     parts = re.split(r"(?<=\d)/(?=\d)", text)
     slugs = [
         re.sub(r"[^a-z0-9]+", "-", part).strip("-")

@@ -298,6 +298,7 @@ def _mapping_xmltv_base(value: str, fallback: str = "") -> str:
     """Return an ASCII alphanumeric-only XMLTV id base."""
     text = str(value or "").strip()
     text = re.sub(r"^\s*Radio:\s*", "", text, flags=re.IGNORECASE)
+    text = text.replace("&", "And")
     text = unicodedata.normalize("NFKD", text)
     text = text.encode("ascii", "ignore").decode("ascii")
     text = re.sub(r"[^A-Za-z0-9]+", "", text)

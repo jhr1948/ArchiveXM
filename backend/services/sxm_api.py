@@ -9,6 +9,7 @@ import re
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional
 import asyncio
+import difflib
 
 
 class SiriusXMAPI:
@@ -656,6 +657,153 @@ class SiriusXMAPI:
 
         return links
 
+
+    def _public_path_title_similarity(self, title: str, path: str) -> float:
+        """Score how well a literal SiriusXM page path matches a channel title."""
+        title_text = self._normalize_public_text(title).lower()
+        slug = str(path or "").split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        slug = slug.rsplit("/", 1)[-1].lower()
+
+        title_compact = re.sub(r"[^a-z0-9]+", "", title_text)
+        slug_compact = re.sub(r"[^a-z0-9]+", "", slug)
+        if not title_compact or not slug_compact:
+            return 0.0
+        if title_compact == slug_compact:
+            return 1.0
+        if (
+            min(len(title_compact), len(slug_compact)) >= 6
+            and (
+                title_compact in slug_compact
+                or slug_compact in title_compact
+            )
+        ):
+            return 0.92
+
+        def token_set(value: str) -> set[str]:
+            tokens = re.findall(r"[a-z0-9]+", value)
+            normalized = set()
+            stop = {"the", "on", "and", "radio", "channel", "siriusxm"}
+            for token in tokens:
+                if token in stop:
+                    continue
+                if len(token) > 4 and token.endswith("s"):
+                    token = token[:-1]
+                normalized.add(token)
+            return normalized
+
+        title_tokens = token_set(title_text)
+        slug_tokens = token_set(slug.replace("-", " ").replace("/", " "))
+        token_score = 0.0
+        if title_tokens and slug_tokens:
+            overlap = len(title_tokens & slug_tokens)
+            token_score = overlap / max(1, min(len(title_tokens), len(slug_tokens)))
+
+        sequence_score = difflib.SequenceMatcher(
+            None,
+            title_compact,
+            slug_compact,
+        ).ratio()
+
+        return max(sequence_score, token_score * 0.9)
+
+    def _overlay_public_paths_from_serialized_page(
+        self,
+        sources: List[str],
+        results: Dict[str, Dict],
+    ) -> int:
+        """
+        Recover literal /channels/... and /sports/... hrefs from Next/React
+        serialized page content when they are not emitted as plain HTML anchors.
+
+        The real path nearest a matching channel title wins only when the title
+        and path are sufficiently similar, preventing neighboring channel cards
+        from being cross-matched.
+        """
+        prepared_sources = []
+        for source in sources:
+            if not source:
+                continue
+            normalized = (
+                source
+                .replace("\\/", "/")
+                .replace("\\u002F", "/")
+                .replace("\\u002f", "/")
+            )
+            prepared_sources.append((normalized, normalized.lower()))
+
+        path_re = re.compile(
+            r'(?:(?:https?://(?:www\.)?siriusxm\.com)?/(?:channels|sports)/'
+            r'[A-Za-z0-9][A-Za-z0-9._~%+\-/]*)',
+            flags=re.IGNORECASE,
+        )
+
+        matched = 0
+        for channel in results.values():
+            title = self._normalize_public_text(channel.get("title") or "")
+            if len(title) < 3:
+                continue
+
+            title_variants = {
+                title.lower(),
+                title.lower().replace("’", "'").replace("‘", "'"),
+            }
+
+            best_path = ""
+            best_score = 0.0
+            best_distance = None
+
+            for source, lowered_source in prepared_sources:
+                for title_variant in title_variants:
+                    search_from = 0
+                    occurrences = 0
+                    while occurrences < 8:
+                        title_pos = lowered_source.find(title_variant, search_from)
+                        if title_pos < 0:
+                            break
+                        occurrences += 1
+                        search_from = title_pos + max(1, len(title_variant))
+
+                        window_start = max(0, title_pos - 1800)
+                        window_end = min(len(source), title_pos + len(title_variant) + 1800)
+                        window = source[window_start:window_end]
+
+                        for path_match in path_re.finditer(window):
+                            raw_path = path_match.group(0)
+                            path = self._normalize_public_channel_path(raw_path)
+                            if not path:
+                                continue
+
+                            absolute_pos = window_start + path_match.start()
+                            distance = abs(absolute_pos - title_pos)
+                            similarity = self._public_path_title_similarity(title, path)
+
+                            # Proximity matters because adjacent channel cards
+                            # can appear in the same serialized page chunk.
+                            proximity_bonus = max(0.0, 1.0 - (distance / 1800.0)) * 0.22
+                            score = similarity + proximity_bonus
+
+                            if (
+                                score > best_score
+                                or (
+                                    abs(score - best_score) < 0.0001
+                                    and (
+                                        best_distance is None
+                                        or distance < best_distance
+                                    )
+                                )
+                            ):
+                                best_score = score
+                                best_path = path
+                                best_distance = distance
+
+            if best_path and best_score >= 0.72:
+                if channel.get("public_path") != best_path:
+                    matched += 1
+                channel["public_path"] = best_path
+                channel["_public_path_quality"] = 190
+
+        return matched
+
     def _add_public_channel_result(self, results: Dict[str, Dict], item: Dict) -> bool:
         """Add one siriusxm.com/channels channel object to results."""
         if not isinstance(item, dict):
@@ -757,10 +905,17 @@ class SiriusXMAPI:
         url = "https://www.siriusxm.com/channels"
 
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/155.0.0.0 Safari/537.36"
+            ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Referer": "https://www.siriusxm.com/",
             "Upgrade-Insecure-Requests": "1",
+            "sec-ch-ua": '"Google Chrome";v="155", "Chromium";v="155", "Not(A:Brand";v="24"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
         }
 
         try:
@@ -779,6 +934,14 @@ class SiriusXMAPI:
                     decoded_variants.append(bytes(candidate, "utf-8").decode("unicode_escape"))
                 except Exception:
                     pass
+
+            # Next/React payloads commonly escape route slashes. Keep explicit
+            # slash-normalized variants available for literal page-path recovery.
+            decoded_variants.extend(
+                candidate.replace("\\/", "/")
+                for candidate in list(decoded_variants)
+                if "\\/" in candidate
+            )
 
             # Preferred path: parse JSON script blobs and recursively find any
             # dict that looks like a public channel object.
@@ -833,11 +996,17 @@ class SiriusXMAPI:
                     channel["_public_path_quality"] = 200
                     linked_count += 1
 
+            serialized_count = self._overlay_public_paths_from_serialized_page(
+                decoded_variants,
+                results,
+            )
+
             if results.get("349"):
                 print(f"🌐 Public 349 title: {results['349'].get('title')}")
             print(
                 f"🌐 Loaded {len(results)} public channel metadata overrides "
-                f"({linked_count} paths from page hrefs)"
+                f"({linked_count} paths from HTML hrefs, "
+                f"{serialized_count} corrected from serialized page paths)"
             )
             return results
 

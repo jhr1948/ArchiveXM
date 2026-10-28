@@ -557,6 +557,105 @@ class SiriusXMAPI:
         # contains "/".
         return f"/channels/{raw.strip('/')}"
 
+
+    def _public_title_key(self, value) -> str:
+        """Return a punctuation-insensitive key for matching page link text."""
+        text = self._normalize_public_text(value).lower()
+        text = text.replace("’", "'").replace("‘", "'")
+        return re.sub(r"[^a-z0-9]+", "", text)
+
+    def _best_public_path_from_item(self, item: Dict) -> tuple[str, int]:
+        """
+        Return the best channel path exposed by one public-page JSON object.
+
+        Prefer actual URL/path/href fields. A bare slug is only a fallback and
+        must never displace a real /channels/... or /sports/... path found from
+        another representation of the same channel.
+        """
+        path_keys = [
+            "href",
+            "channelUrl", "channelURL",
+            "webUrl", "webURL",
+            "seoUrl", "seoURL",
+            "path",
+            "contentPath", "channelPath", "seoPath",
+            "relativeUrl", "relativeURL",
+            "url",
+        ]
+
+        best_path = ""
+        best_quality = 0
+
+        for key in path_keys:
+            raw = self._normalize_public_text(item.get(key))
+            if not raw:
+                continue
+
+            lowered = raw.lower()
+            has_explicit_channel_path = bool(
+                re.search(r"(?:^|siriusxm\.com)/(?:channels|sports)/", lowered)
+                or lowered.startswith("channels/")
+                or lowered.startswith("sports/")
+                or lowered.startswith("/channels/")
+                or lowered.startswith("/sports/")
+            )
+
+            # Ignore unrelated absolute URLs (images, app links, etc.).
+            if lowered.startswith(("http://", "https://")) and not has_explicit_channel_path:
+                continue
+
+            path = self._normalize_public_channel_path(raw)
+            if not path:
+                continue
+
+            quality = 100 if has_explicit_channel_path else 70
+            if quality > best_quality:
+                best_path = path
+                best_quality = quality
+
+        raw_slug = self._normalize_public_text(item.get("slug"))
+        if raw_slug and best_quality < 20:
+            best_path = self._normalize_public_channel_path(raw_slug)
+            best_quality = 20
+
+        return best_path, best_quality
+
+    def _extract_public_page_links(self, raw_html: str) -> Dict[str, str]:
+        """
+        Extract the literal channel/sports hrefs rendered on siriusxm.com/channels,
+        keyed by the visible anchor text. These are authoritative over guessed
+        slugs because they are the actual links published by SiriusXM.
+        """
+        links = {}
+        anchor_re = re.compile(
+            r'<a\\b[^>]*?href=(["\'])(.*?)\\1[^>]*>(.*?)</a>',
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        for match in anchor_re.finditer(raw_html or ""):
+            href = html_lib.unescape(match.group(2)).strip()
+            lowered = href.lower()
+            if not (
+                "/channels/" in lowered
+                or "/sports/" in lowered
+                or lowered.startswith("channels/")
+                or lowered.startswith("sports/")
+            ):
+                continue
+
+            inner_html = match.group(3)
+            label = re.sub(r"<[^>]+>", " ", inner_html)
+            label = self._normalize_public_text(html_lib.unescape(label))
+            title_key = self._public_title_key(label)
+            if not title_key:
+                continue
+
+            path = self._normalize_public_channel_path(href)
+            if path:
+                links.setdefault(title_key, path)
+
+        return links
+
     def _add_public_channel_result(self, results: Dict[str, Dict], item: Dict) -> bool:
         """Add one siriusxm.com/channels channel object to results."""
         if not isinstance(item, dict):
@@ -578,17 +677,7 @@ class SiriusXMAPI:
             ):
                 channel_uuid = candidate_id
 
-        public_path = self._normalize_public_channel_path(
-            self._first_public_value(
-                item,
-                [
-                    "url", "channelUrl", "channelURL", "webUrl", "webURL",
-                    "seoUrl", "seoURL", "path", "href", "slug",
-                    "contentPath", "channelPath", "seoPath",
-                    "relativeUrl", "relativeURL",
-                ]
-            )
-        )
+        public_path, public_path_quality = self._best_public_path_from_item(item)
 
         if not channel_number or (not channel_uuid and not public_path):
             return False
@@ -632,6 +721,14 @@ class SiriusXMAPI:
         )
 
         existing = results.get(number_key, {})
+        existing_path_quality = int(existing.get("_public_path_quality") or 0)
+        chosen_public_path = existing.get("public_path", "")
+        chosen_path_quality = existing_path_quality
+
+        if public_path and public_path_quality > existing_path_quality:
+            chosen_public_path = public_path
+            chosen_path_quality = public_path_quality
+
         # Prefer entries with a friendly public displayName/title, but preserve
         # already-found fields when a later partial object is less complete.
         results[number_key] = {
@@ -640,7 +737,8 @@ class SiriusXMAPI:
             "channel_type": "channel-xtra" if is_xtra else existing.get("channel_type", "channel-linear"),
             "id": str(channel_uuid) or existing.get("id", ""),
             "public_uuid": str(channel_uuid) or existing.get("public_uuid", ""),
-            "public_path": public_path or existing.get("public_path", ""),
+            "public_path": chosen_public_path,
+            "_public_path_quality": chosen_path_quality,
             "logo_path": logo_path or existing.get("logo_path", ""),
         }
         return True
@@ -661,6 +759,8 @@ class SiriusXMAPI:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": "https://www.siriusxm.com/",
+            "Upgrade-Insecure-Requests": "1",
         }
 
         try:
@@ -720,9 +820,25 @@ class SiriusXMAPI:
 
                     self._add_public_channel_result(results, item)
 
+            # Finally, overlay literal hrefs rendered by the /channels page.
+            # This is the strongest source of truth for editorial slugs such as
+            # /channels/grateful-dead-channel or /channels/fox-headline-news.
+            page_links = self._extract_public_page_links(raw_text)
+            linked_count = 0
+            for channel in results.values():
+                title_key = self._public_title_key(channel.get("title") or "")
+                page_path = page_links.get(title_key)
+                if page_path:
+                    channel["public_path"] = page_path
+                    channel["_public_path_quality"] = 200
+                    linked_count += 1
+
             if results.get("349"):
                 print(f"🌐 Public 349 title: {results['349'].get('title')}")
-            print(f"🌐 Loaded {len(results)} public channel metadata overrides")
+            print(
+                f"🌐 Loaded {len(results)} public channel metadata overrides "
+                f"({linked_count} paths from page hrefs)"
+            )
             return results
 
         except Exception as e:

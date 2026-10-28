@@ -3,6 +3,7 @@ Playlist Router - Generate local M3U playlists for IPTV players
 """
 import os
 import re
+import json
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -260,6 +261,242 @@ def _playlist_output_path() -> Path:
     return Path(os.getenv("PLAYLIST_OUTPUT", "/app/output/siriusxm.m3u"))
 
 
+def _channel_map_output_path() -> Path:
+    configured = os.getenv("CHANNEL_MAP_OUTPUT", "").strip()
+    if configured:
+        return Path(configured)
+    return _playlist_output_path().parent / "sxm_channel_map.json"
+
+
+def _dated_backup_path(path: Path) -> Path:
+    stamp = datetime.now().strftime("%m.%d.%Y")
+    backup_path = path.with_name(f"{path.name}.{stamp}.bak")
+    if not backup_path.exists():
+        return backup_path
+
+    time_stamp = datetime.now().strftime("%H%M%S")
+    backup_path = path.with_name(f"{path.name}.{stamp}-{time_stamp}.bak")
+    counter = 2
+    while backup_path.exists():
+        backup_path = path.with_name(
+            f"{path.name}.{stamp}-{time_stamp}-{counter}.bak"
+        )
+        counter += 1
+    return backup_path
+
+
+def _backup_file(path: Path) -> Optional[str]:
+    if not path.exists():
+        return None
+    backup_path = _dated_backup_path(path)
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, backup_path)
+    return str(backup_path)
+
+
+def _mapping_xmltv_id(display_name: str, channel_uuid: str) -> str:
+    base = re.sub(r"^\s*Radio:\s*", "", str(display_name or ""), flags=re.IGNORECASE)
+    base = re.sub(r"\s+", "", base.strip())
+    if not base:
+        base = channel_uuid
+    return f"{base}.sxm"
+
+
+def _load_existing_channel_map(path: Optional[Path] = None) -> dict:
+    path = Path(path) if path else _channel_map_output_path()
+    if not path.exists():
+        return {}
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        print(f"Unable to parse existing channel map {path}: {exc}")
+        return {}
+
+
+def _mapping_display_name(channel: Channel) -> str:
+    name = clean_m3u_text(channel.name or "Unknown")
+    channel_type = str(getattr(channel, "channel_type", None) or "channel-linear").lower()
+    if channel_type == "channel-xtra":
+        return name
+    return f"Radio: {name}"
+
+
+def _mapping_uuid(channel: Channel) -> str:
+    return str(
+        getattr(channel, "public_uuid", None)
+        or channel.channel_id
+        or ""
+    ).strip()
+
+
+def generate_channel_mapping(db: DBSession, previous_map: Optional[dict] = None) -> dict:
+    """Build one unique JSON mapping entry per current SiriusXM UUID.
+
+    Existing xmltvId values and aliases are intentionally preserved for UUIDs
+    already present in the prior map; the current channel name refreshes
+    displayName. New UUIDs receive a deterministic xmltvId generated from the
+    display name using the requested no-spaces rule.
+    """
+    previous_map = previous_map or {}
+    mapping = {}
+
+    channels = (
+        db.query(Channel)
+        .filter(Channel.channel_id.isnot(None))
+        .filter(Channel.name.isnot(None))
+        .order_by(Channel.id.asc())
+        .all()
+    )
+
+    for channel in channels:
+        channel_uuid = _mapping_uuid(channel)
+        if not channel_uuid:
+            continue
+
+        display_name = _mapping_display_name(channel)
+        previous = previous_map.get(channel_uuid)
+        previous = previous if isinstance(previous, dict) else {}
+
+        xmltv_id = str(previous.get("xmltvId") or "").strip()
+        if not xmltv_id:
+            xmltv_id = _mapping_xmltv_id(display_name, channel_uuid)
+
+        entry = {
+            "xmltvId": xmltv_id,
+            "displayName": display_name,
+        }
+
+        aliases = previous.get("aliases")
+        if isinstance(aliases, list):
+            clean_aliases = [
+                str(alias).strip()
+                for alias in aliases
+                if str(alias).strip()
+            ]
+            if clean_aliases:
+                entry["aliases"] = clean_aliases
+
+        # JSON object keys must be unique. If SiriusXM reuses a UUID, the final
+        # current channel row wins rather than emitting invalid duplicate keys.
+        mapping[channel_uuid] = entry
+
+    return mapping
+
+
+def _mapping_entry_block(channel_uuid: str, entry: dict) -> list[str]:
+    encoded = json.dumps(
+        {channel_uuid: entry},
+        indent=2,
+        ensure_ascii=False,
+    ).splitlines()
+    if len(encoded) >= 2:
+        return encoded[1:-1]
+    return encoded
+
+
+def write_channel_mapping_changes_report(previous_map: dict, current_map: dict) -> dict:
+    report_path = _channel_map_output_path().parent / "sxm_channel_map_changes.txt"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    old_keys = set(previous_map)
+    new_keys = set(current_map)
+    added_keys = [key for key in current_map if key not in old_keys]
+    removed_keys = [key for key in previous_map if key not in new_keys]
+    updated_keys = [
+        key
+        for key in current_map
+        if key in previous_map and previous_map.get(key) != current_map.get(key)
+    ]
+
+    lines = [
+        "ArchiveXM SiriusXM Channel Mapping Changes",
+        f"Refresh: {datetime.now().strftime('%m/%d/%Y %I:%M %p')}",
+        "",
+        f"Previous mappings: {len(previous_map)}",
+        f"Current mappings: {len(current_map)}",
+        "",
+        "====================",
+        "Added Mappings",
+        "====================",
+        "",
+    ]
+
+    if added_keys:
+        for key in added_keys:
+            lines.extend(_mapping_entry_block(key, current_map[key]))
+            lines.append("")
+    else:
+        lines.append("None")
+
+    lines.extend([
+        "",
+        "====================",
+        "Updated Mappings",
+        "====================",
+        "",
+    ])
+    if updated_keys:
+        for key in updated_keys:
+            lines.append(f"UUID: {key}")
+            lines.append("OLD:")
+            lines.extend(_mapping_entry_block(key, previous_map[key]))
+            lines.append("NEW:")
+            lines.extend(_mapping_entry_block(key, current_map[key]))
+            lines.append("")
+    else:
+        lines.append("None")
+
+    lines.extend([
+        "",
+        "====================",
+        "Removed Mappings",
+        "====================",
+        "",
+    ])
+    if removed_keys:
+        for key in removed_keys:
+            lines.extend(_mapping_entry_block(key, previous_map[key]))
+            lines.append("")
+    else:
+        lines.append("None")
+
+    report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return {
+        "path": str(report_path),
+        "added": len(added_keys),
+        "updated": len(updated_keys),
+        "removed": len(removed_keys),
+    }
+
+
+def refresh_channel_mapping(db: DBSession) -> dict:
+    output_path = _channel_map_output_path()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    previous_map = _load_existing_channel_map(output_path)
+    backup_path = _backup_file(output_path)
+    current_map = generate_channel_mapping(db, previous_map)
+
+    output_path.write_text(
+        json.dumps(current_map, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    changes = write_channel_mapping_changes_report(previous_map, current_map)
+
+    return {
+        "status": "ok",
+        "path": str(output_path),
+        "backup_path": backup_path,
+        "count": len(current_map),
+        "changes_path": changes["path"],
+        "added": changes["added"],
+        "updated": changes["updated"],
+        "removed": changes["removed"],
+    }
+
+
 def _split_extinf_metadata_and_name(line: str) -> tuple[str, str]:
     """Split an EXTINF line at the first comma that is outside quotes."""
     in_quotes = False
@@ -381,26 +618,7 @@ def read_existing_m3u_channels(
 def backup_existing_m3u(output_path: Optional[Path] = None) -> Optional[str]:
     """Preserve the currently generated M3U before a successful channel refresh."""
     output_path = Path(output_path) if output_path else _playlist_output_path()
-    if not output_path.exists():
-        return None
-
-    stamp = datetime.now().strftime("%m.%d.%Y")
-    backup_path = output_path.with_name(f"{output_path.name}.{stamp}.bak")
-    if backup_path.exists():
-        time_stamp = datetime.now().strftime("%H%M%S")
-        backup_path = output_path.with_name(
-            f"{output_path.name}.{stamp}-{time_stamp}.bak"
-        )
-        counter = 2
-        while backup_path.exists():
-            backup_path = output_path.with_name(
-                f"{output_path.name}.{stamp}-{time_stamp}-{counter}.bak"
-            )
-            counter += 1
-
-    backup_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(output_path, backup_path)
-    return str(backup_path)
+    return _backup_file(output_path)
 
 
 def _xmltv_id_for_channel(channel: dict) -> str:

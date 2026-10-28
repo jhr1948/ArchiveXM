@@ -335,6 +335,23 @@ def _sanitize_existing_mapping_xmltv_id(xmltv_id: str, channel_uuid: str) -> str
     return f"{_mapping_xmltv_base(value, channel_uuid)}.sxm"
 
 
+def _is_uuid_fallback_xmltv_id(xmltv_id: str, channel_uuid: str) -> bool:
+    """Return True when an XMLTV id is only the UUID stripped of punctuation."""
+    value = re.sub(
+        r"\.sxm$",
+        "",
+        str(xmltv_id or "").strip(),
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(r"[^A-Za-z0-9]+", "", value).lower()
+    uuid_base = re.sub(
+        r"[^A-Za-z0-9]+",
+        "",
+        str(channel_uuid or ""),
+    ).lower()
+    return bool(value and uuid_base and value == uuid_base)
+
+
 def _mapping_name_for_compare(value: str) -> str:
     text = unicodedata.normalize("NFKC", str(value or ""))
     text = text.replace("\u00a0", " ").replace("\u200b", "").replace("\ufeff", "")
@@ -412,16 +429,21 @@ def generate_channel_mapping(db: DBSession, previous_map: Optional[dict] = None)
             previous_xmltv_id
             and _mapping_name_for_compare(previous_display_name)
             == _mapping_name_for_compare(display_name)
+            and not _is_uuid_fallback_xmltv_id(
+                previous_xmltv_id,
+                channel_uuid,
+            )
         ):
             # Preserve deliberate/custom XMLTV naming for unchanged channels,
-            # while enforcing the alphanumeric-only ID rule.
+            # while enforcing the alphanumeric-only ID rule. UUID-only fallback
+            # IDs are not deliberate custom names and should be repaired.
             xmltv_id = _sanitize_existing_mapping_xmltv_id(
                 previous_xmltv_id,
                 channel_uuid,
             )
         else:
-            # A changed display name on the same UUID means the channel was
-            # renamed/reassigned; regenerate the XMLTV id from the new name.
+            # A changed display name, or an old UUID-only fallback XMLTV id,
+            # should regenerate from the current channel name.
             xmltv_id = _mapping_xmltv_id(display_name, channel_uuid)
 
         entry = {
@@ -728,6 +750,8 @@ def _channel_xml_xmltv_id(
             and _mapping_name_for_compare(mapped_name)
             == _mapping_name_for_compare(name)
         ):
+            if _is_uuid_fallback_xmltv_id(mapped_id, current_uuid):
+                return _mapping_xmltv_id(name, current_uuid or "channel")
             return mapped_id
 
     # For legacy sports/play-by-play entries that cannot be represented

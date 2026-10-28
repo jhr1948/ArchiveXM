@@ -551,11 +551,11 @@ class SiriusXMAPI:
         if raw.startswith("/"):
             return raw.rstrip("/")
 
-        # Some public objects expose only a slug instead of a complete path.
-        if "/" not in raw:
-            return f"/channels/{raw.strip('/')}"
-
-        return ""
+        # Public channel objects can expose a relative slug that itself contains
+        # a slash (for example "dateline-24/7"). Treat any remaining relative
+        # value as a /channels path instead of rejecting it just because it
+        # contains "/".
+        return f"/channels/{raw.strip('/')}"
 
     def _add_public_channel_result(self, results: Dict[str, Dict], item: Dict) -> bool:
         """Add one siriusxm.com/channels channel object to results."""

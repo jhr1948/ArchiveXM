@@ -1178,6 +1178,21 @@ def _xmltv_id_for_channel(channel: dict) -> str:
     return f"{base}.sxm"
 
 
+def _channel_name_slug_preserving_numeric_slashes(value: str) -> str:
+    """Build a channel slug while retaining meaningful numeric slashes like 24/7."""
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = text.encode("ascii", "ignore").decode("ascii").lower()
+
+    # Split only slashes that are directly between digits. Each side is then
+    # slugified normally and the numeric slash is restored between the pieces.
+    parts = re.split(r"(?<=\d)/(?=\d)", text)
+    slugs = [
+        re.sub(r"[^a-z0-9]+", "-", part).strip("-")
+        for part in parts
+    ]
+    return "/".join(part for part in slugs if part)
+
+
 def _site_id_for_channel(channel: dict) -> str:
     channel_type = str(channel.get("channel_type") or "channel-linear").lower()
     if channel_type == "channel-xtra":
@@ -1197,10 +1212,28 @@ def _site_id_for_channel(channel: dict) -> str:
         else:
             slug = clean_path.strip("/").rsplit("/", 1)[-1]
 
+    # Some SiriusXM public metadata flattens a meaningful numeric slash in a
+    # channel URL (for example Dateline 24/7 becomes "dateline-24-7"). If the
+    # display name produces the same slug except for digit/digit slashes,
+    # restore the canonical slash form.
+    name_slug = _channel_name_slug_preserving_numeric_slashes(
+        str(channel.get("name") or "")
+    )
+    if (
+        slug
+        and "/" in name_slug
+        and name_slug.replace("/", "-") == slug
+    ):
+        slug = name_slug
+
     if not slug:
         # Last-resort fallback for a public object that exposes a UUID/name but
-        # no URL. Prefer the real public_path whenever SiriusXM provides it.
-        slug = re.sub(r"[^a-z0-9]+", "-", str(channel.get("name") or "").lower()).strip("-")
+        # no URL. Preserve numeric slashes such as 24/7 in that fallback too.
+        slug = name_slug or re.sub(
+            r"[^a-z0-9]+",
+            "-",
+            str(channel.get("name") or "").lower(),
+        ).strip("-")
 
     if public_uuid and slug:
         return f"{slug}##{public_uuid}"

@@ -272,7 +272,7 @@ def _channels_xml_output_path() -> Path:
     configured = os.getenv("CHANNELS_XML_OUTPUT", "").strip()
     if configured:
         return Path(configured)
-    return _playlist_output_path().parent / "siriusxm.channels.xml"
+    return _playlist_output_path().parent / "siriusxm.channels_new.xml"
 
 
 def _boss_mapping_output_path() -> Path:
@@ -741,7 +741,7 @@ def _channel_xml_xmltv_id(
         ):
             return old_id
 
-    return _mapping_xmltv_id(name, current_uuid or candidate_site_id if False else current_uuid)
+    return _mapping_xmltv_id(name, current_uuid or "channel")
 
 
 def _format_channels_xml_line(entry: dict) -> str:
@@ -939,7 +939,7 @@ def refresh_channels_xml_and_boss_mapping(db: DBSession) -> dict:
 
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
-        '<site generator-info-name="ArchiveXM" site="siriusxm">',
+        '<site generator-info-name="WebGrab+Plus/w MDB &amp; REX Postprocess -- version V5.2.2.0 -- Jan van Straaten" site="siriusxm">',
         '<channels>',
         '<!-- ON NOW MATCHED -->',
     ]

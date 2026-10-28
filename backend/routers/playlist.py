@@ -944,10 +944,6 @@ def refresh_channels_xml_and_boss_mapping(db: DBSession) -> dict:
         '<!-- ON NOW MATCHED -->',
     ]
     lines.extend(_format_channels_xml_line(entry) for entry in sections["on_now"])
-    lines.extend([
-        "",
-        "<!-- ON NOW SPORTS MATCHED -->",
-    ])
     lines.extend(_format_channels_xml_line(entry) for entry in sections["sports"])
     lines.extend([
         "",

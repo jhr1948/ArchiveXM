@@ -586,7 +586,7 @@ def _is_sports_play_by_play(channel_name: str, public_path: str = "") -> bool:
     return bool(re.search(r"play[- ]by[- ]play", haystack))
 
 
-def _channel_xml_section(channel: Channel) -> str:
+def _channel_xml_section(channel: Channel, sports_path: str = "") -> str:
     channel_type = str(getattr(channel, "channel_type", None) or "channel-linear").lower()
     if channel_type == "channel-xtra":
         return "xtra"
@@ -594,14 +594,14 @@ def _channel_xml_section(channel: Channel) -> str:
     # Only actual SiriusXM team URLs use the special /sports/{league}/{team}
     # site_id form. Sports play-by-play channels otherwise behave like normal
     # ON NOW channels and retain their public web slug plus ##UUID.
-    public_path = str(getattr(channel, "public_path", None) or "").strip()
+    public_path = str(sports_path or getattr(channel, "public_path", None) or "").strip()
     if public_path.lower().startswith("/sports/"):
         return "sports"
     return "on_now"
 
 
-def _sports_site_id(channel: Channel) -> str:
-    public_path = str(getattr(channel, "public_path", None) or "").strip()
+def _sports_site_id(channel: Channel, sports_path: str = "") -> str:
+    public_path = str(sports_path or getattr(channel, "public_path", None) or "").strip()
     if public_path.lower().startswith("/sports/"):
         sports_path = public_path.rstrip("/")
         channel_uuid = _mapping_uuid(channel)
@@ -685,9 +685,9 @@ def _existing_xml_entry_for_channel(
     channel: Channel,
     existing_by_identity: dict,
     candidate_site_id: str,
+    section: str,
 ) -> Optional[dict]:
     name = clean_m3u_text(channel.name or "Unknown")
-    section = _channel_xml_section(channel)
 
     if section == "xtra":
         identity = f"xtra:{_mapping_name_for_compare(name)}"
@@ -779,26 +779,55 @@ def generate_channels_xml_entries(db: DBSession, current_map: dict) -> dict:
     # SiriusXM can expose the same sports team twice: once as a normal channel
     # object and once as the canonical /sports/{league}/{team} public page.
     # Prefer the sports-path version and suppress the duplicate normal entry.
+    # Preserve canonical team paths from the previous channels XML when the
+    # refreshed SiriusXM channel object only exposes a normal /channels slug.
+    # This is important because team streams can appear as both a normal
+    # channel and a /sports/{league}/{team} public page.
+    existing_sports_path_by_name = {}
+    for entry in existing_entries:
+        site_id = str(entry.get("site_id") or "").strip()
+        base_site_id = site_id.split("##", 1)[0]
+        if base_site_id.lower().startswith("/sports/"):
+            existing_sports_path_by_name[
+                _mapping_name_for_compare(entry.get("name"))
+            ] = base_site_id.rstrip("/")
+
     sports_team_names = {
         _mapping_name_for_compare(clean_m3u_text(channel.name or "Unknown"))
         for channel in channels
-        if str(getattr(channel, "public_path", None) or "").strip().lower().startswith("/sports/")
+        if (
+            str(getattr(channel, "public_path", None) or "").strip().lower().startswith("/sports/")
+            or _mapping_name_for_compare(clean_m3u_text(channel.name or "Unknown"))
+            in existing_sports_path_by_name
+        )
     }
 
     for channel in channels:
-        section = _channel_xml_section(channel)
         name = clean_m3u_text(channel.name or "Unknown")
+        name_key = _mapping_name_for_compare(name)
 
+        current_public_path = str(getattr(channel, "public_path", None) or "").strip()
+        sports_path = (
+            current_public_path
+            if current_public_path.lower().startswith("/sports/")
+            else existing_sports_path_by_name.get(name_key, "")
+        )
+        section = _channel_xml_section(channel, sports_path)
+
+        # If SiriusXM exposes both the canonical sports-path row and a normal
+        # duplicate row for the same team, keep only the sports-path version.
+        # If only the normal row survives DB refresh, the existing XML fallback
+        # above upgrades that row back to the canonical sports path.
         if (
             section == "on_now"
-            and _mapping_name_for_compare(name) in sports_team_names
+            and name_key in sports_team_names
         ):
             continue
 
         if section == "xtra":
             site_id = "dummy"
         elif section == "sports":
-            site_id = _sports_site_id(channel)
+            site_id = _sports_site_id(channel, sports_path)
         else:
             snapshot = {
                 "channel_id": str(channel.channel_id or ""),
@@ -813,6 +842,7 @@ def generate_channels_xml_entries(db: DBSession, current_map: dict) -> dict:
             channel,
             existing_by_identity,
             site_id,
+            section,
         )
         xmltv_id = _channel_xml_xmltv_id(
             channel,

@@ -55,7 +55,9 @@ function ChannelsPage() {
         `${data.removed ?? 0} removed`,
         'M3U updated',
         'Changes report created',
-        `Mapping JSON updated (${data.mapping_added ?? 0} added, ${data.mapping_updated ?? 0} updated, ${data.mapping_removed ?? 0} removed)`
+        `Mapping JSON updated (${data.mapping_added ?? 0} added, ${data.mapping_updated ?? 0} updated, ${data.mapping_removed ?? 0} removed)`,
+        `Channels XML updated (${data.channels_xml_added ?? 0} added, ${data.channels_xml_updated ?? 0} updated, ${data.channels_xml_removed ?? 0} removed)`,
+        'Boss mapping updated'
       ]
       setRefreshMessage(parts.join(' • '))
     } catch (error) {

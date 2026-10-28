@@ -772,9 +772,24 @@ def generate_channels_xml_entries(db: DBSession, current_map: dict) -> dict:
         .all()
     )
 
+    # SiriusXM can expose the same sports team twice: once as a normal channel
+    # object and once as the canonical /sports/{league}/{team} public page.
+    # Prefer the sports-path version and suppress the duplicate normal entry.
+    sports_team_names = {
+        _mapping_name_for_compare(clean_m3u_text(channel.name or "Unknown"))
+        for channel in channels
+        if str(getattr(channel, "public_path", None) or "").strip().lower().startswith("/sports/")
+    }
+
     for channel in channels:
         section = _channel_xml_section(channel)
         name = clean_m3u_text(channel.name or "Unknown")
+
+        if (
+            section == "on_now"
+            and _mapping_name_for_compare(name) in sports_team_names
+        ):
+            continue
 
         if section == "xtra":
             site_id = "dummy"

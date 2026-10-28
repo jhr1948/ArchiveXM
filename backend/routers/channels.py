@@ -16,6 +16,7 @@ from routers.playlist import (
     read_existing_m3u_channels,
     refresh_channel_mapping,
     refresh_channels_xml_and_boss_mapping,
+    refresh_xtra_data,
     write_channel_changes_report,
     write_m3u_to_file,
 )
@@ -348,6 +349,7 @@ async def refresh_channels(db: DBSession = Depends(get_db)):
 
         mapping_result = refresh_channel_mapping(db)
         channels_xml_result = refresh_channels_xml_and_boss_mapping(db)
+        xtra_data_result = refresh_xtra_data(channels_data)
 
         return {
             "success": True,
@@ -378,6 +380,9 @@ async def refresh_channels(db: DBSession = Depends(get_db)):
             "channels_xml_updated": channels_xml_result.get("updated", 0),
             "channels_xml_removed": channels_xml_result.get("removed", 0),
             "boss_mapping_path": channels_xml_result.get("boss_mapping_path"),
+            "xtra_data_path": xtra_data_result.get("path"),
+            "xtra_data_backup_path": xtra_data_result.get("backup_path"),
+            "xtra_data_count": xtra_data_result.get("count", 0),
         }
 
     except HTTPException:

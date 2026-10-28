@@ -542,7 +542,7 @@ class SiriusXMAPI:
         )
         raw = raw.split("?", 1)[0].split("#", 1)[0].strip()
 
-        match = re.search(r'(/(?:channels|sports)/[^\\s"\'<>]+)', raw, flags=re.IGNORECASE)
+        match = re.search(r'(/(?:channels|sports)/[^\s"\'<>]+)', raw, flags=re.IGNORECASE)
         if match:
             return match.group(1).rstrip("/")
 
@@ -575,7 +575,7 @@ class SiriusXMAPI:
         """
         explicit_path_re = re.compile(
             r"(?:(?:https?://(?:www\.)?siriusxm\.com)?/"
-            r"(?:channels|sports)/[^\\s\"'<>]+)",
+            r"(?:channels|sports)/[^\s\"'<>]+)",
             flags=re.IGNORECASE,
         )
 
@@ -719,7 +719,7 @@ class SiriusXMAPI:
         """
         path_re = re.compile(
             r"(?:(?:https?://(?:www\.)?siriusxm\.com)?/"
-            r"(?:channels|sports)/[A-Za-z0-9][A-Za-z0-9._~%+\\-/]*)",
+            r"(?:channels|sports)/[A-Za-z0-9][A-Za-z0-9._~%+/-]*)",
             flags=re.IGNORECASE,
         )
 

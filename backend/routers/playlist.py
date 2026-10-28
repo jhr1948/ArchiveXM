@@ -427,7 +427,7 @@ def generate_channel_mapping(db: DBSession, previous_map: Optional[dict] = None)
             alias_candidates.extend(aliases)
 
         for alias in alias_candidates:
-            cleaned = str(alias or "").strip()
+            cleaned = _mapping_plain_name(str(alias or "").strip())
             if not cleaned:
                 continue
             key = _mapping_name_for_compare(cleaned)

@@ -836,6 +836,12 @@ class SiriusXMAPI:
                 ["genreTitle", "genre", "categoryTitle", "category", "superCategoryName"]
             )
         )
+        medium_description = self._normalize_public_text(
+            item.get("mediumDescription")
+        )
+        category_title = self._normalize_public_text(
+            item.get("categoryTitle")
+        )
 
         is_xtra = bool(
             item.get("xtra_channel")
@@ -877,6 +883,8 @@ class SiriusXMAPI:
             "title": title or existing.get("title", ""),
             "_public_titles": public_titles,
             "genre": genre or existing.get("genre", ""),
+            "medium_description": medium_description or existing.get("medium_description", ""),
+            "category_title": category_title or existing.get("category_title", ""),
             "channel_type": "channel-xtra" if is_xtra else existing.get("channel_type", "channel-linear"),
             "id": str(channel_uuid) or existing.get("id", ""),
             "public_uuid": str(channel_uuid) or existing.get("public_uuid", ""),
@@ -1048,6 +1056,14 @@ class SiriusXMAPI:
 
             channel["public_uuid"] = override.get("public_uuid") or override.get("id") or ""
             channel["public_path"] = override.get("public_path") or ""
+
+            # Keep the public XTRA metadata in-memory through Refresh Channels.
+            # It is used to generate SXM_XTRA_data.json without changing the DB.
+            channel["xtra_public_display_name"] = override.get("title") or ""
+            channel["xtra_public_medium_description"] = override.get("medium_description") or ""
+            channel["xtra_public_category_title"] = override.get("category_title") or ""
+            channel["xtra_public_uuid"] = override.get("public_uuid") or override.get("id") or ""
+            channel["xtra_public_logo_path"] = override.get("logo_path") or ""
 
             # Use the public channel page for nicer display names and base groups,
             # but keep authenticated browse artwork as the source of truth. The
